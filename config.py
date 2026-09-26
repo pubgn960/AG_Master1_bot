@@ -39,6 +39,20 @@ def safe_float(env_name: str, default: float) -> float:
         return default
 
 
+def normalize_database_url(url: str) -> str:
+    """Ensures database connection string uses async drivers for SQLAlchemy 2."""
+    if not url:
+        return "sqlite+aiosqlite:///bot_database.db"
+    raw_url = url.strip()
+    if raw_url.startswith("postgres://"):
+        return raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif raw_url.startswith("postgresql://") and not raw_url.startswith("postgresql+asyncpg://"):
+        return raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif raw_url.startswith("sqlite://") and not raw_url.startswith("sqlite+aiosqlite://"):
+        return raw_url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+    return raw_url
+
+
 class Config:
     """Validated Application Configuration."""
 
@@ -46,7 +60,7 @@ class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
     RAW_ADMIN_IDS: str = os.getenv("ADMIN_IDS", "")
     ADMIN_IDS: Set[int] = set()
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot_database.db")
+    DATABASE_URL: str = normalize_database_url(os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot_database.db"))
     # Trusted Internal User IDs to be completely ignored by Order Detection & Workflows
     IGNORED_USER_IDS: Set[int] = {1249984265}
 
@@ -80,7 +94,7 @@ class Config:
         """Parses and validates environment settings."""
         cls.BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
         cls.RAW_ADMIN_IDS = os.getenv("ADMIN_IDS", "")
-        cls.DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot_database.db")
+        cls.DATABASE_URL = normalize_database_url(os.getenv("DATABASE_URL", "sqlite+aiosqlite:///bot_database.db"))
         cls.PAYMENT_REVIEW_GROUP_ID = safe_int("PAYMENT_REVIEW_GROUP_ID", -1004441603990)
         cls.MEDIA_GROUP_TIMEOUT = safe_float("MEDIA_GROUP_TIMEOUT", 2.0)
         cls.USER_SESSION_TIMEOUT = safe_float("USER_SESSION_TIMEOUT", 300.0)
@@ -100,14 +114,6 @@ class Config:
                 cls.ADMIN_IDS = {int(x.strip()) for x in cleaned_str.split() if x.strip().lstrip("-").isdigit()}
             except Exception as e:
                 logger.error(f"Error parsing ADMIN_IDS: {e}")
-
-        # Adapt DATABASE_URL for SQLAlchemy 2 Async drivers
-        if cls.DATABASE_URL.startswith("postgres://"):
-            cls.DATABASE_URL = cls.DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif cls.DATABASE_URL.startswith("postgresql://") and not cls.DATABASE_URL.startswith("postgresql+asyncpg://"):
-            cls.DATABASE_URL = cls.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
-        elif cls.DATABASE_URL.startswith("sqlite://") and not cls.DATABASE_URL.startswith("sqlite+aiosqlite://"):
-            cls.DATABASE_URL = cls.DATABASE_URL.replace("sqlite://", "sqlite+aiosqlite://", 1)
 
         if not cls.BOT_TOKEN:
             logger.warning("BOT_TOKEN is not defined in environment variables!")
