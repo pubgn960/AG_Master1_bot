@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import html
 import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -616,9 +617,51 @@ def format_export_prices(price_map: Dict[str, float]) -> str:
     return "\n".join(std_lines or spc_lines)
 
 
-def _fmt_price_val(val: float) -> str:
+def _fmt_price_val(val: Union[Decimal, float, int, str]) -> str:
     """Helper to format price cleanly (e.g. 16, 16.5)."""
-    return f"{int(val)}" if val.is_integer() else f"{val:g}"
+    try:
+        f_val = float(val)
+        if f_val.is_integer():
+            return str(int(f_val))
+        return f"{f_val:g}"
+    except Exception:
+        return str(val)
+
+
+def format_delivery_summary_message(
+    email: Optional[str],
+    client_price: Union[Decimal, float, int, str],
+    secret_code: Optional[str],
+    before_total: Union[Decimal, float, int, str],
+    now_value: Union[Decimal, float, int, str],
+    running_total: Union[Decimal, float, int, str]
+) -> str:
+    """
+    Formats complete Delivery Summary message according to Step 7 requirements:
+
+    📧 customer@email.com
+    💵 Client Price: $137
+    🔐 Profit: X
+
+    Before: 875
+    Now: 137
+    Total: 1012
+    """
+    email_str = (email or "customer@email.com").strip()
+    c_price_str = _fmt_price_val(client_price)
+    code_str = secret_code if secret_code else "N/A"
+    b_str = _fmt_price_val(before_total)
+    n_str = _fmt_price_val(now_value)
+    t_str = _fmt_price_val(running_total)
+
+    return (
+        f"📧 {email_str}\n"
+        f"💵 Client Price: ${c_price_str}\n"
+        f"🔐 Profit: {code_str}\n\n"
+        f"Before: {b_str}\n"
+        f"Now: {n_str}\n"
+        f"Total: {t_str}"
+    )
 
 
 def format_ledger_entry_message(before: float, now: float, total: float) -> str:
@@ -1703,3 +1746,190 @@ def format_wallet_amount(val: Optional[Union[float, int]]) -> str:
         return s
     else:
         return f"{val_2dec:.2f}"
+
+
+from decimal import Decimal, InvalidOperation
+
+
+def normalize_transaction_id(tx_id: Optional[str]) -> Optional[str]:
+    """
+    Normalizes transaction ID string to canonical uppercase format.
+    Strips prefix labels like 'TXID:', 'TRX ID:', 'Transaction ID:', 'Ref:', 'Hash:'.
+    Example:
+      'Transaction ID: ABC123XYZ' -> 'ABC123XYZ'
+      'trx id: abc123xyz'         -> 'ABC123XYZ'
+      '  txid   ABC123XYZ '       -> 'ABC123XYZ'
+    """
+    if not tx_id or not str(tx_id).strip():
+        return None
+    
+    clean = str(tx_id).strip()
+    clean = re.sub(
+        r'^(?:tx\s*id|trx\s*id|txid|trxid|transaction\s*id|transaction\s*hash|tx\s*hash|hash|reference|ref\s*id|ref)[\s:=#\-]+',
+        '',
+        clean,
+        flags=re.IGNORECASE
+    ).strip()
+    clean = clean.upper()
+    return clean if clean else None
+
+
+def extract_payment_info(text: Optional[str]) -> Dict[str, Any]:
+    """
+    Extracts payment information from OCR / text captions.
+    Requires explicit payment indicators (keywords, currency symbols, or transaction IDs).
+    Returns dict containing:
+      - is_payment: bool
+      - amount: Optional[Decimal]
+      - transaction_id: Optional[str]
+      - currency: str
+      - network: Optional[str]
+      - raw_text: str
+    """
+    if not text or not str(text).strip():
+        return {
+            "is_payment": False,
+            "amount": None,
+            "transaction_id": None,
+            "currency": "USDT",
+            "network": None,
+            "raw_text": ""
+        }
+
+    raw_text = str(text).strip()
+
+    # Exclude normal order credential messages (containing email + password/pass/nick) without payment labels
+    has_credentials = bool(re.search(r'\b(?:pass|password|contraseña|contrasena|nick|login|activision|facebook|fb)\b', raw_text, re.IGNORECASE))
+    has_tx_label = bool(re.search(r'\b(?:tx\s*id|trx\s*id|txid|trxid|transaction|ref\s*id|hash|comprobante|pago|deposit)\b', raw_text, re.IGNORECASE))
+
+    if has_credentials and not has_tx_label:
+        return {
+            "is_payment": False,
+            "amount": None,
+            "transaction_id": None,
+            "currency": "USDT",
+            "network": None,
+            "raw_text": raw_text
+        }
+
+    amount: Optional[Decimal] = None
+    transaction_id: Optional[str] = None
+    currency: str = "USDT"
+    network: Optional[str] = None
+
+    # 1. Network / Currency
+    if re.search(r'\bUSDC\b', raw_text, re.IGNORECASE):
+        currency = "USDC"
+    elif re.search(r'\bUSDT\b', raw_text, re.IGNORECASE):
+        currency = "USDT"
+
+    m_net = re.search(r'\b(TRC20|BEP20|ERC20|POLYGON|SOLANA|TRON)\b', raw_text, re.IGNORECASE)
+    if m_net:
+        network = m_net.group(1).upper()
+
+    # 2. Extract Amount (Requires explicit payment keywords or currency symbols)
+    m_amt = re.search(
+        r'(?:amount|paid|monto|payment|total|sum)\s*[:=#]*\s*[$]?\s*(\d+(?:\.\d+)?)|[$]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:usdt|usdc|usd|[$])',
+        raw_text,
+        re.IGNORECASE
+    )
+    if m_amt:
+        try:
+            amt_str = m_amt.group(1) or m_amt.group(2) or m_amt.group(3)
+            if amt_str:
+                amt_dec = Decimal(amt_str)
+                if amt_dec > Decimal("0"):
+                    amount = amt_dec
+        except (InvalidOperation, ValueError):
+            amount = None
+
+    # 3. Extract Transaction ID / TRX ID
+    m_tx = re.search(
+        r'(?:tx\s*id|trx\s*id|txid|trxid|transaction\s*id|transaction\s*hash|tx\s*hash|hash|reference|ref\s*id|ref)[\s:=#\-]+([A-Za-z0-9_\-]+)',
+        raw_text,
+        re.IGNORECASE
+    )
+    if m_tx:
+        transaction_id = normalize_transaction_id(m_tx.group(1))
+
+    if not transaction_id and has_tx_label:
+        m_hash = re.search(r'\b([a-fA-F0-9]{32,64}|[A-Za-z0-9]{12,64})\b', raw_text)
+        if m_hash:
+            candidate = m_hash.group(1)
+            if not re.search(r'@|[a-zA-Z]{12,}', candidate):
+                transaction_id = normalize_transaction_id(candidate)
+
+    is_payment = (amount is not None and amount > Decimal("0")) or (transaction_id is not None)
+
+    return {
+        "is_payment": is_payment,
+        "amount": amount,
+        "transaction_id": transaction_id,
+        "currency": currency,
+        "network": network,
+        "raw_text": raw_text
+    }
+
+
+def format_payment_verification_message(
+    amount: Union[Decimal, float, int, str],
+    tx_id: str,
+    before_total: float,
+    now_payment: float,
+    running_total: float
+) -> str:
+    """
+    Formats client group verified payment message:
+    ✅ Payment Verified
+
+    💵 Amount: $200
+    🔗 Transaction: ABC123
+
+    Before: 1012
+    Payment: -200
+    Total: 812
+    """
+    amt_fmt = _fmt_price_val(amount)
+    before_fmt = _fmt_price_val(before_total)
+    now_fmt = _fmt_price_val(now_payment)
+    total_fmt = _fmt_price_val(running_total)
+
+    return (
+        "✅ <b>Payment Verified</b>\n\n"
+        f"💵 Amount: ${amt_fmt}\n"
+        f"🔗 Transaction: <code>{html.escape(tx_id)}</code>\n\n"
+        f"Before: {before_fmt}\n"
+        f"Payment: -{now_fmt}\n"
+        f"Total: {total_fmt}"
+    )
+
+
+def format_payment_pending_message(
+    amount: Optional[Union[Decimal, float, int, str]] = None,
+    tx_id: Optional[str] = None
+) -> str:
+    """
+    Formats client group pending payment message (NO balance change):
+    ⏳ Payment received
+    Amount: $200
+    Status: Pending Verification
+    """
+    lines = ["⏳ <b>Payment received</b>"]
+    if amount is not None:
+        lines.append(f"Amount: ${_fmt_price_val(amount)}")
+    if tx_id:
+        lines.append(f"Transaction: <code>{html.escape(tx_id)}</code>")
+    lines.append("Status: Pending Verification")
+    return "\n".join(lines)
+
+
+def format_payment_rejected_message(reason: Optional[str] = None) -> str:
+    """
+    Formats client group rejected payment message (NO balance change):
+    ❌ Payment verification failed.
+    """
+    msg = "❌ <b>Payment verification failed.</b>"
+    if reason:
+        msg += f"\n<i>{html.escape(reason)}</i>"
+    return msg
+

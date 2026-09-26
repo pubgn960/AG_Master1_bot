@@ -19,6 +19,7 @@ import sys
 import html
 import shutil
 import logging
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, WebAppInfo
@@ -159,8 +160,16 @@ from database import (
     execute_pay_reset,
     execute_manual_adjustment,
     get_last_running_total_entry,
-    undo_last_running_total_action
+    undo_last_running_total_action,
+    process_verified_payment_deduction
 )
+from utils import (
+    extract_payment_info,
+    format_payment_verification_message,
+    format_payment_pending_message,
+    format_payment_rejected_message
+)
+from payment_verifier import verify_payment_transaction
 import json
 
 logger = logging.getLogger(__name__)
@@ -229,9 +238,73 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
     text_content = message.text or message.caption or ""
-    if not text_content:
-        logger.debug(f"[CLIENT] Message {message.message_id} in Client Group has no text/caption content.")
+    if not text_content and not (message.photo or message.document):
+        logger.debug(f"[CLIENT] Message {message.message_id} in Client Group has no media or text content.")
         return
+
+    # Check for Client Payment Screenshot / Payment OCR Details
+    pay_info = extract_payment_info(text_content)
+    if pay_info["is_payment"]:
+        amt = pay_info["amount"]
+        tx_id = pay_info["transaction_id"]
+        curr = pay_info.get("currency", "USDT")
+
+        if amt and amt > Decimal("0") and tx_id:
+            # Verify payment using project verification module
+            is_verified, v_code, v_msg = await verify_payment_transaction(
+                provider="Binance",
+                transaction_id=tx_id,
+                amount=float(amt),
+                currency=curr
+            )
+
+            if is_verified:
+                p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
+                    chat_id=chat.id,
+                    amount=amt,
+                    transaction_id=tx_id,
+                    provider="Binance",
+                    currency=curr
+                )
+                msg_text = format_payment_verification_message(
+                    amount=amt,
+                    tx_id=tx_id,
+                    before_total=before_v,
+                    now_payment=now_v,
+                    running_total=after_v
+                )
+                await message.reply_text(msg_text, parse_mode="HTML")
+                return
+            elif v_code == "DUPLICATE_TRANSACTION":
+                p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
+                    chat_id=chat.id,
+                    amount=amt,
+                    transaction_id=tx_id,
+                    provider="Binance",
+                    currency=curr
+                )
+                msg_text = format_payment_verification_message(
+                    amount=amt,
+                    tx_id=tx_id,
+                    before_total=before_v,
+                    now_payment=0.0,
+                    running_total=after_v
+                )
+                await message.reply_text(msg_text, parse_mode="HTML")
+                return
+            elif v_code in ("MISSING_API_CREDENTIALS", "UNVERIFIED", "PENDING"):
+                msg_text = format_payment_pending_message(amount=amt, tx_id=tx_id)
+                await message.reply_text(msg_text, parse_mode="HTML")
+                return
+            else:
+                msg_text = format_payment_rejected_message(reason=v_msg)
+                await message.reply_text(msg_text, parse_mode="HTML")
+                return
+        elif amt and amt > Decimal("0") and not tx_id:
+            # Payment amount present without transaction ID -> Pending Verification (NO balance change)
+            msg_text = format_payment_pending_message(amount=amt, tx_id=None)
+            await message.reply_text(msg_text, parse_mode="HTML")
+            return
 
     # Check if this customer message is a cancellation request replying to an order message
     if message.reply_to_message:
@@ -1832,6 +1905,177 @@ async def bulk_price_update_text_handler(update: Update, context: ContextTypes.D
     return True
 
 
+async def setclientprice_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Admin command /setclientprice.
+    Must be executed by replying to a Telegram message containing the client price list.
+    Parses, validates, and updates the ONE global client price list in DB & RAM cache.
+    """
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
+        logger.warning(f"[SET_CLIENT_PRICE] Unauthorized attempt by user #{user.id if user else 'Unknown'}.")
+        if update.effective_message:
+            await update.effective_message.reply_text("❌ You are not authorized to update client prices.")
+        return
+
+    message = update.effective_message
+    if not message:
+        return
+
+    reply_msg = message.reply_to_message
+    if not reply_msg:
+        await message.reply_text("❌ Reply to a price-list message and use /setclientprice.")
+        return
+
+    replied_text = reply_msg.text or reply_msg.caption or ""
+    if not replied_text or not replied_text.strip():
+        await message.reply_text("❌ No valid prices found.")
+        return
+
+    from price_list_parser import parse_client_price_list
+    from database import update_global_client_prices
+
+    parsed = parse_client_price_list(replied_text)
+    if not parsed["valid"] or parsed["counts"]["total"] == 0 or parsed["errors"]:
+        if parsed["errors"]:
+            err_msg = parsed["errors"][0]
+            await message.reply_text(f"❌ {err_msg}")
+        else:
+            await message.reply_text("❌ No valid prices found.")
+        return
+
+    try:
+        success = await update_global_client_prices(parsed["parsed_prices"])
+        if success:
+            cnts = parsed["counts"]
+            resp = (
+                "✅ <b>Client Price List Updated</b>\n\n"
+                f"<b>Products updated: {cnts['total']}</b>\n\n"
+                f"Normal CP: {cnts['normal_cp']}\n"
+                f"Special CP: {cnts['special_cp']}\n"
+                f"Other Products: {cnts['other_products']}\n\n"
+                "Global client prices are now active for all client groups."
+            )
+            await message.reply_text(resp, parse_mode="HTML")
+            logger.info(f"[SET_CLIENT_PRICE] Admin #{user.id} updated global client price list ({cnts['total']} products).")
+        else:
+            await message.reply_text("❌ Database update failed. Transaction rolled back.")
+    except Exception as e:
+        logger.exception(f"[SET_CLIENT_PRICE] Error updating global client prices: {e}")
+        await message.reply_text("❌ Database update failed. Transaction rolled back.")
+
+
+async def setloaderprice_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Command /setloaderprice.
+    Must be executed by replying to a Telegram message containing a loader price list.
+    Saves/updates private loader cost prices for the target loader.
+    """
+    message = update.effective_message
+    if not message:
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user:
+        return
+
+    reply_msg = message.reply_to_message
+    if not reply_msg:
+        await message.reply_text("❌ Reply to a price-list message and use /setloaderprice.", quote=True)
+        return
+
+    replied_text = reply_msg.text or reply_msg.caption or ""
+    if not replied_text or not replied_text.strip():
+        await message.reply_text("❌ No valid prices found.", quote=True)
+        return
+
+    from database import (
+        LOADERS_CACHE,
+        reload_loaders_cache,
+        get_all_loaders,
+        update_loader_prices
+    )
+    from price_list_parser import parse_client_price_list
+
+    user_is_admin = is_super_admin(user.id) or is_admin(user.id)
+    args = context.args or []
+    explicit_loader_id: Optional[int] = None
+
+    if args:
+        try:
+            explicit_loader_id = int(args[0])
+        except ValueError:
+            await message.reply_text("❌ Invalid loader_id format. Usage: /setloaderprice <loader_id>", quote=True)
+            return
+
+    target_loader_id: Optional[int] = None
+
+    if user_is_admin:
+        if explicit_loader_id is not None:
+            loaders = await get_all_loaders()
+            loader_exists = any(l.id == explicit_loader_id for l in loaders) or explicit_loader_id in LOADERS_CACHE
+            if not loader_exists:
+                await message.reply_text(f"❌ Loader ID #{explicit_loader_id} not found.", quote=True)
+                return
+            target_loader_id = explicit_loader_id
+        else:
+            await message.reply_text("❌ Admins must specify a loader ID: /setloaderprice <loader_id>", quote=True)
+            return
+    else:
+        if not LOADERS_CACHE:
+            await reload_loaders_cache()
+
+        matching_loader_id: Optional[int] = None
+        for l_id, l_data in LOADERS_CACHE.items():
+            if l_data.get("group_id") == user.id or l_id == user.id or (chat and l_data.get("group_id") == chat.id):
+                matching_loader_id = l_id
+                break
+
+        if not matching_loader_id:
+            loaders = await get_all_loaders()
+            for l in loaders:
+                if l.group_id == user.id or l.id == user.id or (chat and l.group_id == chat.id):
+                    matching_loader_id = l.id
+                    break
+
+        if not matching_loader_id:
+            await message.reply_text("❌ You are not authorized to update loader prices.", quote=True)
+            return
+
+        if explicit_loader_id is not None and explicit_loader_id != matching_loader_id:
+            await message.reply_text("❌ You are not authorized to update another loader's prices.", quote=True)
+            return
+
+        target_loader_id = matching_loader_id
+
+    parsed = parse_client_price_list(replied_text)
+    if not parsed["valid"] or parsed["counts"]["total"] == 0 or parsed["errors"]:
+        if parsed["errors"]:
+            err_msg = parsed["errors"][0]
+            await message.reply_text(f"❌ {err_msg}", quote=True)
+        else:
+            await message.reply_text("❌ No valid prices found.", quote=True)
+        return
+
+    try:
+        success = await update_loader_prices(target_loader_id, parsed["parsed_prices"])
+        if success:
+            cnt = parsed["counts"]["total"]
+            resp = (
+                "✅ Loader price list updated\n"
+                f"Products updated: {cnt}"
+            )
+            await message.reply_text(resp, quote=True)
+            logger.info(f"[SET_LOADER_PRICE] Updated loader #{target_loader_id} price list ({cnt} products).")
+        else:
+            await message.reply_text("❌ Database update failed. Transaction rolled back.", quote=True)
+    except Exception as e:
+        logger.exception(f"[SET_LOADER_PRICE] Error updating loader prices: {e}")
+        await message.reply_text("❌ Database update failed. Transaction rolled back.", quote=True)
+
+
+
 # ==========================================
 # Production Delivery Ledger System
 # ==========================================
@@ -1852,9 +2096,22 @@ async def process_delivery_ledger_event(
     if not package_str:
         return
 
-    now_val, all_known = calculate_delivered_packages_value(package_str)
+    from database import get_order_by_id, save_order_pricing
+    from utils import format_delivery_summary_message, format_ledger_entry_message
 
-    if now_val is None or not all_known:
+    order = await get_order_by_id(order_id)
+    if order and (order.client_price_total is None or order.secret_profit_code is None):
+        order = await save_order_pricing(order_id)
+
+    now_val: Optional[float] = None
+    if order and order.client_price_total is not None:
+        now_val = float(order.client_price_total)
+    else:
+        pkg_val, all_known = calculate_delivered_packages_value(package_str)
+        if pkg_val is not None and all_known:
+            now_val = pkg_val
+
+    if now_val is None:
         notice_text = f"⚠️ Price not found for package '{package_str}' on Order #{order_id}.\n\nUse /addprice to update ledger."
         try:
             await bot.send_message(
@@ -1881,7 +2138,20 @@ async def process_delivery_ledger_event(
         logger.info(f"[DUPLICATE_LEDGER_BLOCKED] Skipped duplicate ledger entry for Order #{order_id} ({package_str}).")
         return
 
-    ledger_msg = format_ledger_entry_message(entry.before_total, entry.now_value, entry.running_total)
+    customer_email = order.email if (order and order.email) else "customer@email.com"
+    secret_code = order.secret_profit_code if (order and order.secret_profit_code) else None
+
+    if order or secret_code:
+        ledger_msg = format_delivery_summary_message(
+            email=customer_email,
+            client_price=now_val,
+            secret_code=secret_code,
+            before_total=entry.before_total,
+            now_value=entry.now_value,
+            running_total=entry.running_total
+        )
+    else:
+        ledger_msg = format_ledger_entry_message(entry.before_total, entry.now_value, entry.running_total)
 
     try:
         await bot.send_message(
@@ -4365,4 +4635,536 @@ async def testbinance_command_handler(update: Update, context: ContextTypes.DEFA
         await msg_wait.edit_text(text_report, parse_mode="HTML")
     except Exception:
         await update.message.reply_text(text_report, parse_mode="HTML")
+
+
+# ==========================================
+# Step 11 — Operational Controls Handlers
+# ==========================================
+
+async def pendingorders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /pendingorders [page]. Shows active actionable pending orders."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_pending_orders_paginated
+    orders, total_count = await get_pending_orders_paginated(offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"⏳ <b>Pending Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No pending orders found.</i>"
+    else:
+        for ord_item in orders:
+            loader_str = "Unassigned"
+            if ord_item.loader_group_id:
+                l_info = LOADERS_CACHE.get(ord_item.loader_group_id)
+                loader_str = l_info["name"] if l_info else f"Loader #{ord_item.loader_group_id}"
+
+            c_price_str = ord_item.price or ("$"+str(ord_item.client_price_total) if ord_item.client_price_total else "Unpriced")
+            msg += f"• <b>Order #{ord_item.id}</b>\n  Status: {html.escape(ord_item.status or 'Pending')}\n  Customer: {html.escape(ord_item.email or 'None')}\n  Package: {html.escape(ord_item.package or 'N/A')}\n  Client Price: {c_price_str}\n  Loader: {html.escape(loader_str)}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_pending:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_pending:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def order_lookup_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /order <order_id>. Lookup specific order details with strict role-based privacy."""
+    user = update.effective_user
+    if not user:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("⚠️ Usage: <code>/order &lt;order_id&gt;</code>", parse_mode="HTML")
+        return
+
+    order_id = int(context.args[0])
+    order = await get_order_by_id(order_id)
+    if not order:
+        await update.effective_message.reply_text(f"❌ Order #{order_id} not found.")
+        return
+
+    is_adm = is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)
+    is_ldr = user.id in LOADERS_CACHE or (order.loader_group_id and any(l.get("group_id") == order.loader_group_id for l in LOADERS_CACHE.values()))
+
+    if not is_adm and is_ldr:
+        loader_group = None
+        if user.id in LOADERS_CACHE:
+            loader_group = LOADERS_CACHE[user.id].get("group_id")
+
+        is_assigned = (order.loader_group_id == user.id) or (loader_group is not None and order.loader_group_id == loader_group)
+        if not is_assigned:
+            await update.effective_message.reply_text("⛔ You are not authorized to view this order.")
+            return
+
+    if not is_adm and not is_ldr:
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    dt_str = order.created_at.strftime("%Y-%m-%d %H:%M UTC") if order.created_at else "N/A"
+    loader_str = "Unassigned"
+    if order.loader_group_id:
+        l_info = LOADERS_CACHE.get(order.loader_group_id)
+        loader_str = l_info["name"] if l_info else f"Loader #{order.loader_group_id}"
+
+    msg = f"📦 <b>Order #{order.id} Details</b>\n\n"
+    msg += f"<b>Status:</b> {html.escape(order.status or 'Pending')}\n"
+    msg += f"<b>Customer:</b> {html.escape(order.email or 'None')}\n"
+    msg += f"<b>Package:</b> {html.escape(order.package or 'N/A')}\n"
+    msg += f"<b>Client Price:</b> {order.price or ('$'+str(order.client_price_total) if order.client_price_total else 'Unpriced')}\n"
+    msg += f"<b>Assigned Loader:</b> {html.escape(loader_str)}\n"
+    msg += f"<b>Created:</b> {dt_str}\n"
+
+    if is_adm:
+        msg += f"\n🔒 <b>Internal Admin Metrics:</b>\n"
+        msg += f"  Loader Cost: ${order.loader_cost_total if order.loader_cost_total is not None else 'Unpriced'}\n"
+        msg += f"  Profit Amount: ${order.profit_amount if order.profit_amount is not None else 'N/A'}\n"
+        msg += f"  Secret Profit Code: {order.secret_profit_code or 'N/A'}\n"
+
+    await update.effective_message.reply_text(msg, parse_mode="HTML")
+
+
+async def order_status_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /status <order_id>. Returns current order status safely."""
+    user = update.effective_user
+    if not user:
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("⚠️ Usage: <code>/status &lt;order_id&gt;</code>", parse_mode="HTML")
+        return
+
+    order_id = int(context.args[0])
+    order = await get_order_by_id(order_id)
+    if not order:
+        await update.effective_message.reply_text(f"❌ Order #{order_id} not found.")
+        return
+
+    msg = f"📊 <b>Order #{order.id} Status:</b> {html.escape(order.status or 'Pending')}\n"
+    msg += f"<b>Package:</b> {html.escape(order.package or 'N/A')}\n"
+    msg += f"<b>Created:</b> {order.created_at.strftime('%Y-%m-%d %H:%M UTC') if order.created_at else 'N/A'}"
+
+    await update.effective_message.reply_text(msg, parse_mode="HTML")
+
+
+async def assignloader_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /assignloader <order_id> <loader_id>."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    if not context.args or len(context.args) < 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.effective_message.reply_text("⚠️ Usage: <code>/assignloader &lt;order_id&gt; &lt;loader_id&gt;</code>", parse_mode="HTML")
+        return
+
+    order_id = int(context.args[0])
+    loader_id = int(context.args[1])
+
+    from database import assign_order_loader
+    order, success, reason = await assign_order_loader(order_id, loader_id)
+
+    if not success:
+        if reason == "CANNOT_MODIFY_COMPLETED_ORDER":
+            await update.effective_message.reply_text(f"❌ Order #{order_id} is already COMPLETED and cannot be modified.")
+        else:
+            await update.effective_message.reply_text(f"❌ Failed to assign loader: {reason}")
+        return
+
+    await update.effective_message.reply_text(f"✅ <b>Order #{order_id} assigned to Loader #{loader_id}.</b>\nStatus: {order.status}", parse_mode="HTML")
+
+
+async def reassignloader_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /reassignloader <order_id> <loader_id>."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    if not context.args or len(context.args) < 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.effective_message.reply_text("⚠️ Usage: <code>/reassignloader &lt;order_id&gt; &lt;loader_id&gt;</code>", parse_mode="HTML")
+        return
+
+    order_id = int(context.args[0])
+    loader_id = int(context.args[1])
+
+    from database import reassign_order_loader
+    order, success, reason = await reassign_order_loader(order_id, loader_id)
+
+    if not success:
+        if reason == "CANNOT_MODIFY_COMPLETED_ORDER":
+            await update.effective_message.reply_text(f"❌ Order #{order_id} is already COMPLETED and cannot be modified.")
+        else:
+            await update.effective_message.reply_text(f"❌ Failed to reassign loader: {reason}")
+        return
+
+    await update.effective_message.reply_text(f"✅ <b>Order #{order_id} reassigned to Loader #{loader_id}.</b>\nStatus: {order.status}", parse_mode="HTML")
+
+
+async def myorders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Loader command /myorders [page]. Shows active orders assigned to the calling loader."""
+    user = update.effective_user
+    if not user:
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_orders_for_loader
+    orders, total_count = await get_orders_for_loader(user.id, offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"📦 <b>My Active Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No active orders assigned to you.</i>"
+    else:
+        for ord_item in orders:
+            msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Status: {html.escape(ord_item.status or 'Pending')}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_myorders:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_myorders:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def revieworders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /revieworders [page]. Shows orders in NEEDS_REVIEW or FAILED status."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_orders_by_status_paginated
+    orders, total_count = await get_orders_by_status_paginated(["NEEDS_REVIEW", "Needs_Review", "Needs Review", "FAILED", "Failed"], offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"⚠️ <b>Orders Needing Review</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No orders needing review.</i>"
+    else:
+        for ord_item in orders:
+            diag_reason = "Missing price or configuration error"
+            if not ord_item.client_price_total:
+                diag_reason = f"Missing Client Price for package '{ord_item.package}'"
+            elif not ord_item.loader_cost_total:
+                diag_reason = f"Missing Loader Cost for loader group #{ord_item.loader_group_id}"
+
+            msg += f"• <b>Order #{ord_item.id}</b>\n  Status: {html.escape(ord_item.status or 'Needs Review')}\n  Package: {html.escape(ord_item.package or 'N/A')}\n  Diagnostic: {html.escape(diag_reason)}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_review:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_review:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def completedorders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /completedorders [page]. Shows recently completed orders."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_orders_by_status_paginated
+    orders, total_count = await get_orders_by_status_paginated(["Completed", "COMPLETED"], offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"✅ <b>Completed Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No completed orders found.</i>"
+    else:
+        for ord_item in orders:
+            c_str = f"${ord_item.client_price_total:g}" if ord_item.client_price_total else (ord_item.price or "N/A")
+            msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Client Price: {c_str} | Profit Code: {ord_item.secret_profit_code or 'N/A'}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_completed:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_completed:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def cancelledorders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /cancelledorders [page]. Read-only view of cancelled orders."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_orders_by_status_paginated
+    orders, total_count = await get_orders_by_status_paginated(["Cancelled", "CANCELLED"], offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"🚫 <b>Cancelled Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No cancelled orders found.</i>"
+    else:
+        for ord_item in orders:
+            msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Customer: {html.escape(ord_item.email or 'N/A')}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_cancelled:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_cancelled:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def failedorders_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /failedorders [page]. Read-only view of failed orders."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    offset = (page - 1) * 10
+    from database import get_orders_by_status_paginated
+    orders, total_count = await get_orders_by_status_paginated(["FAILED", "Failed"], offset=offset, limit=10)
+
+    total_pages = max(1, (total_count + 9) // 10)
+    msg = f"❌ <b>Failed Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+
+    if not orders:
+        msg += "<i>No failed orders found.</i>"
+    else:
+        for ord_item in orders:
+            msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Customer: {html.escape(ord_item.email or 'N/A')}\n\n"
+
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_failed:{page-1}"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_failed:{page+1}"))
+
+    kb = InlineKeyboardMarkup([buttons]) if buttons else None
+    await update.effective_message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+
+
+async def retryorder_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command /retryorder <order_id>. Safely recovers an eligible order."""
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
+        await update.effective_message.reply_text("⛔ Unauthorized.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("⚠️ Usage: <code>/retryorder &lt;order_id&gt;</code>", parse_mode="HTML")
+        return
+
+    order_id = int(context.args[0])
+    from database import retry_order
+    order, success, reason = await retry_order(order_id)
+
+    if not success:
+        if reason == "ORDER_ALREADY_COMPLETED":
+            await update.effective_message.reply_text(f"❌ Order #{order_id} is already COMPLETED and cannot be retried.")
+        else:
+            await update.effective_message.reply_text(f"❌ Failed to retry order #{order_id}: {reason}")
+        return
+
+    await update.effective_message.reply_text(f"🔄 <b>Order #{order_id} reset to {order.status} for retry.</b>", parse_mode="HTML")
+
+
+async def operational_pagination_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles pagination callbacks for Step 11 operational control commands with strict role verification."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = query.from_user
+    if not user:
+        return
+
+    data = query.callback_data or ""
+    parts = data.split(":")
+    if len(parts) < 2:
+        return
+
+    action = parts[0]
+    page = int(parts[1]) if parts[1].isdigit() else 1
+    offset = (page - 1) * 10
+
+    is_adm = is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)
+
+    if action in ("op_pending", "op_review", "op_completed", "op_cancelled", "op_failed"):
+        if not is_adm:
+            await query.edit_message_text("⛔ Unauthorized.")
+            return
+
+    if action == "op_pending":
+        from database import get_pending_orders_paginated
+        orders, total_count = await get_pending_orders_paginated(offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"⏳ <b>Pending Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No pending orders found.</i>"
+        else:
+            for ord_item in orders:
+                loader_str = "Unassigned"
+                if ord_item.loader_group_id:
+                    l_info = LOADERS_CACHE.get(ord_item.loader_group_id)
+                    loader_str = l_info["name"] if l_info else f"Loader #{ord_item.loader_group_id}"
+                c_price_str = ord_item.price or ("$"+str(ord_item.client_price_total) if ord_item.client_price_total else "Unpriced")
+                msg += f"• <b>Order #{ord_item.id}</b>\n  Status: {html.escape(ord_item.status or 'Pending')}\n  Customer: {html.escape(ord_item.email or 'None')}\n  Package: {html.escape(ord_item.package or 'N/A')}\n  Client Price: {c_price_str}\n  Loader: {html.escape(loader_str)}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_pending:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_pending:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
+    elif action == "op_myorders":
+        from database import get_orders_for_loader
+        orders, total_count = await get_orders_for_loader(user.id, offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"📦 <b>My Active Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No active orders assigned to you.</i>"
+        else:
+            for ord_item in orders:
+                msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Status: {html.escape(ord_item.status or 'Pending')}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_myorders:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_myorders:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
+    elif action == "op_review":
+        from database import get_orders_by_status_paginated
+        orders, total_count = await get_orders_by_status_paginated(["NEEDS_REVIEW", "Needs_Review", "Needs Review", "FAILED", "Failed"], offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"⚠️ <b>Orders Needing Review</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No orders needing review.</i>"
+        else:
+            for ord_item in orders:
+                diag_reason = "Missing price or configuration error"
+                if not ord_item.client_price_total:
+                    diag_reason = f"Missing Client Price for package '{ord_item.package}'"
+                elif not ord_item.loader_cost_total:
+                    diag_reason = f"Missing Loader Cost for loader group #{ord_item.loader_group_id}"
+                msg += f"• <b>Order #{ord_item.id}</b>\n  Status: {html.escape(ord_item.status or 'Needs Review')}\n  Package: {html.escape(ord_item.package or 'N/A')}\n  Diagnostic: {html.escape(diag_reason)}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_review:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_review:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
+    elif action == "op_completed":
+        from database import get_orders_by_status_paginated
+        orders, total_count = await get_orders_by_status_paginated(["Completed", "COMPLETED"], offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"✅ <b>Completed Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No completed orders found.</i>"
+        else:
+            for ord_item in orders:
+                c_str = f"${ord_item.client_price_total:g}" if ord_item.client_price_total else (ord_item.price or "N/A")
+                msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Client Price: {c_str} | Profit Code: {ord_item.secret_profit_code or 'N/A'}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_completed:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_completed:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
+    elif action == "op_cancelled":
+        from database import get_orders_by_status_paginated
+        orders, total_count = await get_orders_by_status_paginated(["Cancelled", "CANCELLED"], offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"🚫 <b>Cancelled Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No cancelled orders found.</i>"
+        else:
+            for ord_item in orders:
+                msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Customer: {html.escape(ord_item.email or 'N/A')}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_cancelled:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_cancelled:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
+    elif action == "op_failed":
+        from database import get_orders_by_status_paginated
+        orders, total_count = await get_orders_by_status_paginated(["FAILED", "Failed"], offset=offset, limit=10)
+        total_pages = max(1, (total_count + 9) // 10)
+        msg = f"❌ <b>Failed Orders</b> (Page {page}/{total_pages} - Total: {total_count})\n\n"
+        if not orders:
+            msg += "<i>No failed orders found.</i>"
+        else:
+            for ord_item in orders:
+                msg += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')}\n  Customer: {html.escape(ord_item.email or 'N/A')}\n\n"
+
+        buttons = []
+        if page > 1:
+            buttons.append(InlineKeyboardButton("◀ Prev", callback_data=f"op_failed:{page-1}"))
+        if page < total_pages:
+            buttons.append(InlineKeyboardButton("Next ▶", callback_data=f"op_failed:{page+1}"))
+        kb = InlineKeyboardMarkup([buttons]) if buttons else None
+        await query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+
 

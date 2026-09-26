@@ -79,6 +79,8 @@ from handlers import (
     resetgroups_command,
     exportprices_command_handler,
     updateprices_command_handler,
+    setclientprice_command_handler,
+    setloaderprice_command_handler,
     bulk_price_update_text_handler,
     undo_command_handler,
     ledger_undo_callback_handler,
@@ -95,7 +97,19 @@ from handlers import (
     pay_running_total_command_handler,
     manual_running_total_text_handler,
     running_total_undo_command_handler,
-    running_total_undo_callback_handler
+    running_total_undo_callback_handler,
+    pendingorders_command_handler,
+    order_lookup_command_handler,
+    order_status_command_handler,
+    assignloader_command_handler,
+    reassignloader_command_handler,
+    myorders_command_handler,
+    revieworders_command_handler,
+    completedorders_command_handler,
+    cancelledorders_command_handler,
+    failedorders_command_handler,
+    retryorder_command_handler,
+    operational_pagination_callback_handler
 )
 
 # Initialize application logging
@@ -266,6 +280,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("restore", restore_command))
     application.add_handler(CommandHandler("exportprices", exportprices_command_handler))
     application.add_handler(CommandHandler("updateprices", updateprices_command_handler))
+    application.add_handler(CommandHandler("setclientprice", setclientprice_command_handler))
+    application.add_handler(CommandHandler("setloaderprice", setloaderprice_command_handler))
     application.add_handler(CommandHandler("calculate", calculate_command_handler))
     application.add_handler(CommandHandler("total", running_total_command_handler))
     application.add_handler(CommandHandler("pay", pay_running_total_command_handler))
@@ -279,7 +295,19 @@ def build_application() -> Application:
     application.add_handler(CommandHandler(["wallet", "balance"], wallet_command_handler))
     application.add_handler(CommandHandler("testbinance", testbinance_command_handler))
 
+    # Operational Controls Handlers (Step 11)
+    application.add_handler(CommandHandler("pendingorders", pendingorders_command_handler))
+    application.add_handler(CommandHandler("assignloader", assignloader_command_handler))
+    application.add_handler(CommandHandler("reassignloader", reassignloader_command_handler))
+    application.add_handler(CommandHandler("myorders", myorders_command_handler))
+    application.add_handler(CommandHandler("revieworders", revieworders_command_handler))
+    application.add_handler(CommandHandler("completedorders", completedorders_command_handler))
+    application.add_handler(CommandHandler("cancelledorders", cancelledorders_command_handler))
+    application.add_handler(CommandHandler("failedorders", failedorders_command_handler))
+    application.add_handler(CommandHandler("retryorder", retryorder_command_handler))
+
     # Register Interactive Callback Query Handlers
+    application.add_handler(CallbackQueryHandler(operational_pagination_callback_handler, pattern="^op_"))
     application.add_handler(CallbackQueryHandler(client_cancellation_request_callback_handler, pattern="^cancel_req_"))
     application.add_handler(CallbackQueryHandler(duplicate_order_callback_handler, pattern="^dup_"))
     application.add_handler(CallbackQueryHandler(category_b_approval_callback_handler, pattern="^catb_"))

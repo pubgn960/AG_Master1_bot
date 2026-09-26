@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import joinedload
 
 from config import Config
-from models import Base, Order, Image, Settings, AuthorizedUser, ClientGroup, Loader, DeliverySession, PackagePrice, DeliveryLedger, CalculatorLedger, RunningTotalLedger, Wallet, WalletTransaction, PaymentTransaction, BinanceClientIdentity
+from models import Base, Order, Image, Settings, AuthorizedUser, ClientGroup, Loader, DeliverySession, PackagePrice, DeliveryLedger, CalculatorLedger, RunningTotalLedger, Wallet, WalletTransaction, PaymentTransaction, BinanceClientIdentity, GlobalClientPrice, LoaderPrice, OrderItem
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,13 @@ CLIENT_GROUPS_CACHE: Dict[int, str] = {}
 
 # Global in-memory loaders cache: loader_id -> {"id": ..., "name": ..., "group_id": ...}
 LOADERS_CACHE: Dict[int, Dict[str, Any]] = {}
+
+# Global in-memory client prices cache: product_key -> price dict
+GLOBAL_CLIENT_PRICES_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Global in-memory loader prices cache: loader_id -> {product_key -> price dict}
+LOADER_PRICES_CACHE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+
 
 
 async def dispose_engine() -> None:
@@ -107,7 +114,11 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
             ("cancellation_requested_at", "TIMESTAMP WITH TIME ZONE" if is_postgres else "DATETIME"),
             ("cancellation_requested_by", bigint_type),
             ("cancellation_decision", "VARCHAR(50)"),
-            ("cancellation_decided_at", "TIMESTAMP WITH TIME ZONE" if is_postgres else "DATETIME")
+            ("cancellation_decided_at", "TIMESTAMP WITH TIME ZONE" if is_postgres else "DATETIME"),
+            ("client_price_total", "FLOAT"),
+            ("loader_cost_total", "FLOAT"),
+            ("profit_amount", "FLOAT"),
+            ("secret_profit_code", "VARCHAR(100)")
         ]
         for col_name, col_type in columns_to_add:
             if col_name.lower() not in existing_columns:
@@ -123,16 +134,25 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
 
     if "delivery_ledger" in tables:
         existing_columns = {col["name"].lower() for col in inspector.get_columns("delivery_ledger")}
-        if "chat_id" not in existing_columns:
-            logger.info("Adding missing column chat_id to delivery_ledger...")
-            try:
-                if is_postgres:
-                    sync_conn.execute(text(f"ALTER TABLE delivery_ledger ADD COLUMN IF NOT EXISTS chat_id {bigint_type};"))
-                else:
-                    sync_conn.execute(text(f"ALTER TABLE delivery_ledger ADD COLUMN chat_id {bigint_type};"))
-                logger.info("Successfully added column chat_id to delivery_ledger.")
-            except Exception as e:
-                logger.error(f"Failed to add column chat_id to delivery_ledger: {e}")
+        ledger_columns_to_add = [
+            ("chat_id", bigint_type),
+            ("client_amount", "FLOAT"),
+            ("loader_cost", "FLOAT"),
+            ("profit_amount", "FLOAT"),
+            ("secret_profit_code", "VARCHAR(100)")
+        ]
+        for col_name, col_type in ledger_columns_to_add:
+            if col_name.lower() not in existing_columns:
+                logger.info(f"Adding missing column {col_name} to delivery_ledger...")
+                try:
+                    if is_postgres:
+                        sync_conn.execute(text(f"ALTER TABLE delivery_ledger ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                    else:
+                        sync_conn.execute(text(f"ALTER TABLE delivery_ledger ADD COLUMN {col_name} {col_type};"))
+                    logger.info(f"Successfully added column {col_name} to delivery_ledger.")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name} to delivery_ledger: {e}")
+
 
     if "running_total_ledger" in tables:
         existing_columns = {col["name"].lower() for col in inspector.get_columns("running_total_ledger")}
@@ -180,6 +200,9 @@ async def init_db() -> None:
     await reload_bot_settings_cache()
     await reload_loaders_cache()
     await seed_and_load_package_prices()
+    await reload_global_client_prices_cache()
+    await reload_loader_prices_cache()
+
 
 
 # ==========================================
@@ -795,13 +818,105 @@ async def set_order_loader_message_id(order_id: int, loader_message_id: int, loa
         await session.commit()
         logger.info(f"Forwarded Order | Order ID: #{order_id} -> Loader Msg ID: {loader_message_id} (Loader Group: {loader_group_id})")
 
+    await save_order_pricing(order_id)
 
-async def get_order_by_id(order_id: int) -> Optional[Order]:
-    """Retrieves an Order by Order ID with images eagerly loaded."""
+
+async def save_order_pricing(
+    order_id: int,
+    loader_id: Optional[int] = None,
+    client_price_map: Optional[Dict[str, Any]] = None,
+    loader_price_map: Optional[Dict[str, Any]] = None
+) -> Optional[Order]:
+    """
+    Calculates and updates order financial fields (client_price_total, loader_cost_total, profit_amount, secret_profit_code)
+    and populates OrderItem database records atomically.
+    """
+    from pricing_calculator import calculate_order_pricing
+
     async with AsyncSessionLocal() as session:
         stmt = (
             select(Order)
-            .options(joinedload(Order.images))
+            .options(joinedload(Order.items))
+            .where(Order.id == order_id)
+        )
+        res = await session.execute(stmt)
+        order = res.unique().scalar_one_or_none()
+        if not order:
+            return None
+
+        resolved_loader_id = loader_id
+        if resolved_loader_id is None and order.loader_group_id:
+            for l_id, l_data in LOADERS_CACHE.items():
+                if l_data.get("group_id") == order.loader_group_id or l_id == order.loader_group_id:
+                    resolved_loader_id = l_id
+                    break
+
+            if resolved_loader_id is None:
+                stmt_l = select(Loader).where(
+                    or_(Loader.group_id == order.loader_group_id, Loader.id == order.loader_group_id)
+                )
+                loader_obj = (await session.execute(stmt_l)).scalar_one_or_none()
+                if loader_obj:
+                    resolved_loader_id = loader_obj.id
+
+        if resolved_loader_id is not None:
+            loader_info = LOADERS_CACHE.get(resolved_loader_id)
+            order.loader_group_id = loader_info["group_id"] if (loader_info and loader_info.get("group_id")) else resolved_loader_id
+
+        calc_res = await calculate_order_pricing(
+            order_items_or_text=order.package or order.raw_text or "",
+            loader_id=resolved_loader_id,
+            client_price_map=client_price_map,
+            loader_price_map=loader_price_map
+        )
+
+        c_total = calc_res["client_price_total"]
+        l_total = calc_res["loader_cost_total"]
+        p_amount = calc_res["profit_amount"]
+        code = calc_res["secret_profit_code"]
+
+        order.client_price_total = float(c_total) if c_total is not None else None
+        order.loader_cost_total = float(l_total) if l_total is not None else None
+        order.profit_amount = float(p_amount) if p_amount is not None else None
+        order.secret_profit_code = code
+
+        if c_total is not None:
+            order.price = f"${float(c_total):g}"
+
+        await session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
+
+        for it in calc_res["items"]:
+            c_u = float(it["client_unit_price"]) if it["client_unit_price"] is not None else 0.0
+            c_lt = float(it["client_line_total"]) if it["client_line_total"] is not None else 0.0
+            l_u = float(it["loader_unit_cost"]) if it["loader_unit_cost"] is not None else 0.0
+            l_lt = float(it["loader_line_total"]) if it["loader_line_total"] is not None else 0.0
+            p_a = float(it["profit_amount"]) if it["profit_amount"] is not None else 0.0
+
+            db_item = OrderItem(
+                order_id=order_id,
+                product_key=it["product_key"],
+                product_type=it["product_type"],
+                display_name=it["display_name"],
+                quantity=it["quantity"],
+                client_unit_price=c_u,
+                client_line_total=c_lt,
+                loader_unit_cost=l_u,
+                loader_line_total=l_lt,
+                profit_amount=p_a
+            )
+            session.add(db_item)
+
+        await session.commit()
+        await session.refresh(order)
+        return order
+
+
+async def get_order_by_id(order_id: int) -> Optional[Order]:
+    """Retrieves an Order by Order ID with images and items eagerly loaded."""
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(Order)
+            .options(joinedload(Order.images), joinedload(Order.items))
             .where(Order.id == order_id)
         )
         res = await session.execute(stmt)
@@ -1038,6 +1153,89 @@ async def mark_order_delivered(order_id: int) -> Optional[Order]:
         return order
 
 
+async def mark_order_completed(order_id: int) -> Optional[Order]:
+    """Updates order status to 'Completed' and sets delivered_at timestamp if not set."""
+    async with AsyncSessionLocal() as session:
+        now_utc = datetime.now(timezone.utc)
+        stmt = (
+            update(Order)
+            .where(Order.id == order_id)
+            .values(
+                status="Completed",
+                delivered_at=Order.delivered_at or now_utc
+            )
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+        res = await session.execute(
+            select(Order).options(joinedload(Order.images), joinedload(Order.items)).where(Order.id == order_id)
+        )
+        order = res.unique().scalar_one_or_none()
+        logger.info(f"Order Completed | Order ID: #{order_id} marked as Completed.")
+        return order
+
+
+async def transition_order_status(
+    order_id: int,
+    target_status: str,
+    loader_id: Optional[int] = None
+) -> Tuple[Optional[Order], bool, str]:
+    """
+    Safely transitions an Order's status through the canonical lifecycle:
+    PENDING -> PRICED -> LOADER_ASSIGNED -> SENT_TO_LOADER -> DELIVERED -> COMPLETED
+    Supports CANCELLED, FAILED, and NEEDS_REVIEW states.
+    Prevents invalid state jumps (e.g. PENDING -> COMPLETED or COMPLETED -> SENT_TO_LOADER).
+
+    Returns:
+        Tuple[Optional[Order], bool, str]: (order_object, success, reason)
+    """
+    valid_statuses = {
+        "PENDING", "PRICED", "LOADER_ASSIGNED", "SENT_TO_LOADER",
+        "DELIVERED", "COMPLETED", "CANCELLED", "FAILED", "NEEDS_REVIEW",
+        "Pending", "Priced", "Loader_Assigned", "Sent_To_Loader",
+        "Delivered", "Completed", "Cancelled", "Failed", "Needs_Review", "Needs Review"
+    }
+
+    t_status = target_status.strip()
+    if t_status not in valid_statuses:
+        return None, False, f"Invalid target status: '{target_status}'"
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(Order).options(joinedload(Order.items)).where(Order.id == order_id)
+        res = await session.execute(stmt)
+        order = res.unique().scalar_one_or_none()
+        if not order:
+            return None, False, "ORDER_NOT_FOUND"
+
+        curr = (order.status or "Pending").strip()
+
+        # Disallow state transition on already completed orders unless administrative
+        if curr in ("Completed", "COMPLETED") and t_status not in ("Completed", "COMPLETED", "CANCELLED", "Cancelled"):
+            return order, False, "INVALID_TRANSITION_ALREADY_COMPLETED"
+
+        # Disallow jump from Pending directly to Completed
+        if curr in ("Pending", "PENDING") and t_status in ("Completed", "COMPLETED", "Sent_To_Loader", "SENT_TO_LOADER"):
+            return order, False, "INVALID_TRANSITION_JUMP"
+
+        # Perform status update
+        order.status = t_status
+        if t_status in ("Delivered", "DELIVERED", "Completed", "COMPLETED") and not order.delivered_at:
+            order.delivered_at = datetime.now(timezone.utc)
+
+        await session.commit()
+        await session.refresh(order)
+
+    # If transitioning to LOADER_ASSIGNED or PRICED, refresh financial pricing calculations
+    if t_status in ("Loader_Assigned", "LOADER_ASSIGNED", "Priced", "PRICED"):
+        updated_order = await save_order_pricing(order_id, loader_id=loader_id)
+        if updated_order:
+            order = updated_order
+
+    logger.info(f"[ORDER_STATUS] Order #{order_id} transitioned: '{curr}' -> '{t_status}'")
+    return order, True, "SUCCESS"
+
+
 async def cancel_order(order_id: int) -> Tuple[Optional[Order], bool]:
     """Cancels a pending order."""
     async with AsyncSessionLocal() as session:
@@ -1103,6 +1301,90 @@ async def get_all_orders_by_email(email: str) -> List[Order]:
         )
         result = await session.execute(stmt)
         return list(result.unique().scalars().all())
+
+
+async def get_pending_orders_paginated(offset: int = 0, limit: int = 10) -> Tuple[List[Order], int]:
+    """Retrieves paginated active pending/actionable orders ordered by creation timestamp desc."""
+    async with AsyncSessionLocal() as session:
+        base_stmt = select(Order).where(Order.status.in_(["Pending", "PENDING", "PRICED", "Priced", "LOADER_ASSIGNED", "Loader_Assigned", "SENT_TO_LOADER", "Sent_To_Loader", "Needs_Review", "NEEDS_REVIEW"]))
+        count_stmt = select(func.count()).select_from(base_stmt.subquery())
+        total_count = (await session.execute(count_stmt)).scalar() or 0
+
+        stmt = base_stmt.options(joinedload(Order.items)).order_by(Order.created_at.desc()).offset(offset).limit(limit)
+        res = await session.execute(stmt)
+        return list(res.unique().scalars().all()), total_count
+
+
+async def get_orders_by_status_paginated(status_list: List[str], offset: int = 0, limit: int = 10) -> Tuple[List[Order], int]:
+    """Retrieves paginated orders matching specified status list ordered by creation timestamp desc."""
+    async with AsyncSessionLocal() as session:
+        base_stmt = select(Order).where(Order.status.in_(status_list))
+        count_stmt = select(func.count()).select_from(base_stmt.subquery())
+        total_count = (await session.execute(count_stmt)).scalar() or 0
+
+        stmt = base_stmt.options(joinedload(Order.items)).order_by(Order.created_at.desc()).offset(offset).limit(limit)
+        res = await session.execute(stmt)
+        return list(res.unique().scalars().all()), total_count
+
+
+async def get_orders_for_loader(loader_id: int, offset: int = 0, limit: int = 10) -> Tuple[List[Order], int]:
+    """Retrieves paginated active orders assigned strictly to a specific loader."""
+    async with AsyncSessionLocal() as session:
+        loader_group = None
+        if loader_id in LOADERS_CACHE:
+            loader_group = LOADERS_CACHE[loader_id].get("group_id")
+
+        conds = [Order.loader_group_id == loader_id]
+        if loader_group:
+            conds.append(Order.loader_group_id == loader_group)
+
+        base_stmt = select(Order).where(or_(*conds)).where(Order.status.not_in(["Completed", "COMPLETED", "Cancelled", "CANCELLED"]))
+        count_stmt = select(func.count()).select_from(base_stmt.subquery())
+        total_count = (await session.execute(count_stmt)).scalar() or 0
+
+        stmt = base_stmt.options(joinedload(Order.items)).order_by(Order.created_at.desc()).offset(offset).limit(limit)
+        res = await session.execute(stmt)
+        return list(res.unique().scalars().all()), total_count
+
+
+async def assign_order_loader(order_id: int, loader_id: int) -> Tuple[Optional[Order], bool, str]:
+    """Assigns an order to a specific loader and updates status to LOADER_ASSIGNED."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Order).where(Order.id == order_id)
+        res = await session.execute(stmt)
+        order = res.scalar_one_or_none()
+        if not order:
+            return None, False, "ORDER_NOT_FOUND"
+
+        if order.status in ("Completed", "COMPLETED", "Delivered", "DELIVERED"):
+            return order, False, "CANNOT_MODIFY_COMPLETED_ORDER"
+
+        loader_info = LOADERS_CACHE.get(loader_id)
+        group_id_to_set = loader_info["group_id"] if loader_info else loader_id
+        order.loader_group_id = group_id_to_set
+        await session.commit()
+
+    return await transition_order_status(order_id, "LOADER_ASSIGNED", loader_id=loader_id)
+
+
+async def reassign_order_loader(order_id: int, new_loader_id: int) -> Tuple[Optional[Order], bool, str]:
+    """Reassigns a non-completed order to a new loader."""
+    return await assign_order_loader(order_id, new_loader_id)
+
+
+async def retry_order(order_id: int) -> Tuple[Optional[Order], bool, str]:
+    """Safely retries/recovers an eligible order without financial side effects."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Order).where(Order.id == order_id)
+        res = await session.execute(stmt)
+        order = res.scalar_one_or_none()
+        if not order:
+            return None, False, "ORDER_NOT_FOUND"
+
+        if order.status in ("Completed", "COMPLETED"):
+            return order, False, "ORDER_ALREADY_COMPLETED"
+
+    return await transition_order_status(order_id, "SENT_TO_LOADER")
 
 
 async def delete_orders_by_email(email: str) -> int:
@@ -1528,12 +1810,372 @@ async def bulk_update_package_prices_in_db(
             raise e
 
 
+# ==========================================
+# STEP 2: Global Client Prices & Loader Prices DB API
+# ==========================================
+
+async def reload_global_client_prices_cache() -> Dict[str, Dict[str, Any]]:
+    """Loads all active GlobalClientPrice records from DB into RAM cache."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(GlobalClientPrice).where(GlobalClientPrice.active == True)
+        res = await session.execute(stmt)
+        prices = list(res.scalars().all())
+
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+        for p in prices:
+            GLOBAL_CLIENT_PRICES_CACHE[p.product_key] = {
+                "id": p.id,
+                "product_key": p.product_key,
+                "display_name": p.display_name,
+                "package_type": p.package_type,
+                "price": p.price,
+                "currency": p.currency,
+                "active": p.active
+            }
+    logger.info(f"[CACHE] Loaded {len(GLOBAL_CLIENT_PRICES_CACHE)} Global Client Price(s) into RAM cache.")
+    return GLOBAL_CLIENT_PRICES_CACHE
+
+
+async def reload_loader_prices_cache(loader_id: Optional[int] = None) -> Dict[int, Dict[str, Dict[str, Any]]]:
+    """Loads active LoaderPrice records from DB into RAM cache."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(LoaderPrice).where(LoaderPrice.active == True)
+        if loader_id is not None:
+            stmt = stmt.where(LoaderPrice.loader_id == loader_id)
+            res = await session.execute(stmt)
+            prices = list(res.scalars().all())
+            LOADER_PRICES_CACHE[loader_id] = {
+                p.product_key: {
+                    "id": p.id,
+                    "loader_id": p.loader_id,
+                    "product_key": p.product_key,
+                    "display_name": p.display_name,
+                    "package_type": p.package_type,
+                    "cost": p.cost,
+                    "currency": p.currency,
+                    "active": p.active
+                } for p in prices
+            }
+        else:
+            res = await session.execute(stmt)
+            prices = list(res.scalars().all())
+            LOADER_PRICES_CACHE.clear()
+            for p in prices:
+                if p.loader_id not in LOADER_PRICES_CACHE:
+                    LOADER_PRICES_CACHE[p.loader_id] = {}
+                LOADER_PRICES_CACHE[p.loader_id][p.product_key] = {
+                    "id": p.id,
+                    "loader_id": p.loader_id,
+                    "product_key": p.product_key,
+                    "display_name": p.display_name,
+                    "package_type": p.package_type,
+                    "cost": p.cost,
+                    "currency": p.currency,
+                    "active": p.active
+                }
+    logger.info(f"[CACHE] Loaded Loader Prices for {len(LOADER_PRICES_CACHE)} loader(s) into RAM cache.")
+    return LOADER_PRICES_CACHE
+
+
+async def get_all_global_client_prices_from_db() -> List[GlobalClientPrice]:
+    """Retrieves all GlobalClientPrice records from DB."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(GlobalClientPrice).order_by(GlobalClientPrice.product_key)
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def get_global_client_price(product_key: str) -> Optional[float]:
+    """
+    Retrieves the global client price for a specific product_key.
+    Checks RAM cache first, falls back to DB query.
+    Returns float price or None if not found.
+    """
+    pkey = product_key.strip().lower()
+    if pkey in GLOBAL_CLIENT_PRICES_CACHE:
+        return GLOBAL_CLIENT_PRICES_CACHE[pkey].get("price")
+    async with AsyncSessionLocal() as session:
+        stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey, GlobalClientPrice.active == True)
+        item = (await session.execute(stmt)).scalar_one_or_none()
+        if item:
+            return item.price
+    return None
+
+
+async def get_all_global_client_prices() -> Dict[str, Dict[str, Any]]:
+    """
+    Retrieves all global client prices dictionary (product_key -> price info dict).
+    Uses GLOBAL_CLIENT_PRICES_CACHE as source of truth.
+    """
+    if not GLOBAL_CLIENT_PRICES_CACHE:
+        await reload_global_client_prices_cache()
+    return GLOBAL_CLIENT_PRICES_CACHE
+
+
+async def set_global_client_price(
+    product_key: str,
+    price: float,
+    display_name: Optional[str] = None,
+    package_type: str = "normal_cp",
+    currency: str = "USD"
+) -> GlobalClientPrice:
+    """Sets or updates a single global client price entry in DB and RAM cache."""
+    return await set_global_client_price_in_db(
+        product_key=product_key,
+        price=price,
+        display_name=display_name,
+        package_type=package_type,
+        currency=currency
+    )
+
+
+async def update_global_client_prices(price_map: Dict[str, float]) -> bool:
+    """Updates multiple global client prices atomically in DB & cache."""
+    return await bulk_set_global_client_prices_in_db(price_map)
+
+
+async def set_global_client_price_in_db(
+    product_key: str,
+    price: float,
+    display_name: Optional[str] = None,
+    package_type: str = "normal_cp",
+    currency: str = "USD"
+) -> GlobalClientPrice:
+    """Sets or updates a single global client price entry in database and updates RAM cache."""
+    pkey = product_key.strip().lower()
+    dname = display_name or pkey.replace("_", " ").upper()
+    async with AsyncSessionLocal() as session:
+        stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey)
+        item = (await session.execute(stmt)).scalar_one_or_none()
+        if item:
+            item.price = float(price)
+            item.display_name = dname
+            item.package_type = package_type
+            item.currency = currency
+            item.active = True
+            item.updated_at = datetime.now(timezone.utc)
+        else:
+            item = GlobalClientPrice(
+                product_key=pkey,
+                display_name=dname,
+                package_type=package_type,
+                price=float(price),
+                currency=currency,
+                active=True
+            )
+            session.add(item)
+        await session.commit()
+        await session.refresh(item)
+    await reload_global_client_prices_cache()
+    return item
+
+
+async def bulk_set_global_client_prices_in_db(price_map: Dict[str, float]) -> bool:
+    """Bulk upserts multiple global client prices in database."""
+    async with AsyncSessionLocal() as session:
+        try:
+            now = datetime.now(timezone.utc)
+            for pkey_raw, val in price_map.items():
+                pkey = pkey_raw.strip().lower()
+                dname = pkey.replace("_", " ").upper()
+                stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey)
+                existing = (await session.execute(stmt)).scalar_one_or_none()
+                if existing:
+                    existing.price = float(val)
+                    existing.updated_at = now
+                else:
+                    session.add(GlobalClientPrice(
+                        product_key=pkey,
+                        display_name=dname,
+                        package_type="normal_cp",
+                        price=float(val),
+                        currency="USD",
+                        active=True
+                    ))
+            await session.commit()
+            await reload_global_client_prices_cache()
+            return True
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"[GLOBAL_CLIENT_PRICES_UPDATE] Failed: {e}")
+            raise e
+
+
+async def get_loader_price(loader_id: int, product_key: str) -> Optional[Decimal]:
+    """
+    Retrieves the loader cost price for a specific loader_id and product_key as a Decimal.
+    Checks RAM cache first, falls back to DB query.
+    Returns Decimal or None if not found.
+    """
+    pkey = product_key.strip().lower()
+    if loader_id not in LOADER_PRICES_CACHE:
+        await reload_loader_prices_cache(loader_id=loader_id)
+
+    loader_cache = LOADER_PRICES_CACHE.get(loader_id, {})
+    if pkey in loader_cache:
+        cost_val = loader_cache[pkey].get("cost")
+        if cost_val is not None:
+            return Decimal(str(cost_val))
+
+    async with AsyncSessionLocal() as session:
+        stmt = select(LoaderPrice).where(
+            LoaderPrice.loader_id == loader_id,
+            LoaderPrice.product_key == pkey,
+            LoaderPrice.active == True
+        )
+        item = (await session.execute(stmt)).scalar_one_or_none()
+        if item and item.cost is not None:
+            return Decimal(str(item.cost))
+
+    return None
+
+
+async def get_all_loader_prices(loader_id: int) -> Dict[str, Dict[str, Any]]:
+    """
+    Retrieves all active loader prices dictionary (product_key -> price info dict) for loader_id.
+    Uses LOADER_PRICES_CACHE as source of truth.
+    """
+    if loader_id not in LOADER_PRICES_CACHE:
+        await reload_loader_prices_cache(loader_id=loader_id)
+
+    return LOADER_PRICES_CACHE.get(loader_id, {})
+
+
+async def set_loader_price(
+    loader_id: int,
+    product_key: str,
+    cost: Union[Decimal, float, int, str],
+    display_name: Optional[str] = None,
+    package_type: str = "normal_cp",
+    currency: str = "USD"
+) -> LoaderPrice:
+    """Sets or updates a single private loader price entry in DB and updates RAM cache."""
+    return await set_loader_price_in_db(
+        loader_id=loader_id,
+        product_key=product_key,
+        cost=float(Decimal(str(cost))),
+        display_name=display_name,
+        package_type=package_type,
+        currency=currency
+    )
+
+
+async def update_loader_prices(
+    loader_id: int,
+    price_map: Dict[str, Union[Decimal, float, int, str]]
+) -> bool:
+    """
+    Updates multiple loader prices for loader_id atomically in DB & cache.
+    Performs partial update: only product keys in price_map are updated.
+    Existing prices for other products remain unchanged.
+    """
+    cost_map = {k: float(Decimal(str(v))) for k, v in price_map.items()}
+    return await bulk_set_loader_prices_in_db(loader_id, cost_map)
+
+
+async def get_all_loader_prices_from_db(loader_id: int) -> List[LoaderPrice]:
+    """Retrieves all LoaderPrice records for a specific loader_id."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(LoaderPrice).where(LoaderPrice.loader_id == loader_id).order_by(LoaderPrice.product_key)
+        res = await session.execute(stmt)
+        return list(res.scalars().all())
+
+
+async def set_loader_price_in_db(
+    loader_id: int,
+    product_key: str,
+    cost: float,
+    display_name: Optional[str] = None,
+    package_type: str = "normal_cp",
+    currency: str = "USD"
+) -> LoaderPrice:
+    """Sets or updates a private loader price entry in database and updates RAM cache."""
+    from product_catalog import PRODUCT_CATALOG
+    pkey = product_key.strip().lower()
+    catalog_item = PRODUCT_CATALOG.get(pkey, {})
+    dname = display_name or catalog_item.get("display_name") or pkey.replace("_", " ").upper()
+    pkg_type = catalog_item.get("package_type") or package_type
+    curr = catalog_item.get("currency") or currency
+    async with AsyncSessionLocal() as session:
+        stmt = select(LoaderPrice).where(
+            LoaderPrice.loader_id == loader_id,
+            LoaderPrice.product_key == pkey
+        )
+        item = (await session.execute(stmt)).scalar_one_or_none()
+        if item:
+            item.cost = float(cost)
+            item.display_name = dname
+            item.package_type = pkg_type
+            item.currency = curr
+            item.active = True
+            item.updated_at = datetime.now(timezone.utc)
+        else:
+            item = LoaderPrice(
+                loader_id=loader_id,
+                product_key=pkey,
+                display_name=dname,
+                package_type=pkg_type,
+                cost=float(cost),
+                currency=curr,
+                active=True
+            )
+            session.add(item)
+        await session.commit()
+        await session.refresh(item)
+    await reload_loader_prices_cache(loader_id=loader_id)
+    return item
+
+
+async def bulk_set_loader_prices_in_db(loader_id: int, cost_map: Dict[str, float]) -> bool:
+    """Bulk upserts multiple loader prices for a specific loader_id."""
+    from product_catalog import PRODUCT_CATALOG
+    async with AsyncSessionLocal() as session:
+        try:
+            now = datetime.now(timezone.utc)
+            for pkey_raw, val in cost_map.items():
+                pkey = pkey_raw.strip().lower()
+                catalog_item = PRODUCT_CATALOG.get(pkey, {})
+                dname = catalog_item.get("display_name") or pkey.replace("_", " ").upper()
+                pkg_type = catalog_item.get("package_type") or "normal_cp"
+                curr = catalog_item.get("currency") or "USD"
+
+                stmt = select(LoaderPrice).where(
+                    LoaderPrice.loader_id == loader_id,
+                    LoaderPrice.product_key == pkey
+                )
+                existing = (await session.execute(stmt)).scalar_one_or_none()
+                if existing:
+                    existing.cost = float(val)
+                    existing.display_name = dname
+                    existing.package_type = pkg_type
+                    existing.currency = curr
+                    existing.updated_at = now
+                else:
+                    session.add(LoaderPrice(
+                        loader_id=loader_id,
+                        product_key=pkey,
+                        display_name=dname,
+                        package_type=pkg_type,
+                        cost=float(val),
+                        currency=curr,
+                        active=True
+                    ))
+            await session.commit()
+            await reload_loader_prices_cache(loader_id=loader_id)
+            return True
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"[LOADER_PRICES_UPDATE] Failed for loader #{loader_id}: {e}")
+            raise e
+
+
 async def update_single_package_price_in_db(
     pkg: str,
     price_val: float,
     category: str = "A",
     updated_by_id: Optional[int] = None
 ) -> bool:
+
     """
     Updates price for a single package in DB via UPSERT and reloads in-memory cache for category.
     Canonical package alias normalization is applied.
@@ -1854,12 +2496,17 @@ async def get_current_running_total(chat_id: Optional[int] = None) -> float:
 async def record_delivery_ledger_entry(
     order_id: Optional[int],
     package: Optional[str],
-    now_value: float,
+    now_value: Optional[float] = None,
     loader_name: Optional[str] = None,
     dedup_hash: Optional[str] = None,
     reason: Optional[str] = None,
     is_manual: bool = False,
-    chat_id: Optional[int] = None
+    chat_id: Optional[int] = None,
+    price: Optional[float] = None,
+    client_amount: Optional[float] = None,
+    loader_cost: Optional[float] = None,
+    profit_amount: Optional[float] = None,
+    secret_profit_code: Optional[str] = None
 ) -> Tuple[Optional[DeliveryLedger], bool]:
     """
     Records an independent delivery ledger entry and updates the running total for a specific chat_id.
@@ -1868,6 +2515,10 @@ async def record_delivery_ledger_entry(
     """
     async with AsyncSessionLocal() as session:
         try:
+            val_now = now_value if now_value is not None else (price if price is not None else 0.0)
+            entry_price = price if price is not None else val_now
+            entry_client = client_amount if client_amount is not None else entry_price
+
             if dedup_hash:
                 stmt = select(DeliveryLedger).where(DeliveryLedger.dedup_hash == dedup_hash)
                 dup = (await session.execute(stmt)).scalar_one_or_none()
@@ -1891,16 +2542,20 @@ async def record_delivery_ledger_entry(
 
             # Get current active running total for this chat_id
             before_total = await get_running_total_current(chat_id=chat_id)
-            new_running_total = before_total + now_value
+            new_running_total = before_total + val_now
 
             now_dt = datetime.now(timezone.utc)
             entry = DeliveryLedger(
                 chat_id=chat_id,
                 order_id=order_id,
                 package=package,
-                price=now_value,
+                price=entry_price,
+                client_amount=entry_client,
+                loader_cost=loader_cost,
+                profit_amount=profit_amount,
+                secret_profit_code=secret_profit_code,
                 before_total=before_total,
-                now_value=now_value,
+                now_value=val_now,
                 running_total=new_running_total,
                 loader=loader_name,
                 reason=reason,
@@ -1911,11 +2566,11 @@ async def record_delivery_ledger_entry(
             session.add(entry)
 
             # Sync RunningTotalLedger table for this chat_id
-            action_type = "MANUAL_PLUS" if (is_manual and now_value >= 0) else ("MANUAL_MINUS" if is_manual else "AUTO_DELIVERY")
+            action_type = "MANUAL_PLUS" if (is_manual and val_now >= 0) else ("MANUAL_MINUS" if is_manual else "AUTO_DELIVERY")
             rt_entry = RunningTotalLedger(
                 chat_id=chat_id,
                 action_type=action_type,
-                amount=now_value,
+                amount=val_now,
                 before_total=before_total,
                 after_total=new_running_total,
                 order_id=order_id,
@@ -1934,7 +2589,7 @@ async def record_delivery_ledger_entry(
                 f"Order #{order_id}\n"
                 f"Package: {package}\n"
                 f"Before: {before_total}$\n"
-                f"Now: {now_value}$\n"
+                f"Now: {val_now}$\n"
                 f"Total: {new_running_total}$\n"
                 f"Loader: {loader_name}\n"
                 f"Timestamp: {now_dt.isoformat()}"
@@ -1942,6 +2597,13 @@ async def record_delivery_ledger_entry(
             return entry, True
         except Exception as e:
             await session.rollback()
+            if "UNIQUE constraint failed" in str(e) or "integrityerror" in str(e).lower():
+                logger.warning(
+                    f"[DUPLICATE_LEDGER_BLOCKED]\n"
+                    f"Blocked concurrent duplicate ledger entry for hash: {dedup_hash}\n"
+                    f"Order #{order_id} | Package: {package}"
+                )
+                return None, False
             logger.error(f"[LEDGER_ADD] Failed to record delivery ledger entry: {e}")
             raise e
 
@@ -2767,4 +3429,131 @@ async def get_dashboard_daily_trends(days: int = 7) -> Dict[str, Any]:
             "delivered": delivered_counts,
             "cancelled": cancelled_counts
         }
+
+
+async def process_verified_payment_deduction(
+    chat_id: int,
+    amount: Union[Decimal, float, int, str],
+    transaction_id: str,
+    provider: str = "Binance",
+    currency: str = "USDT",
+    order_id: Optional[int] = None
+) -> Tuple[Optional[PaymentTransaction], float, float, float, bool, str]:
+    """
+    Atomically records a verified client payment transaction and deducts the payment amount from chat_id's running total.
+    Enforces duplicate payment protection via (provider, transaction_id) in PaymentTransaction table
+    and dedup_hash in DeliveryLedger & RunningTotalLedger.
+    Returns Tuple[payment_tx: Optional[PaymentTransaction], before_total: float, payment_amount: float, total_after: float, is_new: bool, status_code: str].
+    """
+    from decimal import Decimal
+    from utils import normalize_transaction_id
+    norm_txid = normalize_transaction_id(transaction_id) or str(transaction_id).strip().upper()
+    provider_clean = (provider or "Binance").strip()
+    currency_clean = (currency or "USDT").strip().upper()
+
+    try:
+        dec_amt = Decimal(str(amount))
+    except Exception:
+        return None, 0.0, 0.0, 0.0, False, "INVALID_AMOUNT"
+
+    if dec_amt <= Decimal("0"):
+        return None, 0.0, 0.0, 0.0, False, "INVALID_AMOUNT"
+
+    float_amt = float(dec_amt)
+    dedup_hash = f"payment_tx_{provider_clean.lower()}_{norm_txid.lower()}"
+
+    async with AsyncSessionLocal() as session:
+        try:
+            # 1. Check duplicate PaymentTransaction record
+            stmt_ptx = select(PaymentTransaction).where(
+                PaymentTransaction.provider == provider_clean,
+                PaymentTransaction.transaction_id == norm_txid
+            )
+            dup_ptx = (await session.execute(stmt_ptx)).scalar_one_or_none()
+            if dup_ptx and dup_ptx.status == "VERIFIED":
+                logger.warning(f"[DUPLICATE_PAYMENT_BLOCKED] Provider {provider_clean} TxID {norm_txid} already verified.")
+                curr_total = await get_running_total_current(chat_id=chat_id)
+                return dup_ptx, curr_total, 0.0, curr_total, False, "DUPLICATE_TRANSACTION"
+
+            # 2. Check duplicate DeliveryLedger record
+            stmt_led = select(DeliveryLedger).where(DeliveryLedger.dedup_hash == dedup_hash)
+            dup_led = (await session.execute(stmt_led)).scalar_one_or_none()
+            if dup_led:
+                logger.warning(f"[DUPLICATE_PAYMENT_BLOCKED] Ledger dedup_hash {dedup_hash} already recorded.")
+                curr_total = await get_running_total_current(chat_id=chat_id)
+                return dup_ptx, curr_total, 0.0, curr_total, False, "DUPLICATE_TRANSACTION"
+
+            # 3. Read current group running total for chat_id
+            before_val = await get_running_total_current(chat_id=chat_id)
+            after_val = before_val - float_amt
+            now_dt = datetime.now(timezone.utc)
+
+            # 4. Create PaymentTransaction record if not existing
+            if dup_ptx:
+                p_tx = dup_ptx
+                p_tx.status = "VERIFIED"
+                p_tx.verified_at = now_dt
+            else:
+                p_tx = PaymentTransaction(
+                    provider=provider_clean,
+                    transaction_id=norm_txid,
+                    amount=float_amt,
+                    currency=currency_clean,
+                    wallet_id=None,
+                    status="VERIFIED",
+                    created_at=now_dt,
+                    verified_at=now_dt
+                )
+                session.add(p_tx)
+
+            # 5. Create DeliveryLedger entry for audit
+            delivery_entry = DeliveryLedger(
+                chat_id=chat_id,
+                order_id=order_id,
+                package=f"PAYMENT_{norm_txid}",
+                price=-float_amt,
+                before_total=before_val,
+                now_value=-float_amt,
+                running_total=after_val,
+                loader=provider_clean,
+                reason=f"Verified Payment ({norm_txid})",
+                dedup_hash=dedup_hash,
+                is_manual=False,
+                timestamp=now_dt
+            )
+            session.add(delivery_entry)
+
+            # 6. Create RunningTotalLedger entry
+            rt_entry = RunningTotalLedger(
+                chat_id=chat_id,
+                action_type="PAYMENT",
+                amount=-float_amt,
+                before_total=before_val,
+                after_total=after_val,
+                order_id=order_id,
+                admin_id=None,
+                timestamp=now_dt
+            )
+            session.add(rt_entry)
+
+            await session.commit()
+            await session.refresh(p_tx)
+
+            logger.info(
+                f"[PAYMENT_VERIFIED_DEDUCTION]\n"
+                f"Group Chat ID: {chat_id}\n"
+                f"Provider: {provider_clean}\n"
+                f"TxID: {norm_txid}\n"
+                f"Before: {before_val}$\n"
+                f"Payment: -{float_amt}$\n"
+                f"After: {after_val}$\n"
+                f"Timestamp: {now_dt.isoformat()}"
+            )
+
+            return p_tx, before_val, float_amt, after_val, True, "SUCCESS"
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"[PAYMENT_DEDUCTION_FAILED] Transaction rolled back for TxID {norm_txid}: {e}")
+            raise e
+
 

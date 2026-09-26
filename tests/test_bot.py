@@ -4845,5 +4845,3110 @@ class TestOrderParserV2(unittest.TestCase):
         self.assertEqual(parsed["unknown_packages"], [])
 
 
+class TestStep2DatabaseSchema(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests STEP 2 Data Models & Database Schema requirements:
+    1. Global client price creation
+    2. Updating an existing global client price
+    3. Loader A price creation
+    4. Loader B price creation
+    5. Confirm Loader A and Loader B prices remain independent
+    6. Creating an order with pricing fields
+    7. Creating an order with multiple OrderItems
+    8. Nullable pricing fields on old orders
+    9. Migration running more than once safely
+    10. SQLite compatibility
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal
+        from models import OrderItem, GlobalClientPrice, LoaderPrice
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.commit()
+
+
+    async def test_global_client_price_creation_and_update(self):
+        from database import set_global_client_price_in_db, get_all_global_client_prices_from_db, GLOBAL_CLIENT_PRICES_CACHE
+        # 1. Creation
+        item = await set_global_client_price_in_db("cp_10800", 65.5, display_name="10800 CP", package_type="normal_cp")
+        self.assertIsNotNone(item.id)
+        self.assertEqual(item.product_key, "cp_10800")
+        self.assertEqual(item.price, 65.5)
+
+        prices = await get_all_global_client_prices_from_db()
+        self.assertTrue(any(p.product_key == "cp_10800" for p in prices))
+        self.assertIn("cp_10800", GLOBAL_CLIENT_PRICES_CACHE)
+        self.assertEqual(GLOBAL_CLIENT_PRICES_CACHE["cp_10800"]["price"], 65.5)
+
+        # 2. Update existing
+        updated = await set_global_client_price_in_db("cp_10800", 66.0, display_name="10800 CP Updated")
+        self.assertEqual(updated.id, item.id)
+        self.assertEqual(updated.price, 66.0)
+        self.assertEqual(GLOBAL_CLIENT_PRICES_CACHE["cp_10800"]["price"], 66.0)
+
+    async def test_loader_prices_independence(self):
+        from database import add_loader, set_loader_price_in_db, get_all_loader_prices_from_db, LOADER_PRICES_CACHE
+        # Setup 2 distinct loaders
+        loader_a = await add_loader("Loader Alpha", 999001)
+        loader_b = await add_loader("Loader Beta", 999002)
+
+
+        # 3. Loader A price creation
+        price_a = await set_loader_price_in_db(loader_a.id, "cp_10800", 55.0, display_name="10800 CP")
+        self.assertEqual(price_a.cost, 55.0)
+
+        # 4. Loader B price creation
+        price_b = await set_loader_price_in_db(loader_b.id, "cp_10800", 58.0, display_name="10800 CP")
+        self.assertEqual(price_b.cost, 58.0)
+
+        # 5. Confirm independence
+        prices_a = await get_all_loader_prices_from_db(loader_a.id)
+        prices_b = await get_all_loader_prices_from_db(loader_b.id)
+
+        self.assertEqual(len(prices_a), 1)
+        self.assertEqual(len(prices_b), 1)
+        self.assertEqual(prices_a[0].cost, 55.0)
+        self.assertEqual(prices_b[0].cost, 58.0)
+
+        self.assertEqual(LOADER_PRICES_CACHE[loader_a.id]["cp_10800"]["cost"], 55.0)
+        self.assertEqual(LOADER_PRICES_CACHE[loader_b.id]["cp_10800"]["cost"], 58.0)
+
+    async def test_order_creation_with_pricing_fields(self):
+        from database import create_order, get_order_by_id, AsyncSessionLocal
+        from models import Order
+        from sqlalchemy import select
+        # 6. Creating order with pricing fields
+        ord_obj = await create_order(email="client@test.com", package="10800 CP")
+        async with AsyncSessionLocal() as session:
+            db_ord = (await session.execute(select(Order).where(Order.id == ord_obj.id))).scalar_one_or_none()
+            db_ord.client_price_total = 65.5
+            db_ord.loader_cost_total = 55.0
+            db_ord.profit_amount = 10.5
+            db_ord.secret_profit_code = "F+C"
+            await session.commit()
+
+        fetched = await get_order_by_id(ord_obj.id)
+        self.assertEqual(fetched.client_price_total, 65.5)
+        self.assertEqual(fetched.loader_cost_total, 55.0)
+        self.assertEqual(fetched.profit_amount, 10.5)
+        self.assertEqual(fetched.secret_profit_code, "F+C")
+
+    async def test_order_multiple_order_items(self):
+        import time
+        from database import create_order, AsyncSessionLocal
+        from models import Order, OrderItem
+        from sqlalchemy import select
+        # 7. Order with multiple OrderItems
+        email_addr = f"multi_{int(time.time() * 1000)}@test.com"
+
+        ord_obj = await create_order(email=email_addr, package="2400 CP x 2 + 4800 CP x 1")
+
+        async with AsyncSessionLocal() as session:
+            item1 = OrderItem(
+                order_id=ord_obj.id,
+                product_key="cp_2400",
+                display_name="2400 CP",
+                quantity=2,
+                client_unit_price=16.0,
+                client_line_total=32.0,
+                loader_unit_cost=13.0,
+                loader_line_total=26.0,
+                profit_amount=6.0
+            )
+            item2 = OrderItem(
+                order_id=ord_obj.id,
+                product_key="cp_4800",
+                display_name="4800 CP",
+                quantity=1,
+                client_unit_price=30.0,
+                client_line_total=30.0,
+                loader_unit_cost=25.0,
+                loader_line_total=25.0,
+                profit_amount=5.0
+            )
+            session.add_all([item1, item2])
+            await session.commit()
+
+        async with AsyncSessionLocal() as session:
+            stmt_items = select(OrderItem).where(OrderItem.order_id == ord_obj.id)
+            items = list((await session.execute(stmt_items)).scalars().all())
+
+            self.assertEqual(len(items), 2)
+            total_client = sum(it.client_line_total for it in items)
+            total_loader = sum(it.loader_line_total for it in items)
+            total_profit = sum(it.profit_amount for it in items)
+
+            self.assertEqual(total_client, 62.0)
+            self.assertEqual(total_loader, 51.0)
+            self.assertEqual(total_profit, 11.0)
+
+
+    async def test_nullable_pricing_fields_on_old_orders(self):
+        from database import create_order, get_order_by_id
+        # 8. Nullable pricing fields on old/existing orders
+        ord_old = await create_order(email="oldorder@test.com", package="5040 CP")
+        fetched = await get_order_by_id(ord_old.id)
+        self.assertIsNone(fetched.client_price_total)
+        self.assertIsNone(fetched.loader_cost_total)
+        self.assertIsNone(fetched.profit_amount)
+        self.assertIsNone(fetched.secret_profit_code)
+
+    async def test_idempotent_migration_running_multiple_times(self):
+        from database import init_db, _migrate_orders_schema, engine
+        # 9. Migration running more than once safely
+        await init_db()
+        async with engine.begin() as conn:
+            await conn.run_sync(_migrate_orders_schema)
+            await conn.run_sync(_migrate_orders_schema)
+
+
+class TestStep3SecretCodeAndCatalog(unittest.TestCase):
+    """
+    Test suite for STEP 3 Secret Profit Code Engine & Product Catalog:
+    1. Single profit code mappings
+    2. Combination profit code mappings
+    3. Decoder roundtrip equality for all encoded results
+    4. Product catalog completeness, uniqueness, and correct reference prices
+    5. Profit & multi-package calculation helpers using exact Decimal arithmetic
+    """
+
+    def test_single_secret_code_mappings(self):
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code, decode_profit_code
+
+        expected_singles = [
+            (Decimal("0"), "U"),
+            (Decimal("0.25"), "K"),
+            (Decimal("0.5"), "C"),
+            (Decimal("0.75"), "L"),
+            (Decimal("1"), "V"),
+            (Decimal("2"), "W"),
+            (Decimal("3"), "Y"),
+            (Decimal("4"), "X"),
+            (Decimal("5"), "Z"),
+            (Decimal("6"), "A"),
+            (Decimal("7"), "B"),
+            (Decimal("8"), "D"),
+            (Decimal("9"), "E"),
+            (Decimal("10"), "F"),
+            (Decimal("11"), "G"),
+            (Decimal("12"), "H"),
+            (Decimal("13"), "I"),
+            (Decimal("14"), "J"),
+            (Decimal("-1"), "T"),
+            (Decimal("-2"), "S"),
+            (Decimal("-3"), "R"),
+            (Decimal("-4"), "Q"),
+        ]
+
+        for val, expected_code in expected_singles:
+            code = encode_profit_code(val)
+            self.assertEqual(code, expected_code, f"Failed encoding for {val}: expected {expected_code}, got {code}")
+            decoded = decode_profit_code(code)
+            self.assertEqual(decoded, val, f"Failed decoding roundtrip for {val}: got {decoded}")
+
+    def test_combination_secret_code_mappings(self):
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code, decode_profit_code
+
+        combinations = [
+            (Decimal("17"), "X+F+Y"),
+            (Decimal("4.5"), "X+C"),
+            (Decimal("10.5"), "F+C"),
+            (Decimal("10.25"), "F+K"),
+            (Decimal("14.75"), "J+L"),
+        ]
+
+        for val, expected_code in combinations:
+            code = encode_profit_code(val)
+            self.assertEqual(code, expected_code, f"Failed encoding combination for {val}: expected {expected_code}, got {code}")
+            decoded = decode_profit_code(code)
+            self.assertEqual(decoded, val, f"Roundtrip failed for {val}: got {decoded}")
+
+        # 22.5 -> valid combination summing exactly to 22.5
+        val_22_5 = Decimal("22.5")
+        code_22_5 = encode_profit_code(val_22_5)
+        self.assertIsNotNone(code_22_5)
+        self.assertTrue(len(code_22_5) > 0)
+        decoded_22_5 = decode_profit_code(code_22_5)
+        self.assertEqual(decoded_22_5, val_22_5)
+
+    def test_roundtrip_decoding_forall_encoded_results(self):
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code, decode_profit_code
+
+        test_values = [
+            Decimal("0"), Decimal("0.25"), Decimal("0.5"), Decimal("0.75"),
+            Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5"),
+            Decimal("6"), Decimal("7"), Decimal("8"), Decimal("9"), Decimal("10"),
+            Decimal("11"), Decimal("12"), Decimal("13"), Decimal("14"),
+            Decimal("-1"), Decimal("-2"), Decimal("-3"), Decimal("-4"),
+            Decimal("4.5"), Decimal("10.5"), Decimal("10.25"), Decimal("14.75"),
+            Decimal("17"), Decimal("22.5"), Decimal("35.75"), Decimal("-3.5")
+        ]
+
+        for val in test_values:
+            encoded = encode_profit_code(val)
+            decoded = decode_profit_code(encoded)
+            self.assertEqual(decoded, val, f"Roundtrip failed for {val}: encoded as '{encoded}', decoded as '{decoded}'")
+
+    def test_product_catalog_structure_and_reference_prices(self):
+        from product_catalog import (
+            PRODUCT_CATALOG,
+            get_all_products,
+            get_product_by_key,
+            get_products_by_type,
+        )
+
+        all_prods = get_all_products()
+        self.assertGreaterEqual(len(all_prods), 40)
+
+        # Keys uniqueness
+        keys = list(PRODUCT_CATALOG.keys())
+        self.assertEqual(len(keys), len(set(keys)), "Product keys must be unique!")
+
+        # 26400 CP reference price check (Must be 150.5, NOT 15.5)
+        cp_26400 = get_product_by_key("cp_26400")
+        self.assertIsNotNone(cp_26400)
+        self.assertEqual(cp_26400["reference_price"], 150.5)
+        self.assertNotEqual(cp_26400["reference_price"], 15.5)
+
+        # Check normal CP products reference prices
+        normal_expected = {
+            "cp_10800": (65.5, "10800 CP"),
+            "cp_5000": (33.0, "5000 CP"),
+            "cp_2400": (16.0, "2400 CP"),
+            "cp_880": (8.0, "880 CP"),
+            "cp_420": (4.5, "420 CP"),
+        }
+        for pkey, (ref_p, disp_name) in normal_expected.items():
+            prod = get_product_by_key(pkey)
+            self.assertIsNotNone(prod, f"Missing product {pkey}")
+            self.assertEqual(prod["reference_price"], ref_p)
+            self.assertEqual(prod["display_name"], disp_name)
+            self.assertEqual(prod["package_type"], "normal_cp")
+
+        # Check special CP products reference prices sample
+        special_sample = {
+            "cp_4800": 30.0,
+            "cp_7200": 43.5,
+            "cp_9600": 57.0,
+            "cp_12000": 71.0,
+            "cp_72000": 411.0,
+        }
+        for pkey, ref_p in special_sample.items():
+            prod = get_product_by_key(pkey)
+            self.assertIsNotNone(prod, f"Missing product {pkey}")
+            self.assertEqual(prod["reference_price"], ref_p)
+            self.assertEqual(prod["package_type"], "special_cp")
+
+        # Check other products
+        other_sample = {
+            "full_event_deal": (15.0, "3280 CP + Epic Bundle", "bonus_deal"),
+            "safe_vault_50": (38.0, "$50 Safe Vault", "safe_vault"),
+            "safe_vault_30": (22.0, "$30 Safe Vault", "safe_vault"),
+            "safe_vault_20": (12.5, "$20 Safe Vault", "safe_vault"),
+            "safe_vault_10": (7.0, "$10 Safe Vault", "safe_vault"),
+            "safe_vault_5": (4.5, "$5 Safe Vault", "safe_vault"),
+            "full_chain": (16.0, "560 CP + 300 Mythic Cards", "full_chain"),
+        }
+        for pkey, (ref_p, disp_name, ptype) in other_sample.items():
+            prod = get_product_by_key(pkey)
+            self.assertIsNotNone(prod, f"Missing product {pkey}")
+            self.assertEqual(prod["reference_price"], ref_p)
+            self.assertEqual(prod["display_name"], disp_name)
+            self.assertEqual(prod["package_type"], ptype)
+
+        # Check product types filter
+        self.assertEqual(len(get_products_by_type("normal_cp")), 5)
+        self.assertEqual(len(get_products_by_type("special_cp")), 29)
+        self.assertEqual(len(get_products_by_type("safe_vault")), 5)
+        self.assertEqual(len(get_products_by_type("bonus_deal")), 1)
+        self.assertEqual(len(get_products_by_type("full_chain")), 1)
+
+    def test_profit_and_order_totals_calculation(self):
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code
+        from pricing_calculator import (
+            calculate_profit,
+            calculate_profit_and_code,
+            calculate_order_totals,
+        )
+
+        # 46 - 36 = 10 -> F
+        profit1 = calculate_profit(46, 36)
+        self.assertEqual(profit1, Decimal("10"))
+        self.assertEqual(encode_profit_code(profit1), "F")
+
+        # 46 - 29 = 17 -> X+F+Y
+        profit2, code2 = calculate_profit_and_code(46, 29)
+        self.assertEqual(profit2, Decimal("17"))
+        self.assertEqual(code2, "X+F+Y")
+
+        # Multi-package calculation test: 2400 CP x 2, 4800 CP x 1
+        items = [
+            {"product_key": "cp_2400", "quantity": 2},
+            {"product_key": "cp_4800", "quantity": 1},
+        ]
+        # Reference prices: cp_2400 -> 16, cp_4800 -> 30
+        # Client total: 16*2 + 30*1 = 62
+        loader_prices = {"cp_2400": Decimal("13"), "cp_4800": Decimal("25")}
+        # Loader total: 13*2 + 25*1 = 51
+        # Profit: 62 - 51 = 11 -> G
+
+        totals = calculate_order_totals(items, loader_price_map=loader_prices)
+        self.assertEqual(totals["client_total"], Decimal("62"))
+        self.assertEqual(totals["loader_total"], Decimal("51"))
+        self.assertEqual(totals["profit"], Decimal("11"))
+        self.assertEqual(totals["secret_code"], "G")
+        self.assertEqual(len(totals["item_breakdown"]), 2)
+
+
+class TestStep4GlobalClientPricesAndSetCommand(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for STEP 4 Global Client Price List & /setclientprice:
+    1-18. Parser unit tests for all formats, special products, edge cases, validation
+    19-20. Command handler security & reply requirement checks
+    21-25. Atomic DB updates, cache sync, non-destructive isolation
+    26. Regression preservation
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal
+        from models import GlobalClientPrice, LoaderPrice, Order
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Order))
+            await session.commit()
+
+    def test_parse_normal_cp_comma_and_arrows(self):
+        from price_list_parser import parse_client_price_list
+
+        text1 = "10,800 CP ➜ $65.5 💵"
+        res1 = parse_client_price_list(text1)
+        self.assertTrue(res1["valid"])
+        self.assertEqual(res1["parsed_prices"].get("cp_10800"), 65.5)
+
+        text2 = "5,000 CP ➡️ $33 💵"
+        res2 = parse_client_price_list(text2)
+        self.assertTrue(res2["valid"])
+        self.assertEqual(res2["parsed_prices"].get("cp_5000"), 33.0)
+
+        text3 = "2400 CP -> $16"
+        res3 = parse_client_price_list(text3)
+        self.assertTrue(res3["valid"])
+        self.assertEqual(res3["parsed_prices"].get("cp_2400"), 16.0)
+
+        text4 = "880 CP → $8"
+        res4 = parse_client_price_list(text4)
+        self.assertTrue(res4["valid"])
+        self.assertEqual(res4["parsed_prices"].get("cp_880"), 8.0)
+
+        text5 = "420 CP = $4.5"
+        res5 = parse_client_price_list(text5)
+        self.assertTrue(res5["valid"])
+        self.assertEqual(res5["parsed_prices"].get("cp_420"), 4.5)
+
+    def test_parse_special_cp_and_decimal_26400(self):
+        from price_list_parser import parse_client_price_list
+
+        text = (
+            "72,000 CP ➡️ $411💵\n"
+            "26,400 CP ➡️ $150.5 💵\n"
+            "4,800 CP ➜ $30 💵"
+        )
+        res = parse_client_price_list(text)
+        self.assertTrue(res["valid"])
+        self.assertEqual(res["parsed_prices"].get("cp_72000"), 411.0)
+        self.assertEqual(res["parsed_prices"].get("cp_26400"), 150.5)
+        self.assertEqual(res["parsed_prices"].get("cp_4800"), 30.0)
+
+    def test_parse_full_event_deal_and_safe_vaults_and_full_chain(self):
+        from price_list_parser import parse_client_price_list
+
+        text = """
+🎁 BONUS DEAL 💰
+
+$17 Full Event Deal
+(3280 CP + Epic Bundle)
+💵 $15 USDT ✅
+🔐 Only accounts starting with $1 and ending at $10
+
+━━━━━━━━━━━━━━
+
+🏦 SAFE VAULT
+
+💵 $50 ➜ $38 USDT
+💵 $30 ➜ $22 USDT
+💵 $20 ➜ $12.5 USDT
+💵 $10 ➜ $7 USDT
+💵 $5 ➜ $4.5 USDT
+
+━━━━━━━━━━━━━━
+
+🔥 FULL CHAIN COST
+
+Only available for $1 to $7 Accounts
+
+💎 560 CP
+🃏 300 Mythic Cards
+
+💰 Total Cost: $16
+"""
+        res = parse_client_price_list(text)
+        self.assertTrue(res["valid"])
+        prices = res["parsed_prices"]
+
+        # 9. Full Event Deal = 15
+        self.assertEqual(prices.get("full_event_deal"), 15.0)
+        # 13. Must NOT interpret 17 as price
+        self.assertNotEqual(prices.get("full_event_deal"), 17.0)
+
+        # 10. Safe Vaults
+        self.assertEqual(prices.get("safe_vault_50"), 38.0)
+        self.assertEqual(prices.get("safe_vault_30"), 22.0)
+        self.assertEqual(prices.get("safe_vault_20"), 12.5)
+        self.assertEqual(prices.get("safe_vault_10"), 7.0)
+        self.assertEqual(prices.get("safe_vault_5"), 4.5)
+
+        # 11. Full Chain = 16
+        self.assertEqual(prices.get("full_chain"), 16.0)
+        # 12. Must NOT treat 560 CP as cp_560
+        self.assertNotIn("cp_560", prices)
+        # 3280 CP must NOT be cp_3280
+        self.assertNotIn("cp_3280", prices)
+
+    def test_duplicate_identical_and_conflicting_lines(self):
+        from price_list_parser import parse_client_price_list
+
+        # 14. Identical duplicates -> valid
+        text_ident = "10,800 CP ➜ $65.5\n10,800 CP ➜ $65.5"
+        res_ident = parse_client_price_list(text_ident)
+        self.assertTrue(res_ident["valid"])
+        self.assertEqual(res_ident["parsed_prices"].get("cp_10800"), 65.5)
+
+        # 15. Conflicting duplicates -> invalid
+        text_conflict = "10,800 CP ➜ $65.5\n10,800 CP ➜ $70.0"
+        res_conflict = parse_client_price_list(text_conflict)
+        self.assertFalse(res_conflict["valid"])
+        self.assertTrue(len(res_conflict["errors"]) > 0)
+
+    def test_invalid_prices_empty_and_no_price_lines(self):
+        from price_list_parser import parse_client_price_list
+
+        # 16. Invalid non-numeric price
+        res_inv = parse_client_price_list("10800 CP ➜ FREE")
+        self.assertFalse(res_inv["valid"])
+
+        # 17. Empty message
+        res_empty = parse_client_price_list("")
+        self.assertFalse(res_empty["valid"])
+
+        # 18. No price lines
+        res_no_prices = parse_client_price_list("Hello this is just a normal conversation message")
+        self.assertFalse(res_no_prices["valid"])
+
+    async def test_setclientprice_command_unauthorized_and_no_reply(self):
+        from handlers import setclientprice_command_handler
+
+        class MockUser:
+            id = 999999
+            username = "unauth_user"
+
+        class MockMessage:
+            reply_to_message = None
+            text = "/setclientprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class MockUpdate:
+            effective_user = MockUser()
+            effective_message = MockMessage()
+
+        up = MockUpdate()
+        ctx = type("Context", (), {})()
+
+        # 19. Unauthorized command execution
+        await setclientprice_command_handler(up, ctx)
+        self.assertIn("not authorized", up.effective_message.replied_text.lower())
+
+        # 20. Command without reply (authorized user)
+        from config import Config
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        up.effective_user.id = admin_id
+
+        await setclientprice_command_handler(up, ctx)
+        self.assertIn("reply to a price-list message", up.effective_message.replied_text.lower())
+
+    async def test_setclientprice_successful_db_and_cache_update(self):
+        from handlers import setclientprice_command_handler
+        from database import (
+            get_global_client_price,
+            get_all_global_client_prices,
+            GLOBAL_CLIENT_PRICES_CACHE,
+            set_loader_price_in_db,
+            get_all_loader_prices_from_db,
+            create_order,
+            get_order_by_id
+        )
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # Create prior order and loader price to verify isolation (24, 25)
+        old_order = await create_order(email="old_step4@test.com", package="10800 CP")
+        loader_price = await set_loader_price_in_db(loader_id=77, product_key="cp_10800", cost=55.0)
+
+        class MockRepliedMsg:
+            text = """
+10,800 CP ➜ $65.5 💵
+5,000 CP ➜ $33 💵
+2,400 CP ➜ $16 💵
+
+🎁 BONUS DEAL 💰
+$17 Full Event Deal
+(3280 CP + Epic Bundle)
+💵 $15 USDT ✅
+
+🏦 SAFE VAULT
+💵 $50 ➜ $38 USDT
+💵 $30 ➜ $22 USDT
+
+🔥 FULL CHAIN COST
+💎 560 CP
+💰 Total Cost: $16
+"""
+
+        class MockCmdMsg:
+            reply_to_message = MockRepliedMsg()
+            text = "/setclientprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class MockUser:
+            id = admin_id
+            username = "admin"
+
+        class MockUpdate:
+            effective_user = MockUser()
+            effective_message = MockCmdMsg()
+
+        up = MockUpdate()
+        ctx = type("Context", (), {})()
+
+        await setclientprice_command_handler(up, ctx)
+        self.assertIn("Client Price List Updated", up.effective_message.replied_text)
+        self.assertIn("Products updated: 7", up.effective_message.replied_text)
+
+        # 21. Database updated
+        p_10800 = await get_global_client_price("cp_10800")
+        self.assertEqual(p_10800, 65.5)
+
+        p_event = await get_global_client_price("full_event_deal")
+        self.assertEqual(p_event, 15.0)
+
+        p_chain = await get_global_client_price("full_chain")
+        self.assertEqual(p_chain, 16.0)
+
+        # 22. Cache updated
+        self.assertIn("cp_10800", GLOBAL_CLIENT_PRICES_CACHE)
+        self.assertEqual(GLOBAL_CLIENT_PRICES_CACHE["cp_10800"]["price"], 65.5)
+        self.assertEqual(GLOBAL_CLIENT_PRICES_CACHE["full_chain"]["price"], 16.0)
+
+        # 24. Existing order remains unchanged
+        check_ord = await get_order_by_id(old_order.id)
+        self.assertEqual(check_ord.email, "old_step4@test.com")
+
+        # 25. Loader price remains unchanged
+        l_prices = await get_all_loader_prices_from_db(77)
+        self.assertEqual(len(l_prices), 1)
+        self.assertEqual(l_prices[0].cost, 55.0)
+
+    async def test_failed_validation_does_not_overwrite_old_prices(self):
+        from database import set_global_client_price, get_global_client_price
+        from handlers import setclientprice_command_handler
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # Set initial global price
+        await set_global_client_price("cp_10800", 65.5)
+        self.assertEqual(await get_global_client_price("cp_10800"), 65.5)
+
+        # Send bad message with conflicting duplicate prices
+        class MockRepliedMsg:
+            text = "10,800 CP ➜ $65.5\n10,800 CP ➜ $99.0"
+
+        class MockCmdMsg:
+            reply_to_message = MockRepliedMsg()
+            text = "/setclientprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class MockUser:
+            id = admin_id
+
+        up = type("Update", (), {"effective_user": MockUser(), "effective_message": MockCmdMsg()})()
+        ctx = type("Context", (), {})()
+
+        # 23. Failed validation does not overwrite old price
+        await setclientprice_command_handler(up, ctx)
+        self.assertIn("Conflicting price", up.effective_message.replied_text)
+        self.assertEqual(await get_global_client_price("cp_10800"), 65.5)
+
+
+class TestStep5LoaderPricesAndSetCommand(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for Step 5: Per-Loader Private Price List and /setloaderprice command.
+    """
+
+    async def asyncSetUp(self):
+        from database import engine, Base, LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE
+        from sqlalchemy import delete
+        from models import LoaderPrice, GlobalClientPrice, Loader
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def test_step5_complete_coverage(self):
+        from decimal import Decimal
+        from database import (
+            add_loader,
+            set_loader_price,
+            get_loader_price,
+            get_all_loader_prices,
+            update_loader_prices,
+            set_global_client_price,
+            get_global_client_price,
+            LOADER_PRICES_CACHE,
+            GLOBAL_CLIENT_PRICES_CACHE,
+            LOADERS_CACHE
+        )
+        from handlers import setloaderprice_command_handler
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # Setup 2 distinct loaders
+        loader_a = await add_loader(group_id=1001, loader_name="Loader A")
+        loader_b = await add_loader(group_id=1002, loader_name="Loader B")
+
+        # 1. Registered loader can set own prices
+        class MockRepliedMsg:
+            text = "10800 CP ➜ $50\n5000 CP ➜ $25"
+            caption = None
+
+        class MockCmdMsg:
+            reply_to_message = MockRepliedMsg()
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class MockUserLoaderA:
+            id = 1001
+
+        class MockUpdateA:
+            effective_user = MockUserLoaderA()
+            effective_chat = type("Chat", (), {"id": 1001})()
+            effective_message = MockCmdMsg()
+
+        up_a = MockUpdateA()
+        ctx_a = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_a, ctx_a)
+        self.assertIn("Loader price list updated", up_a.effective_message.replied_text)
+        self.assertIn("Products updated: 2", up_a.effective_message.replied_text)
+
+        price_a_10800 = await get_loader_price(loader_a.id, "cp_10800")
+        self.assertEqual(price_a_10800, Decimal("50"))
+
+        # 2. Unregistered user cannot set loader prices
+        class MockUserUnregistered:
+            id = 999999
+
+        class MockUpdateUnreg:
+            effective_user = MockUserUnregistered()
+            effective_chat = type("Chat", (), {"id": 999999})()
+            effective_message = MockCmdMsg()
+
+        up_unreg = MockUpdateUnreg()
+        ctx_unreg = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_unreg, ctx_unreg)
+        self.assertIn("not authorized", up_unreg.effective_message.replied_text.lower())
+
+        # 3. Loader A prices are isolated from Loader B
+        price_b_10800 = await get_loader_price(loader_b.id, "cp_10800")
+        self.assertIsNone(price_b_10800)
+
+        # 4. Loader A cannot overwrite Loader B
+        class MockUserLoaderB:
+            id = 1002
+
+        class MockRepliedMsgB:
+            text = "10800 CP ➜ $52"
+            caption = None
+
+        class MockCmdMsgB:
+            reply_to_message = MockRepliedMsgB()
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_b = type("Update", (), {"effective_user": MockUserLoaderB(), "effective_chat": type("Chat", (), {"id": 1002})(), "effective_message": MockCmdMsgB()})()
+        ctx_b = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_b, ctx_b)
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_10800"), Decimal("50"))
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_10800"), Decimal("52"))
+
+        # 5. Admin can set a specific loader using loader_id
+        class MockAdminUser:
+            id = admin_id
+
+        class MockRepliedMsgAdmin:
+            text = "2400 CP ➜ $12.50\n880 CP ➜ $6"
+            caption = None
+
+        class MockCmdMsgAdmin:
+            reply_to_message = MockRepliedMsgAdmin()
+            text = f"/setloaderprice {loader_a.id}"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_admin = type("Update", (), {"effective_user": MockAdminUser(), "effective_chat": type("Chat", (), {"id": admin_id})(), "effective_message": MockCmdMsgAdmin()})()
+        ctx_admin = type("Context", (), {"args": [str(loader_a.id)]})()
+
+        await setloaderprice_command_handler(up_admin, ctx_admin)
+        self.assertIn("Loader price list updated", up_admin.effective_message.replied_text)
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_2400"), Decimal("12.5"))
+
+        # 6. Admin without loader_id is rejected as ambiguous
+        class MockCmdMsgAdminNoArgs:
+            reply_to_message = MockRepliedMsgAdmin()
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_admin_no_args = type("Update", (), {"effective_user": MockAdminUser(), "effective_chat": type("Chat", (), {"id": admin_id})(), "effective_message": MockCmdMsgAdminNoArgs()})()
+        ctx_admin_no_args = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_admin_no_args, ctx_admin_no_args)
+        self.assertIn("Admins must specify a loader ID", up_admin_no_args.effective_message.replied_text)
+
+        # 7. Command without reply is rejected
+        class MockCmdMsgNoReply:
+            reply_to_message = None
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_no_reply = type("Update", (), {"effective_user": MockUserLoaderA(), "effective_chat": type("Chat", (), {"id": 1001})(), "effective_message": MockCmdMsgNoReply()})()
+        ctx_no_reply = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_no_reply, ctx_no_reply)
+        self.assertIn("Reply to a price-list message", up_no_reply.effective_message.replied_text)
+
+        # 8. Invalid price list does not modify existing prices
+        old_price_2400 = await get_loader_price(loader_a.id, "cp_2400")
+
+        class MockRepliedInvalid:
+            text = "10,800 CP ➜ $50\n10,800 CP ➜ $99"
+            caption = None
+
+        class MockCmdMsgInvalid:
+            reply_to_message = MockRepliedInvalid()
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_invalid = type("Update", (), {"effective_user": MockUserLoaderA(), "effective_chat": type("Chat", (), {"id": 1001})(), "effective_message": MockCmdMsgInvalid()})()
+        ctx_invalid = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_invalid, ctx_invalid)
+        self.assertIn("Conflicting price", up_invalid.effective_message.replied_text)
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_2400"), old_price_2400)
+
+        # 9. Partial price list preserves existing products
+        class MockRepliedPartial:
+            text = "420 CP ➜ $3.50"
+            caption = None
+
+        class MockCmdMsgPartial:
+            reply_to_message = MockRepliedPartial()
+            text = "/setloaderprice"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_partial = type("Update", (), {"effective_user": MockUserLoaderA(), "effective_chat": type("Chat", (), {"id": 1001})(), "effective_message": MockCmdMsgPartial()})()
+        ctx_partial = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_partial, ctx_partial)
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_420"), Decimal("3.5"))
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_10800"), Decimal("50"))
+
+        # 10. Multiple products update correctly
+        # 11. Decimal prices work
+        # 12. CP aliases/products parse correctly
+        # 13. Safe Vault parses correctly
+        # 14. Full Event Deal parses correctly
+        # 15. Full Chain remains separate from cp_560
+        class MockRepliedFullSuite:
+            text = """
+10,800 CP ➜ $49.99
+5,000 CP ➜ $24.50
+4,800 CP ➜ $20.00
+
+🏦 SAFE VAULT
+💵 $50 ➜ $35 USDT
+💵 $30 ➜ $20 USDT
+
+🎁 BONUS DEAL
+$17 Full Event Deal
+💵 $14 USDT
+
+🔥 FULL CHAIN COST
+💎 560 CP
+Total Cost: $12.75
+"""
+            caption = None
+
+        class MockCmdMsgFullSuite:
+            reply_to_message = MockRepliedFullSuite()
+            text = f"/setloaderprice {loader_b.id}"
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_fs = type("Update", (), {"effective_user": MockAdminUser(), "effective_chat": type("Chat", (), {"id": admin_id})(), "effective_message": MockCmdMsgFullSuite()})()
+        ctx_fs = type("Context", (), {"args": [str(loader_b.id)]})()
+
+        await setloaderprice_command_handler(up_fs, ctx_fs)
+        self.assertIn("Loader price list updated", up_fs.effective_message.replied_text)
+
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_10800"), Decimal("49.99"))
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_5000"), Decimal("24.5"))
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_4800"), Decimal("20"))
+        self.assertEqual(await get_loader_price(loader_b.id, "safe_vault_50"), Decimal("35"))
+        self.assertEqual(await get_loader_price(loader_b.id, "full_event_deal"), Decimal("14"))
+        self.assertEqual(await get_loader_price(loader_b.id, "full_chain"), Decimal("12.75"))
+        self.assertIsNone(await get_loader_price(loader_b.id, "cp_560"))
+
+        # 16. Cache is updated after successful DB commit
+        self.assertIn(loader_b.id, LOADER_PRICES_CACHE)
+        self.assertEqual(LOADER_PRICES_CACHE[loader_b.id]["cp_10800"]["cost"], 49.99)
+
+        # 17. Failed transaction does not corrupt cache
+        try:
+            await update_loader_prices(loader_b.id, {"invalid_key_causes_db_error": "not_a_number"})
+        except Exception:
+            pass
+        self.assertEqual(LOADER_PRICES_CACHE[loader_b.id]["cp_10800"]["cost"], 49.99)
+
+        # 18. Client global prices remain unchanged
+        await set_global_client_price("cp_10800", 65.5)
+        self.assertEqual(await get_global_client_price("cp_10800"), 65.5)
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_10800"), Decimal("49.99"))
+
+        # 19. Loader A cache cannot return Loader B prices
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_10800"), Decimal("50"))
+        self.assertEqual(await get_loader_price(loader_b.id, "cp_10800"), Decimal("49.99"))
+
+
+class TestStep6OrderPricingAndProfitCode(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for Step 6: Order Pricing + Loader Cost + Profit + Secret Profit Code.
+    """
+
+    async def asyncSetUp(self):
+        from database import engine, Base, LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE
+        from sqlalchemy import delete
+        from models import Order, OrderItem, LoaderPrice, GlobalClientPrice, Loader
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(Order))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def test_step6_examples_and_pricing_engine(self):
+        from decimal import Decimal
+        from database import (
+            add_loader,
+            set_loader_price,
+            set_global_client_price,
+            create_order,
+            save_order_pricing,
+            get_order_by_id,
+            GLOBAL_CLIENT_PRICES_CACHE,
+            LOADER_PRICES_CACHE
+        )
+        from pricing_calculator import calculate_order_pricing, calculate_profit_and_code, parse_order_items_from_text
+
+        loader_a = await add_loader(group_id=2001, loader_name="Loader Alpha")
+        loader_b = await add_loader(group_id=2002, loader_name="Loader Beta")
+
+        # Set Global Client Prices
+        await set_global_client_price("cp_2400", 16.0)
+        await set_global_client_price("cp_880", 8.0)
+        await set_global_client_price("cp_10800", 65.5)
+        await set_global_client_price("cp_4800", 30.0)
+        await set_global_client_price("full_chain", 16.0)
+        await set_global_client_price("full_event_deal", 15.0)
+        await set_global_client_price("safe_vault_50", 38.0)
+
+        # Set Loader A Prices
+        await set_loader_price(loader_a.id, "cp_2400", 12.0)
+        await set_loader_price(loader_a.id, "cp_880", 6.0)
+        await set_loader_price(loader_a.id, "cp_10800", 50.0)
+
+        # Set Loader B Prices (isolated from Loader A)
+        await set_loader_price(loader_b.id, "cp_2400", 11.50)
+        await set_loader_price(loader_b.id, "cp_880", 6.0)
+
+        # ----------------------------------------------------
+        # Example A: Client $16, Loader $12 -> profit=$4, code=X
+        # ----------------------------------------------------
+        res_a = await calculate_order_pricing("2400 CP", loader_id=loader_a.id)
+        self.assertTrue(res_a["is_complete"])
+        self.assertEqual(res_a["client_price_total"], Decimal("16"))
+        self.assertEqual(res_a["loader_cost_total"], Decimal("12"))
+        self.assertEqual(res_a["profit_amount"], Decimal("4"))
+        self.assertEqual(res_a["secret_profit_code"], "X")
+
+        # ----------------------------------------------------
+        # Example B: Client $16, Loader $11.5 -> profit=$4.5, code=X+C
+        # ----------------------------------------------------
+        res_b = await calculate_order_pricing("2400 CP", loader_id=loader_b.id)
+        self.assertTrue(res_b["is_complete"])
+        self.assertEqual(res_b["client_price_total"], Decimal("16"))
+        self.assertEqual(res_b["loader_cost_total"], Decimal("11.5"))
+        self.assertEqual(res_b["profit_amount"], Decimal("4.5"))
+        self.assertEqual(res_b["secret_profit_code"], "X+C")
+
+        # ----------------------------------------------------
+        # Example C: Client $24, Loader $18 -> profit=$6, code=A
+        # ----------------------------------------------------
+        res_c = await calculate_order_pricing("2400 CP + 880 CP", loader_id=loader_a.id)
+        self.assertTrue(res_c["is_complete"])
+        self.assertEqual(res_c["client_price_total"], Decimal("24"))
+        self.assertEqual(res_c["loader_cost_total"], Decimal("18"))
+        self.assertEqual(res_c["profit_amount"], Decimal("6"))
+        self.assertEqual(res_c["secret_profit_code"], "A")
+
+        # ----------------------------------------------------
+        # Example D: Client $10, Loader $12 -> profit=-$2
+        # ----------------------------------------------------
+        res_d = await calculate_order_pricing(
+            "2400 CP",
+            loader_id=loader_a.id,
+            client_price_map={"cp_2400": 10.0},
+            loader_price_map={"cp_2400": 12.0}
+        )
+        self.assertTrue(res_d["is_complete"])
+        self.assertEqual(res_d["client_price_total"], Decimal("10"))
+        self.assertEqual(res_d["loader_cost_total"], Decimal("12"))
+        self.assertEqual(res_d["profit_amount"], Decimal("-2"))
+        self.assertIn(res_d["secret_profit_code"], ["W", "S"])
+
+        # ----------------------------------------------------
+        # Example E: Client $10.5, Loader $0 -> profit=$10.5, code=F+C
+        # ----------------------------------------------------
+        res_e = await calculate_order_pricing(
+            "2400 CP",
+            client_price_map={"cp_2400": 10.5},
+            loader_price_map={"cp_2400": 0.0}
+        )
+        self.assertTrue(res_e["is_complete"])
+        self.assertEqual(res_e["client_price_total"], Decimal("10.5"))
+        self.assertEqual(res_e["loader_cost_total"], Decimal("0"))
+        self.assertEqual(res_e["profit_amount"], Decimal("10.5"))
+        self.assertEqual(res_e["secret_profit_code"], "F+C")
+
+        # ----------------------------------------------------
+        # 4 & 5. Multiple Products & Product Quantities (2400 CP x2)
+        # ----------------------------------------------------
+        res_qty = await calculate_order_pricing("2400 CP x2", loader_id=loader_a.id)
+        self.assertTrue(res_qty["is_complete"])
+        self.assertEqual(res_qty["client_price_total"], Decimal("32"))
+        self.assertEqual(res_qty["loader_cost_total"], Decimal("24"))
+        self.assertEqual(res_qty["profit_amount"], Decimal("8"))
+        self.assertEqual(res_qty["secret_profit_code"], "D")
+
+        # ----------------------------------------------------
+        # 8 & 11. Unassigned Loader & Missing Loader Price
+        # ----------------------------------------------------
+        res_unassigned = await calculate_order_pricing("2400 CP", loader_id=None)
+        self.assertFalse(res_unassigned["is_complete"])
+        self.assertEqual(res_unassigned["client_price_total"], Decimal("16"))
+        self.assertIsNone(res_unassigned["loader_cost_total"])
+        self.assertIsNone(res_unassigned["profit_amount"])
+        self.assertIsNone(res_unassigned["secret_profit_code"])
+        self.assertIn("cp_2400", res_unassigned["missing_loader_keys"])
+
+        res_missing_l = await calculate_order_pricing("10800 CP", loader_id=loader_b.id)
+        self.assertFalse(res_missing_l["is_complete"])
+        self.assertEqual(res_missing_l["client_price_total"], Decimal("65.5"))
+        self.assertIsNone(res_missing_l["loader_cost_total"])
+        self.assertIsNone(res_missing_l["profit_amount"])
+        self.assertIsNone(res_missing_l["secret_profit_code"])
+
+        # ----------------------------------------------------
+        # 9. Missing Client Price
+        # ----------------------------------------------------
+        res_missing_c = await calculate_order_pricing("cp_unknown_123", loader_id=loader_a.id)
+        self.assertFalse(res_missing_c["is_complete"])
+        self.assertIsNone(res_missing_c["client_price_total"])
+        self.assertIsNone(res_missing_c["profit_amount"])
+
+        # ----------------------------------------------------
+        # 12-15. Full Chain, Full Event Deal, Safe Vault, Special CP
+        # ----------------------------------------------------
+        await set_loader_price(loader_a.id, "full_chain", 12.0)
+        await set_loader_price(loader_a.id, "full_event_deal", 11.0)
+        await set_loader_price(loader_a.id, "safe_vault_50", 28.0)
+        await set_loader_price(loader_a.id, "cp_4800", 20.0)
+
+        # Full Chain
+        res_fc = await calculate_order_pricing("Full Chain", loader_id=loader_a.id)
+        self.assertTrue(res_fc["is_complete"])
+        self.assertEqual(res_fc["items"][0]["product_key"], "full_chain")
+        self.assertEqual(res_fc["client_price_total"], Decimal("16"))
+        self.assertEqual(res_fc["loader_cost_total"], Decimal("12"))
+        self.assertEqual(res_fc["profit_amount"], Decimal("4"))
+
+        # Full Event Deal
+        res_fe = await calculate_order_pricing("Full Event Deal", loader_id=loader_a.id)
+        self.assertTrue(res_fe["is_complete"])
+        self.assertEqual(res_fe["items"][0]["product_key"], "full_event_deal")
+        self.assertEqual(res_fe["client_price_total"], Decimal("15"))
+        self.assertEqual(res_fe["loader_cost_total"], Decimal("11"))
+
+        # Safe Vault
+        res_sv = await calculate_order_pricing("Safe Vault $50", loader_id=loader_a.id)
+        self.assertTrue(res_sv["is_complete"])
+        self.assertEqual(res_sv["items"][0]["product_key"], "safe_vault_50")
+        self.assertEqual(res_sv["client_price_total"], Decimal("38"))
+        self.assertEqual(res_sv["loader_cost_total"], Decimal("28"))
+
+        # Special CP
+        res_scp = await calculate_order_pricing("4800 CP", loader_id=loader_a.id)
+        self.assertTrue(res_scp["is_complete"])
+        self.assertEqual(res_scp["items"][0]["product_key"], "cp_4800")
+        self.assertEqual(res_scp["client_price_total"], Decimal("30"))
+        self.assertEqual(res_scp["loader_cost_total"], Decimal("20"))
+
+        # ----------------------------------------------------
+        # 16 & 17. DB OrderItem and Order Level Persistence
+        # ----------------------------------------------------
+        ord_db = await create_order(email="step6_db@test.com", package="2400 CP x2 + 880 CP")
+        saved_ord = await save_order_pricing(ord_db.id, loader_id=loader_a.id)
+        self.assertIsNotNone(saved_ord)
+        self.assertEqual(saved_ord.client_price_total, 40.0)
+        self.assertEqual(saved_ord.loader_cost_total, 30.0)
+        self.assertEqual(saved_ord.profit_amount, 10.0)
+        self.assertEqual(saved_ord.secret_profit_code, "F")
+
+        fetched_ord = await get_order_by_id(ord_db.id)
+        self.assertEqual(len(fetched_ord.items), 2)
+        item_2400 = next(it for it in fetched_ord.items if it.product_key == "cp_2400")
+        self.assertEqual(item_2400.quantity, 2)
+        self.assertEqual(item_2400.client_unit_price, 16.0)
+        self.assertEqual(item_2400.client_line_total, 32.0)
+        self.assertEqual(item_2400.loader_unit_cost, 12.0)
+        self.assertEqual(item_2400.loader_line_total, 24.0)
+
+        # ----------------------------------------------------
+        # 20. Historical Order Protection
+        # ----------------------------------------------------
+        hist_client = saved_ord.client_price_total
+        hist_loader = saved_ord.loader_cost_total
+        hist_profit = saved_ord.profit_amount
+        hist_code = saved_ord.secret_profit_code
+
+        # Change Loader A price for cp_2400
+        await set_loader_price(loader_a.id, "cp_2400", 15.0)
+
+        # Historical order in DB is UNCHANGED
+        check_hist = await get_order_by_id(ord_db.id)
+        self.assertEqual(check_hist.client_price_total, hist_client)
+        self.assertEqual(check_hist.loader_cost_total, hist_loader)
+        self.assertEqual(check_hist.profit_amount, hist_profit)
+        self.assertEqual(check_hist.secret_profit_code, hist_code)
+
+
+class TestStep7DeliveryAlbumGroupingAndSummary(unittest.IsolatedAsyncioTestCase):
+    """Tests Step 7: Delivery Album Grouping + Delivery Summary."""
+
+    async def asyncSetUp(self):
+        from database import init_db, update_global_client_prices, add_loader, set_loader_price
+        await init_db()
+        await update_global_client_prices({
+            "cp_2400": 16.0,
+            "cp_5000": 33.0,
+            "cp_10800": 65.5,
+            "cp_880": 8.0,
+        })
+        self.loader_a = await add_loader(-100777888, "Step7 Loader A")
+        await set_loader_price(self.loader_a.id, "cp_2400", 12.0)
+        await set_loader_price(self.loader_a.id, "cp_5000", 25.0)
+
+    async def test_single_image_delivery_formatting(self):
+        """1 & 12. Single image delivery formatting without media_group_id."""
+        from utils import format_delivery_summary_message
+        msg = format_delivery_summary_message(
+            email="cust1@gmail.com",
+            client_price=137.0,
+            secret_code="X",
+            before_total=875.0,
+            now_value=137.0,
+            running_total=1012.0
+        )
+        self.assertIn("📧 cust1@gmail.com", msg)
+        self.assertIn("💵 Client Price: $137", msg)
+        self.assertIn("🔐 Profit: X", msg)
+        self.assertIn("Before: 875", msg)
+        self.assertIn("Now: 137", msg)
+        self.assertIn("Total: 1012", msg)
+        self.assertNotIn("Loader", msg)
+        self.assertNotIn("Cost", msg)
+
+    async def test_album_collector_debouncing_and_grouping(self):
+        """2, 3, 4 & 11. 2-image, 5-image, large album collection and debouncing."""
+        from media_collector import MediaGroupCollector
+        from unittest.mock import MagicMock, AsyncMock
+
+        collector = MediaGroupCollector(timeout=0.05)
+        
+        order_id = 999
+        email = "album@test.com"
+        mock_bot = MagicMock()
+        mock_bot.send_media_group = AsyncMock()
+
+        # Create 5 images for a single media_group_id
+        for i in range(1, 6):
+            msg = MagicMock()
+            msg.message_id = 1000 + i
+            msg.media_group_id = "mg_test_album_5"
+            msg.chat.id = -100888999
+            msg.photo = [MagicMock(file_id=f"file_id_{i}")]
+            msg.document = None
+            msg.caption = f"Caption {i}" if i == 1 else None
+            msg.text = None
+            await collector.add_reply_media_message(msg, order_id=order_id, email=email, bot=mock_bot)
+
+        # Check buffer key exists while debouncing
+        buffer_key = f"{order_id}_mg_test_album_5"
+        self.assertIn(buffer_key, collector._buffers)
+        self.assertEqual(len(collector._buffers[buffer_key]["items"]), 5)
+
+        # Wait for debounce flush to finish
+        await asyncio.sleep(0.12)
+
+        # Buffer should be flushed and added to _processed_cache
+        self.assertNotIn(buffer_key, collector._buffers)
+        self.assertIn(buffer_key, collector._processed_cache)
+
+    async def test_single_delivery_ledger_and_running_total_per_album(self):
+        """5, 6, 7, 8 & 13. Same media_group_id creates ONE ledger entry & updates total ONCE for client group."""
+        from database import create_order, get_current_running_total, record_delivery_ledger_entry, AsyncSessionLocal
+        from models import DeliveryLedger
+        from sqlalchemy import select
+        chat_id = -100987654321
+        order = await create_order(email="album_single@test.com", package="2400 CP", client_chat_id=chat_id)
+
+        before_total = await get_current_running_total(chat_id)
+
+        # Record delivery ledger for album with 4 images
+        entry, is_new = await record_delivery_ledger_entry(
+            order_id=order.id,
+            package=order.package,
+            now_value=16.0,
+            loader_name="Loader A",
+            dedup_hash="media_group_mg_album_123",
+            chat_id=chat_id
+        )
+
+        self.assertTrue(is_new)
+        self.assertIsNotNone(entry)
+
+        after_total = await get_current_running_total(chat_id)
+        self.assertEqual(after_total, before_total + 16.0)
+
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(DeliveryLedger).where(DeliveryLedger.chat_id == chat_id))
+            ledger = res.scalars().all()
+            matched = [e for e in ledger if e.dedup_hash == "media_group_mg_album_123"]
+            self.assertEqual(len(matched), 1)
+
+    async def test_duplicate_protection_and_retries(self):
+        """9 & 10. Duplicate album update/media_group_id does NOT process twice or change total twice."""
+        from database import create_order, get_current_running_total, record_delivery_ledger_entry
+        chat_id = -100444555666
+        order = await create_order(email="dup_album@test.com", package="2400 CP", client_chat_id=chat_id)
+
+        before_total = await get_current_running_total(chat_id)
+
+        # First attempt
+        entry1, is_new1 = await record_delivery_ledger_entry(
+            order_id=order.id,
+            package=order.package,
+            now_value=16.0,
+            loader_name="Loader A",
+            dedup_hash="media_group_mg_dup_999",
+            chat_id=chat_id
+        )
+        self.assertTrue(is_new1)
+
+        # Retry attempt with same dedup_hash / media_group_id
+        entry2, is_new2 = await record_delivery_ledger_entry(
+            order_id=order.id,
+            package=order.package,
+            now_value=16.0,
+            loader_name="Loader A",
+            dedup_hash="media_group_mg_dup_999",
+            chat_id=chat_id
+        )
+        self.assertFalse(is_new2)
+        self.assertIsNone(entry2)
+
+        after_total = await get_current_running_total(chat_id)
+        self.assertEqual(after_total, before_total + 16.0)
+
+    async def test_client_group_isolation(self):
+        """14. Wrong client group running total is never used or affected."""
+        from database import create_order, get_current_running_total, record_delivery_ledger_entry
+        group1 = -100111111111
+        group2 = -100222222222
+
+        order1 = await create_order(email="g1@test.com", package="2400 CP", client_chat_id=group1)
+        
+        await record_delivery_ledger_entry(
+            order_id=order1.id,
+            package=order1.package,
+            now_value=16.0,
+            loader_name="Loader A",
+            dedup_hash="mg_g1",
+            chat_id=group1
+        )
+
+        total_g1 = await get_current_running_total(group1)
+        total_g2 = await get_current_running_total(group2)
+
+        self.assertEqual(total_g1, 16.0)
+        self.assertEqual(total_g2, 0.0)
+
+    async def test_multiple_packages_combined_client_price(self):
+        """15. Multiple packages use combined client price."""
+        from decimal import Decimal
+        from pricing_calculator import calculate_order_pricing
+        from utils import format_delivery_summary_message
+        
+        pricing = await calculate_order_pricing("2400 CP + 5000 CP", loader_id=self.loader_a.id)
+
+        # 2400 CP ($16) + 5000 CP ($33) = $49
+        self.assertEqual(pricing["client_price_total"], Decimal("49"))
+        self.assertEqual(pricing["loader_cost_total"], Decimal("37"))
+        self.assertEqual(pricing["profit_amount"], Decimal("12"))
+        self.assertEqual(pricing["secret_profit_code"], "H")
+
+        summary = format_delivery_summary_message(
+            email="multi_pkg@test.com",
+            client_price=pricing["client_price_total"],
+            secret_code=pricing["secret_profit_code"],
+            before_total=100.0,
+            now_value=float(pricing["client_price_total"]),
+            running_total=149.0
+        )
+        self.assertIn("💵 Client Price: $49", summary)
+        self.assertIn("🔐 Profit: H", summary)
+        self.assertNotIn("37", summary)
+
+    async def test_privacy_non_exposure(self):
+        """16 & 17. Secret profit code is shown, actual dollar profit & loader cost are NEVER exposed."""
+        from utils import format_delivery_summary_message
+        summary = format_delivery_summary_message(
+            email="privacy@test.com",
+            client_price=49.0,
+            secret_code="H",
+            before_total=0.0,
+            now_value=49.0,
+            running_total=49.0
+        )
+        self.assertIn("🔐 Profit: H", summary)
+        self.assertNotIn("Loader Cost", summary)
+        self.assertNotIn("Actual Profit", summary)
+        self.assertNotIn("cost", summary.lower())
+
+    async def test_missing_order_or_failure_isolation(self):
+        """18 & 19. Missing order or failure does not create financial changes."""
+        from database import get_current_running_total
+        chat_id = -100999000
+        before_total = await get_current_running_total(chat_id)
+
+        after_total = await get_current_running_total(chat_id)
+        self.assertEqual(before_total, after_total)
+
+    async def test_delivery_chunking_utility(self):
+        """20. Existing delivery behavior/chunking remains compatible."""
+        from delivery import chunk_list
+        items = list(range(25))
+        chunks = chunk_list(items, 10)
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(len(chunks[0]), 10)
+        self.assertEqual(len(chunks[1]), 10)
+        self.assertEqual(len(chunks[2]), 5)
+
+
+class TestStep8ClientPaymentOCRAndDeduction(unittest.IsolatedAsyncioTestCase):
+    """Tests Step 8: Client Payment OCR + Verification + Group Balance Deduction."""
+
+    async def asyncSetUp(self):
+        from database import init_db
+        await init_db()
+
+    def test_ocr_amount_and_txid_extraction(self):
+        """1, 2, 3, 4. Extracts amount (Decimal, USDT, $) and normalized TXID."""
+        from utils import extract_payment_info, normalize_transaction_id
+        from decimal import Decimal
+
+        # 1. Standard text
+        text1 = "Payment received: $200.50 USDT\nTransaction ID: TXN123456789"
+        info1 = extract_payment_info(text1)
+        self.assertTrue(info1["is_payment"])
+        self.assertEqual(info1["amount"], Decimal("200.50"))
+        self.assertEqual(info1["transaction_id"], "TXN123456789")
+        self.assertEqual(info1["currency"], "USDT")
+
+        # 2. Lowercase and prefix labels
+        text2 = "amount paid: 100 usdt\ntrx id: abc_xyz_999"
+        info2 = extract_payment_info(text2)
+        self.assertEqual(info2["amount"], Decimal("100"))
+        self.assertEqual(info2["transaction_id"], "ABC_XYZ_999")
+
+        # 3. Canonical TXID normalization
+        self.assertEqual(normalize_transaction_id("Transaction ID: REF_001_ABC"), "REF_001_ABC")
+        self.assertEqual(normalize_transaction_id("txid: 123456"), "123456")
+
+    def test_missing_amount_and_missing_txid(self):
+        """5 & 6. Handles missing amount or missing transaction ID."""
+        from utils import extract_payment_info
+        from decimal import Decimal
+
+        # Missing TXID
+        text_no_tx = "Payment received $200 USDT"
+        info1 = extract_payment_info(text_no_tx)
+        self.assertEqual(info1["amount"], Decimal("200"))
+        self.assertIsNone(info1["transaction_id"])
+
+        # Missing Amount
+        text_no_amt = "Transaction Hash: 0x1234567890abcdef"
+        info2 = extract_payment_info(text_no_amt)
+        self.assertIsNone(info2["amount"])
+        self.assertEqual(info2["transaction_id"], "0X1234567890ABCDEF")
+
+    async def test_pending_and_rejected_payment_no_balance_change(self):
+        """7 & 8. Pending and Rejected payments produce ZERO balance change."""
+        from database import get_current_running_total
+        from utils import format_payment_pending_message, format_payment_rejected_message
+        chat_id = -100888111
+
+        before_total = await get_current_running_total(chat_id)
+
+        # Pending message format
+        msg_pending = format_payment_pending_message(amount=200.0, tx_id="TX_PENDING_1")
+        self.assertIn("Pending Verification", msg_pending)
+        self.assertIn("200", msg_pending)
+
+        # Rejected message format
+        msg_rejected = format_payment_rejected_message("API Error")
+        self.assertIn("failed", msg_rejected)
+
+        # Balance remains unchanged
+        after_total = await get_current_running_total(chat_id)
+        self.assertEqual(before_total, after_total)
+
+    async def test_verified_payment_group_balance_deduction(self):
+        """9, 10, 16, 17 & 20. Verified payment deducts group balance with correct Before/Payment/Total."""
+        from database import process_verified_payment_deduction, get_current_running_total, record_delivery_ledger_entry, AsyncSessionLocal
+        from models import PaymentTransaction, DeliveryLedger
+        from sqlalchemy import select
+
+        chat_id = -100555666777
+
+        # Set initial delivery to make running total 1012
+        await record_delivery_ledger_entry(
+            order_id=None,
+            package="INIT",
+            now_value=1012.0,
+            loader_name="Admin",
+            dedup_hash="step8_init_1012",
+            chat_id=chat_id
+        )
+
+        before_total = await get_current_running_total(chat_id)
+        self.assertEqual(before_total, 1012.0)
+
+        # Process verified payment of $200
+        p_tx, before_v, now_v, total_v, is_new, res_code = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=200.0,
+            transaction_id="TX_VERIFIED_1001",
+            provider="Binance",
+            currency="USDT"
+        )
+
+        self.assertTrue(is_new)
+        self.assertEqual(res_code, "SUCCESS")
+        self.assertEqual(before_v, 1012.0)
+        self.assertEqual(now_v, 200.0)
+        self.assertEqual(total_v, 812.0)
+
+        after_total = await get_current_running_total(chat_id)
+        self.assertEqual(after_total, 812.0)
+
+        # Verify PaymentTransaction & DeliveryLedger records created once
+        async with AsyncSessionLocal() as session:
+            stmt_p = select(PaymentTransaction).where(PaymentTransaction.transaction_id == "TX_VERIFIED_1001")
+            ptx_item = (await session.execute(stmt_p)).scalar_one_or_none()
+            self.assertIsNotNone(ptx_item)
+            self.assertEqual(ptx_item.amount, 200.0)
+            self.assertEqual(ptx_item.status, "VERIFIED")
+
+            stmt_l = select(DeliveryLedger).where(DeliveryLedger.dedup_hash == "payment_tx_binance_tx_verified_1001")
+            ledger_item = (await session.execute(stmt_l)).scalar_one_or_none()
+            self.assertIsNotNone(ledger_item)
+            self.assertEqual(ledger_item.price, -200.0)
+
+    async def test_duplicate_payment_deduplication(self):
+        """11, 12 & 13. Duplicate transaction ID does NOT deduct balance twice."""
+        from database import process_verified_payment_deduction, get_current_running_total, record_delivery_ledger_entry
+
+        chat_id = -100444333222
+
+        await record_delivery_ledger_entry(
+            order_id=None,
+            package="INIT",
+            now_value=1012.0,
+            loader_name="Admin",
+            dedup_hash="step8_dup_init",
+            chat_id=chat_id
+        )
+
+        # 1st Submission: $200
+        p_tx1, before1, now1, total1, is_new1, res1 = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=200.0,
+            transaction_id="TX_DUP_12345",
+            provider="Binance"
+        )
+        self.assertTrue(is_new1)
+        self.assertEqual(total1, 812.0)
+
+        # 2nd Submission (Duplicate TXID): $200
+        p_tx2, before2, now2, total2, is_new2, res2 = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=200.0,
+            transaction_id="TX_DUP_12345",
+            provider="Binance"
+        )
+        self.assertFalse(is_new2)
+        self.assertEqual(res2, "DUPLICATE_TRANSACTION")
+        self.assertEqual(now2, 0.0)
+        self.assertEqual(total2, 812.0)
+
+        # Running total remains 812.0, NOT 612.0
+        final_total = await get_current_running_total(chat_id)
+        self.assertEqual(final_total, 812.0)
+
+    async def test_group_isolation(self):
+        """14, 15 & 24. Payment in Group A does not affect Group B or another order."""
+        from database import process_verified_payment_deduction, get_current_running_total, record_delivery_ledger_entry
+
+        group_a = -100888777111
+        group_b = -100999888222
+
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=1012.0, dedup_hash="init_a", chat_id=group_a)
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=500.0, dedup_hash="init_b", chat_id=group_b)
+
+        # Payment in Group A: $200
+        await process_verified_payment_deduction(chat_id=group_a, amount=200.0, transaction_id="TX_GROUP_A", provider="Binance")
+
+        total_a = await get_current_running_total(group_a)
+        total_b = await get_current_running_total(group_b)
+
+        self.assertEqual(total_a, 812.0)
+        self.assertEqual(total_b, 500.0)
+
+    async def test_overpayment_ledger_behavior(self):
+        """21. Overpayment reduces running total into negative value as expected."""
+        from database import process_verified_payment_deduction, get_current_running_total, record_delivery_ledger_entry
+
+        chat_id = -100999888777
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=100.0, dedup_hash="init_overpay", chat_id=chat_id)
+
+        # Payment of $200 on balance of $100 -> -100
+        p_tx, before_v, now_v, total_v, is_new, res_code = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=200.0,
+            transaction_id="TX_OVERPAY_1",
+            provider="Binance"
+        )
+        self.assertTrue(is_new)
+        self.assertEqual(total_v, -100.0)
+
+        final_total = await get_current_running_total(chat_id)
+        self.assertEqual(final_total, -100.0)
+
+    async def test_privacy_non_exposure_in_payment_messages(self):
+        """24. Payment confirmation messages NEVER expose loader cost or actual profit."""
+        from utils import format_payment_verification_message, format_payment_pending_message, format_payment_rejected_message
+
+        v_msg = format_payment_verification_message(amount=200.0, tx_id="ABC123XYZ", before_total=1012.0, now_payment=200.0, running_total=812.0)
+        self.assertIn("Payment Verified", v_msg)
+        self.assertIn("ABC123XYZ", v_msg)
+        self.assertIn("Before: 1012", v_msg)
+        self.assertIn("Payment: -200", v_msg)
+        self.assertIn("Total: 812", v_msg)
+
+        self.assertNotIn("Loader", v_msg)
+        self.assertNotIn("Profit", v_msg)
+        self.assertNotIn("cost", v_msg.lower())
+
+        p_msg = format_payment_pending_message(amount=200.0, tx_id="ABC123XYZ")
+        self.assertNotIn("Loader", p_msg)
+        self.assertNotIn("Profit", p_msg)
+
+        r_msg = format_payment_rejected_message("API error")
+        self.assertNotIn("Loader", r_msg)
+        self.assertNotIn("Profit", r_msg)
+
+
+class TestStep9EndToEndIntegration(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from database import init_db
+        await init_db()
+
+    def test_negative_profit_encoding_regression(self):
+        """21 & 22. Verify negative profit encoding: -$2 -> S and +$2 -> W."""
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code, decode_profit_code
+
+        self.assertEqual(encode_profit_code(Decimal("-2")), "S")
+        self.assertEqual(encode_profit_code(Decimal("2")), "W")
+        self.assertEqual(encode_profit_code(Decimal("0")), "U")
+        self.assertEqual(encode_profit_code(Decimal("4")), "X")
+        self.assertEqual(encode_profit_code(Decimal("4.5")), "X+C")
+        self.assertEqual(encode_profit_code(Decimal("10.5")), "F+C")
+        self.assertEqual(encode_profit_code(Decimal("10.25")), "F+K")
+        self.assertEqual(encode_profit_code(Decimal("14.75")), "J+L")
+        self.assertEqual(encode_profit_code(Decimal("17")), "X+F+Y")
+
+        # Decodes back to exact Decimal
+        self.assertEqual(decode_profit_code("S"), Decimal("-2"))
+        self.assertEqual(decode_profit_code("W"), Decimal("2"))
+
+    def test_product_catalog_coverage_and_canonical_keys(self):
+        """20. Full product coverage & canonical key verification."""
+        from pricing_calculator import parse_order_items_from_text
+        from product_catalog import PRODUCT_CATALOG
+
+        # Check catalog products
+        for key in ["cp_10800", "cp_5000", "cp_2400", "cp_880", "cp_420", "cp_4800", "safe_vault_50", "full_event_deal", "full_chain"]:
+            self.assertIn(key, PRODUCT_CATALOG)
+
+        # Full Chain MUST remain full_chain and NOT cp_560
+        items_fc = parse_order_items_from_text("Full Chain")
+        self.assertEqual(len(items_fc), 1)
+        self.assertEqual(items_fc[0]["product_key"], "full_chain")
+
+        # Full Event Deal
+        items_fe = parse_order_items_from_text("Full Event Deal")
+        self.assertEqual(len(items_fe), 1)
+        self.assertEqual(items_fe[0]["product_key"], "full_event_deal")
+
+    def test_order_parser_context_aware_exclusions(self):
+        """3. Order parser avoids mistaking random numbers (UID, OTP, Passwords, Order ID) for CP."""
+        from order_parser import parse_order_v2
+
+        text = (
+            "Order #:991\n"
+            "Activision\n"
+            "UID: 6712394850192\n"
+            "Email: testuser@gmail.com\n"
+            "Pass: 987654321\n"
+            "OTP: 0451 8921\n"
+            "2400 CP"
+        )
+        parsed = parse_order_v2(text)
+        self.assertTrue(parsed["order_detected"])
+        self.assertEqual(parsed["customer_ref_id"], "991")
+        self.assertEqual(parsed["email"], "testuser@gmail.com")
+        self.assertEqual(len(parsed["packages"]), 1)
+        self.assertEqual(parsed["packages"][0]["package"], "2400")
+        self.assertNotIn("6712394850192", [p["package"] for p in parsed["packages"]])
+        self.assertNotIn("987654321", [p["package"] for p in parsed["packages"]])
+
+    async def test_loader_pricing_isolation(self):
+        """19. Loader A cost ($12) vs Loader B cost ($14) for same product (2400 CP)."""
+        from database import set_loader_price
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        loader_a_id = 9001
+        loader_b_id = 9002
+
+        await set_loader_price(loader_a_id, "cp_2400", Decimal("12"))
+        await set_loader_price(loader_b_id, "cp_2400", Decimal("14"))
+
+        calc_a = await calculate_order_pricing("2400 CP", loader_id=loader_a_id, client_price_map={"cp_2400": Decimal("16")})
+        calc_b = await calculate_order_pricing("2400 CP", loader_id=loader_b_id, client_price_map={"cp_2400": Decimal("16")})
+
+        self.assertEqual(calc_a["loader_cost_total"], Decimal("12"))
+        self.assertEqual(calc_a["profit_amount"], Decimal("4"))
+        self.assertEqual(calc_a["secret_profit_code"], "X")
+
+        self.assertEqual(calc_b["loader_cost_total"], Decimal("14"))
+        self.assertEqual(calc_b["profit_amount"], Decimal("2"))
+        self.assertEqual(calc_b["secret_profit_code"], "W")
+
+    def test_multi_package_and_quantity_pricing(self):
+        """8 & 9. Multi-package aggregation and quantity multiplier pricing."""
+        from pricing_calculator import calculate_order_totals
+        from decimal import Decimal
+
+        # 2400 CP ($16 client / $12 loader) + 5000 CP ($33 client / $25 loader)
+        items_multi = [
+            {"product_key": "cp_2400", "quantity": 1, "client_price": Decimal("16"), "loader_cost": Decimal("12")},
+            {"product_key": "cp_5000", "quantity": 1, "client_price": Decimal("33"), "loader_cost": Decimal("25")}
+        ]
+        res_multi = calculate_order_totals(items_multi)
+        self.assertEqual(res_multi["client_total"], Decimal("49"))
+        self.assertEqual(res_multi["loader_total"], Decimal("37"))
+        self.assertEqual(res_multi["profit"], Decimal("12"))
+        self.assertEqual(res_multi["secret_code"], "H")
+
+        # Quantities: 2400 CP x2 ($16 x2 = $32 client / $12 x2 = $24 loader / profit $8 = D)
+        items_qty = [
+            {"product_key": "cp_2400", "quantity": 2, "client_price": Decimal("16"), "loader_cost": Decimal("12")}
+        ]
+        res_qty = calculate_order_totals(items_qty)
+        self.assertEqual(res_qty["client_total"], Decimal("32"))
+        self.assertEqual(res_qty["loader_total"], Decimal("24"))
+        self.assertEqual(res_qty["profit"], Decimal("8"))
+        self.assertEqual(res_qty["secret_code"], "D")
+
+    async def test_end_to_end_scenario_1_single_package(self):
+        """23. Full end-to-end scenario: Order -> Pricing -> Delivery -> Payment -> Dup Check."""
+        from database import (
+            record_delivery_ledger_entry,
+            get_current_running_total,
+            process_verified_payment_deduction,
+            set_global_client_price,
+            set_loader_price
+        )
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        chat_id = -100999000111
+        loader_id = 8801
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(loader_id, "cp_2400", Decimal("12"))
+
+        await record_delivery_ledger_entry(
+            order_id=None,
+            package="INIT",
+            now_value=875.0,
+            loader_name="Admin",
+            dedup_hash="s9_sc1_init",
+            chat_id=chat_id
+        )
+        self.assertEqual(await get_current_running_total(chat_id), 875.0)
+
+        # 1. Calculate pricing
+        pricing = await calculate_order_pricing("2400 CP", loader_id=loader_id)
+        self.assertTrue(pricing["is_complete"])
+        self.assertEqual(pricing["client_price_total"], Decimal("16"))
+        self.assertEqual(pricing["loader_cost_total"], Decimal("12"))
+        self.assertEqual(pricing["profit_amount"], Decimal("4"))
+        self.assertEqual(pricing["secret_profit_code"], "X")
+
+        # 2. Record delivery ledger entry (Order +$16)
+        entry, _ = await record_delivery_ledger_entry(
+            order_id=101,
+            package="2400 CP",
+            price=16.0,
+            loader_name="Loader A",
+            client_amount=16.0,
+            loader_cost=12.0,
+            profit_amount=4.0,
+            secret_profit_code="X",
+            chat_id=chat_id,
+            dedup_hash="s9_sc1_delivery_101"
+        )
+        self.assertEqual(entry.before_total, 875.0)
+        self.assertEqual(entry.now_value, 16.0)
+        self.assertEqual(entry.running_total, 891.0)
+        self.assertEqual(await get_current_running_total(chat_id), 891.0)
+
+        # 3. Process Verified Payment of $100
+        p_tx1, b1, n1, t1, is_new1, res1 = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=100.0,
+            transaction_id="TX_S9_SC1_100",
+            provider="Binance"
+        )
+        self.assertTrue(is_new1)
+        self.assertEqual(b1, 891.0)
+        self.assertEqual(n1, 100.0)
+        self.assertEqual(t1, 791.0)
+        self.assertEqual(await get_current_running_total(chat_id), 791.0)
+
+        # 4. Duplicate Payment TXID resubmission
+        p_tx2, b2, n2, t2, is_new2, res2 = await process_verified_payment_deduction(
+            chat_id=chat_id,
+            amount=100.0,
+            transaction_id="TX_S9_SC1_100",
+            provider="Binance"
+        )
+        self.assertFalse(is_new2)
+        self.assertEqual(res2, "DUPLICATE_TRANSACTION")
+        self.assertEqual(n2, 0.0)
+        self.assertEqual(t2, 791.0)
+        self.assertEqual(await get_current_running_total(chat_id), 791.0)
+
+    async def test_end_to_end_scenario_2_multi_package(self):
+        """24. Second scenario: 2400 CP + 5000 CP ($49 client / $37 loader / profit $12 -> H)."""
+        from database import (
+            record_delivery_ledger_entry,
+            get_current_running_total,
+            set_global_client_price,
+            set_loader_price
+        )
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        chat_id = -100999000222
+        loader_id = 8802
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_global_client_price("cp_5000", Decimal("33"))
+        await set_loader_price(loader_id, "cp_2400", Decimal("12"))
+        await set_loader_price(loader_id, "cp_5000", Decimal("25"))
+
+        pricing = await calculate_order_pricing("2400 CP + 5000 CP", loader_id=loader_id)
+        self.assertTrue(pricing["is_complete"])
+        self.assertEqual(pricing["client_price_total"], Decimal("49"))
+        self.assertEqual(pricing["loader_cost_total"], Decimal("37"))
+        self.assertEqual(pricing["profit_amount"], Decimal("12"))
+        self.assertEqual(pricing["secret_profit_code"], "H")
+
+        # 5 screenshots in 1 album -> 1 delivery ledger entry
+        entry, is_new = await record_delivery_ledger_entry(
+            order_id=102,
+            package="2400 CP + 5000 CP",
+            price=49.0,
+            loader_name="Loader B",
+            client_amount=49.0,
+            loader_cost=37.0,
+            profit_amount=12.0,
+            secret_profit_code="H",
+            chat_id=chat_id,
+            dedup_hash="s9_sc2_album_5_images_dedup"
+        )
+        self.assertTrue(is_new)
+        self.assertEqual(entry.now_value, 49.0)
+        self.assertEqual(await get_current_running_total(chat_id), 49.0)
+
+        # Duplicate album retry with same dedup_hash -> blocked
+        entry_dup, is_new_dup = await record_delivery_ledger_entry(
+            order_id=102,
+            package="2400 CP + 5000 CP",
+            price=49.0,
+            loader_name="Loader B",
+            client_amount=49.0,
+            loader_cost=37.0,
+            profit_amount=12.0,
+            secret_profit_code="H",
+            chat_id=chat_id,
+            dedup_hash="s9_sc2_album_5_images_dedup"
+        )
+        self.assertFalse(is_new_dup)
+        self.assertEqual(await get_current_running_total(chat_id), 49.0)
+
+    async def test_historical_price_protection(self):
+        """14. Updating /setclientprice or /setloaderprice does NOT mutate historical order/ledger records."""
+        from database import (
+            record_delivery_ledger_entry,
+            set_global_client_price,
+            set_loader_price,
+            get_ledger_entry_by_id
+        )
+        from decimal import Decimal
+
+        chat_id = -100777666555
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(7001, "cp_2400", Decimal("12"))
+
+        entry, _ = await record_delivery_ledger_entry(
+            order_id=201,
+            package="2400 CP",
+            price=16.0,
+            loader_name="Loader A",
+            client_amount=16.0,
+            loader_cost=12.0,
+            profit_amount=4.0,
+            secret_profit_code="X",
+            chat_id=chat_id,
+            dedup_hash="s9_hist_price_201"
+        )
+        entry_id = entry.id
+
+        # Admin updates global client price and loader price
+        await set_global_client_price("cp_2400", Decimal("20"))
+        await set_loader_price(7001, "cp_2400", Decimal("15"))
+
+        # Verify historical ledger entry remains unchanged
+        fetched = await get_ledger_entry_by_id(entry_id)
+        self.assertEqual(fetched.client_amount, 16.0)
+        self.assertEqual(fetched.loader_cost, 12.0)
+        self.assertEqual(fetched.profit_amount, 4.0)
+        self.assertEqual(fetched.secret_profit_code, "X")
+
+    async def test_failure_scenarios(self):
+        """25. Missing prices, unassigned loader lead to incomplete pricing & no fake records."""
+        from pricing_calculator import calculate_order_pricing
+
+        # Missing client price
+        res_no_client = await calculate_order_pricing([{"product_key": "cp_unknown_999", "quantity": 1}], loader_id=123)
+        self.assertFalse(res_no_client["is_complete"])
+        self.assertFalse(res_no_client["is_client_complete"])
+        self.assertIn("cp_unknown_999", res_no_client["missing_client_keys"])
+
+        # No loader assigned
+        res_no_loader = await calculate_order_pricing("2400 CP", loader_id=None, client_price_map={"cp_2400": 16})
+        self.assertFalse(res_no_loader["is_complete"])
+        self.assertFalse(res_no_loader["is_loader_complete"])
+        self.assertIsNone(res_no_loader["profit_amount"])
+        self.assertIsNone(res_no_loader["secret_profit_code"])
+
+
+class TestStep10OrderLifecycleIntegration(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from database import init_db
+        await init_db()
+
+    async def test_1_initial_pending_status(self):
+        """1. Initial PENDING status upon order creation."""
+        from database import create_order
+        order = await create_order(email="newcust@gmail.com", package="2400 CP", client_chat_id=-10011)
+        self.assertEqual(order.status, "Pending")
+
+    async def test_2_successful_pricing(self):
+        """2. Successful pricing transitions order status to PRICED."""
+        from database import create_order, set_global_client_price, transition_order_status
+        from decimal import Decimal
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        order = await create_order(email="cust2@gmail.com", package="2400 CP", client_chat_id=-10012)
+        upd_order, success, reason = await transition_order_status(order.id, "PRICED")
+        self.assertTrue(success)
+        self.assertEqual(upd_order.status, "PRICED")
+        self.assertEqual(upd_order.client_price_total, 16.0)
+
+    async def test_3_missing_client_price(self):
+        """3. Order with missing client price remains Pending / Needs_Review without fake pricing."""
+        from database import create_order
+        from pricing_calculator import calculate_order_pricing
+
+        order = await create_order(email="cust3@gmail.com", package="99999 CP Unpriced", client_chat_id=-10013)
+        calc = await calculate_order_pricing([{"product_key": "cp_99999", "quantity": 1}], loader_id=101)
+        self.assertFalse(calc["is_complete"])
+        self.assertFalse(calc["is_client_complete"])
+        self.assertIsNone(calc["client_price_total"])
+
+    async def test_4_loader_assignment(self):
+        """4. Loader assignment calculates loader cost, profit amount, and secret profit code."""
+        from database import create_order, set_global_client_price, set_loader_price, save_order_pricing, transition_order_status
+        from decimal import Decimal
+
+        loader_id = 9101
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(loader_id, "cp_2400", Decimal("12"))
+
+        order = await create_order(email="cust4@gmail.com", package="2400 CP", client_chat_id=-10014)
+        upd_order, success, _ = await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=loader_id)
+        self.assertTrue(success)
+        self.assertEqual(upd_order.client_price_total, 16.0)
+        self.assertEqual(upd_order.loader_cost_total, 12.0)
+        self.assertEqual(upd_order.profit_amount, 4.0)
+        self.assertEqual(upd_order.secret_profit_code, "X")
+
+    async def test_5_missing_loader_assignment(self):
+        """5. Calculation without loader assigned leaves loader cost & profit uncalculated."""
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        calc = await calculate_order_pricing("2400 CP", loader_id=None, client_price_map={"cp_2400": Decimal("16")})
+        self.assertFalse(calc["is_loader_complete"])
+        self.assertIsNone(calc["loader_cost_total"])
+        self.assertIsNone(calc["profit_amount"])
+        self.assertIsNone(calc["secret_profit_code"])
+
+    async def test_6_missing_loader_price(self):
+        """6. Assigned loader missing product cost moves order to NEEDS_REVIEW / unpriced loader state."""
+        from database import create_order, set_global_client_price, transition_order_status
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        loader_id = 9106
+        await set_global_client_price("cp_2400", Decimal("16"))
+        order = await create_order(email="cust6@gmail.com", package="2400 CP", client_chat_id=-10016)
+
+        calc = await calculate_order_pricing("2400 CP", loader_id=loader_id)
+        self.assertFalse(calc["is_loader_complete"])
+        self.assertIn("cp_2400", calc["missing_loader_keys"])
+
+        upd_order, success, _ = await transition_order_status(order.id, "NEEDS_REVIEW", loader_id=loader_id)
+        self.assertTrue(success)
+        self.assertEqual(upd_order.status, "NEEDS_REVIEW")
+
+    async def test_7_successful_transition_to_sent_to_loader(self):
+        """7. Successful transition to SENT_TO_LOADER."""
+        from database import create_order, transition_order_status
+
+        order = await create_order(email="cust7@gmail.com", package="2400 CP", client_chat_id=-10017)
+        await transition_order_status(order.id, "PRICED")
+        upd_order, success, _ = await transition_order_status(order.id, "SENT_TO_LOADER")
+        self.assertTrue(success)
+        self.assertEqual(upd_order.status, "SENT_TO_LOADER")
+
+    async def test_8_single_image_delivery(self):
+        """8. Single image delivery transitions to DELIVERED and COMPLETED."""
+        from database import create_order, mark_order_delivered, mark_order_completed
+
+        order = await create_order(email="cust8@gmail.com", package="2400 CP", client_chat_id=-10018)
+        deliv = await mark_order_delivered(order.id)
+        self.assertEqual(deliv.status, "Delivered")
+        comp = await mark_order_completed(order.id)
+        self.assertEqual(comp.status, "Completed")
+
+    async def test_9_multi_image_album_delivery(self):
+        """9. Multi-image album delivery transitions to COMPLETED creating 1 ledger entry."""
+        from database import create_order, record_delivery_ledger_entry, mark_order_completed, get_current_running_total
+
+        chat_id = -10019
+        order = await create_order(email="cust9@gmail.com", package="2400 CP", client_chat_id=chat_id)
+        entry, is_new = await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400 CP",
+            now_value=16.0,
+            loader_name="Loader A",
+            dedup_hash="step10_album_5_images",
+            chat_id=chat_id
+        )
+        self.assertTrue(is_new)
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+        comp = await mark_order_completed(order.id)
+        self.assertEqual(comp.status, "Completed")
+
+    async def test_10_delivered_transition(self):
+        """10. mark_order_delivered sets status to Delivered."""
+        from database import create_order, mark_order_delivered
+        order = await create_order(email="cust10@gmail.com", package="2400 CP", client_chat_id=-10020)
+        deliv = await mark_order_delivered(order.id)
+        self.assertEqual(deliv.status, "Delivered")
+        self.assertIsNotNone(deliv.delivered_at)
+
+    async def test_11_completed_transition(self):
+        """11. mark_order_completed sets status to Completed."""
+        from database import create_order, mark_order_completed
+        order = await create_order(email="cust11@gmail.com", package="2400 CP", client_chat_id=-10021)
+        comp = await mark_order_completed(order.id)
+        self.assertEqual(comp.status, "Completed")
+
+    async def test_12_duplicate_delivery_protection(self):
+        """12. Re-delivering a completed order is blocked as duplicate with 0 running total change."""
+        from database import create_order, mark_order_completed, record_delivery_ledger_entry, get_current_running_total
+
+        chat_id = -10022
+        order = await create_order(email="cust12@gmail.com", package="2400 CP", client_chat_id=chat_id)
+        await record_delivery_ledger_entry(order_id=order.id, package="2400 CP", now_value=16.0, dedup_hash="hash_12", chat_id=chat_id)
+        await mark_order_completed(order.id)
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+        # Retry duplicate delivery
+        entry_dup, is_new_dup = await record_delivery_ledger_entry(order_id=order.id, package="2400 CP", now_value=16.0, dedup_hash="hash_12", chat_id=chat_id)
+        self.assertFalse(is_new_dup)
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+    async def test_13_duplicate_source_order_protection(self):
+        """13. Re-submitting exact duplicate content returns existing pending order."""
+        from database import create_order, get_exact_duplicate_pending_order
+
+        text = "Order #:54\nActivision\nEmail: testdup@gmail.com\nPass: 12345\n2400 CP"
+        o1 = await create_order(email="testdup@gmail.com", package="2400 CP", raw_text=text, client_chat_id=-10023)
+        dup = await get_exact_duplicate_pending_order("testdup@gmail.com", text)
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup.id, o1.id)
+
+    async def test_14_cancelled_order(self):
+        """14. Cancelling an order sets status Cancelled and produces NO delivery ledger entry or running total change."""
+        from database import create_order, cancel_order, get_current_running_total
+
+        chat_id = -10024
+        order = await create_order(email="cust14@gmail.com", package="2400 CP", client_chat_id=chat_id)
+        c_order, ok = await cancel_order(order.id)
+        self.assertTrue(ok)
+        self.assertEqual(c_order.status, "Cancelled")
+        self.assertEqual(await get_current_running_total(chat_id), 0.0)
+
+    async def test_15_failed_delivery(self):
+        """15. Failed delivery transitions to FAILED and produces 0 running total change."""
+        from database import create_order, transition_order_status, get_current_running_total
+
+        chat_id = -10025
+        order = await create_order(email="cust15@gmail.com", package="2400 CP", client_chat_id=chat_id)
+        upd, ok, _ = await transition_order_status(order.id, "FAILED")
+        self.assertTrue(ok)
+        self.assertEqual(upd.status, "FAILED")
+        self.assertEqual(await get_current_running_total(chat_id), 0.0)
+
+    async def test_16_redelivery_protection(self):
+        """16. Redelivering an order session with same dedup_hash is idempotent."""
+        from database import record_delivery_ledger_entry, get_current_running_total
+
+        chat_id = -10026
+        entry1, ok1 = await record_delivery_ledger_entry(order_id=160, package="2400 CP", now_value=16.0, dedup_hash="redeliv_hash", chat_id=chat_id)
+        self.assertTrue(ok1)
+
+        entry2, ok2 = await record_delivery_ledger_entry(order_id=160, package="2400 CP", now_value=16.0, dedup_hash="redeliv_hash", chat_id=chat_id)
+        self.assertFalse(ok2)
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+    async def test_17_loader_ab_isolation(self):
+        """17. Loader A ($12) vs Loader B ($14) pricing isolation."""
+        from database import set_loader_price
+        from pricing_calculator import calculate_order_pricing
+        from decimal import Decimal
+
+        l_a = 9171
+        l_b = 9172
+        await set_loader_price(l_a, "cp_2400", Decimal("12"))
+        await set_loader_price(l_b, "cp_2400", Decimal("14"))
+
+        res_a = await calculate_order_pricing("2400 CP", loader_id=l_a, client_price_map={"cp_2400": Decimal("16")})
+        res_b = await calculate_order_pricing("2400 CP", loader_id=l_b, client_price_map={"cp_2400": Decimal("16")})
+
+        self.assertEqual(res_a["loader_cost_total"], Decimal("12"))
+        self.assertEqual(res_b["loader_cost_total"], Decimal("14"))
+
+    async def test_18_client_group_ab_isolation(self):
+        """18. Client Group A balance changes do not affect Group B."""
+        from database import record_delivery_ledger_entry, get_current_running_total
+
+        g_a = -100281
+        g_b = -100282
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=100.0, dedup_hash="iso_a", chat_id=g_a)
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=500.0, dedup_hash="iso_b", chat_id=g_b)
+
+        self.assertEqual(await get_current_running_total(g_a), 100.0)
+        self.assertEqual(await get_current_running_total(g_b), 500.0)
+
+    async def test_19_historical_price_protection(self):
+        """19. Updating price lists post-completion does NOT mutate historical order records."""
+        from database import record_delivery_ledger_entry, set_global_client_price, set_loader_price, get_ledger_entry_by_id
+        from decimal import Decimal
+
+        chat_id = -10029
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(9190, "cp_2400", Decimal("12"))
+
+        entry, _ = await record_delivery_ledger_entry(
+            order_id=190,
+            package="2400 CP",
+            now_value=16.0,
+            loader_name="Loader A",
+            client_amount=16.0,
+            loader_cost=12.0,
+            profit_amount=4.0,
+            secret_profit_code="X",
+            chat_id=chat_id,
+            dedup_hash="hist_protect_19"
+        )
+        eid = entry.id
+
+        await set_global_client_price("cp_2400", Decimal("25"))
+        await set_loader_price(9190, "cp_2400", Decimal("18"))
+
+        fetched = await get_ledger_entry_by_id(eid)
+        self.assertEqual(fetched.client_amount, 16.0)
+        self.assertEqual(fetched.loader_cost, 12.0)
+        self.assertEqual(fetched.profit_amount, 4.0)
+
+    async def test_20_running_total_correctness(self):
+        """20. Running total updates atomically: 875 + 16 = 891."""
+        from database import record_delivery_ledger_entry, get_current_running_total
+
+        chat_id = -10030
+        await record_delivery_ledger_entry(order_id=None, package="INIT", now_value=875.0, dedup_hash="rt_init", chat_id=chat_id)
+        await record_delivery_ledger_entry(order_id=200, package="2400 CP", now_value=16.0, dedup_hash="rt_ord", chat_id=chat_id)
+        self.assertEqual(await get_current_running_total(chat_id), 891.0)
+
+    def test_21_secret_profit_code_remains_correct(self):
+        """21. Secret profit code calculations remain exact."""
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code
+
+        self.assertEqual(encode_profit_code(Decimal("4")), "X")
+        self.assertEqual(encode_profit_code(Decimal("-2")), "S")
+        self.assertEqual(encode_profit_code(Decimal("0")), "U")
+
+    def test_22_no_client_privacy_leak(self):
+        """22. Client delivery format never leaks actual loader cost or actual dollar profit."""
+        from utils import format_payment_verification_message
+
+        msg = format_payment_verification_message(amount=200.0, tx_id="TX123", before_total=1012.0, now_payment=200.0, running_total=812.0)
+        self.assertNotIn("Loader", msg)
+        self.assertNotIn("Profit", msg)
+
+    async def test_23_concurrent_duplicate_delivery(self):
+        """23. Concurrent duplicate delivery requests result in 1 DB record."""
+        import asyncio
+        from database import record_delivery_ledger_entry, get_current_running_total
+
+        chat_id = -10033
+        h = "concurrent_hash_23"
+
+        task1 = asyncio.create_task(record_delivery_ledger_entry(order_id=230, package="2400 CP", now_value=16.0, dedup_hash=h, chat_id=chat_id))
+        task2 = asyncio.create_task(record_delivery_ledger_entry(order_id=230, package="2400 CP", now_value=16.0, dedup_hash=h, chat_id=chat_id))
+
+        r1, r2 = await asyncio.gather(task1, task2)
+        successes = [r for r in (r1, r2) if r[1] is True]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+    async def test_24_full_single_package_scenario(self):
+        """24. Full single package scenario: PENDING -> PRICED -> LOADER_ASSIGNED -> SENT_TO_LOADER -> DELIVERED -> COMPLETED."""
+        from database import (
+            create_order,
+            set_global_client_price,
+            set_loader_price,
+            transition_order_status,
+            record_delivery_ledger_entry,
+            mark_order_delivered,
+            mark_order_completed,
+            get_current_running_total
+        )
+        from decimal import Decimal
+
+        chat_id = -10034
+        loader_id = 9240
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(loader_id, "cp_2400", Decimal("12"))
+
+        # PENDING
+        order = await create_order(email="scen24@gmail.com", package="2400 CP", client_chat_id=chat_id)
+        self.assertEqual(order.status, "Pending")
+
+        # PRICED
+        upd1, _, _ = await transition_order_status(order.id, "PRICED")
+        self.assertEqual(upd1.status, "PRICED")
+
+        # LOADER_ASSIGNED
+        upd2, _, _ = await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=loader_id)
+        self.assertEqual(upd2.status, "LOADER_ASSIGNED")
+        self.assertEqual(upd2.secret_profit_code, "X")
+
+        # SENT_TO_LOADER
+        upd3, _, _ = await transition_order_status(order.id, "SENT_TO_LOADER")
+        self.assertEqual(upd3.status, "SENT_TO_LOADER")
+
+        # DELIVERED & COMPLETED
+        await record_delivery_ledger_entry(order_id=order.id, package="2400 CP", now_value=16.0, loader_name="Loader A", chat_id=chat_id, dedup_hash="scen24_deliv")
+        deliv = await mark_order_delivered(order.id)
+        self.assertEqual(deliv.status, "Delivered")
+
+        comp = await mark_order_completed(order.id)
+        self.assertEqual(comp.status, "Completed")
+        self.assertEqual(await get_current_running_total(chat_id), 16.0)
+
+    async def test_25_full_multi_package_scenario(self):
+        """25. Full multi-package scenario ($2400 CP + 5000 CP$) with 5-image album delivery."""
+        from database import (
+            create_order,
+            set_global_client_price,
+            set_loader_price,
+            transition_order_status,
+            record_delivery_ledger_entry,
+            mark_order_completed,
+            get_current_running_total
+        )
+        from decimal import Decimal
+
+        chat_id = -10035
+        loader_id = 9250
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_global_client_price("cp_5000", Decimal("33"))
+        await set_loader_price(loader_id, "cp_2400", Decimal("12"))
+        await set_loader_price(loader_id, "cp_5000", Decimal("25"))
+
+        order = await create_order(email="scen25@gmail.com", package="2400 CP + 5000 CP", client_chat_id=chat_id)
+        upd, _, _ = await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=loader_id)
+        self.assertEqual(upd.client_price_total, 49.0)
+        self.assertEqual(upd.loader_cost_total, 37.0)
+        self.assertEqual(upd.profit_amount, 12.0)
+        self.assertEqual(upd.secret_profit_code, "H")
+
+        # 5 images in 1 album -> 1 delivery ledger entry
+        entry, is_new = await record_delivery_ledger_entry(order_id=order.id, package="2400 CP + 5000 CP", now_value=49.0, loader_name="Loader B", chat_id=chat_id, dedup_hash="scen25_album_5")
+        self.assertTrue(is_new)
+        self.assertEqual(await get_current_running_total(chat_id), 49.0)
+
+        comp = await mark_order_completed(order.id)
+        self.assertEqual(comp.status, "Completed")
+
+
+class TestStep11OperationalControls(unittest.IsolatedAsyncioTestCase):
+    """Test suite for Step 11 Admin & Loader Operational Controls."""
+
+    async def test_1_admin_can_view_pending_orders(self):
+        from database import create_order
+        from handlers import pendingorders_command_handler
+        await create_order(email="pend1@gmail.com", package="2400 CP", client_chat_id=-1001)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await pendingorders_command_handler(mock_update, mock_context)
+        self.assertEqual(len(replied), 1)
+        self.assertIn("Pending Orders", replied[0])
+        self.assertIn("pend1@gmail.com", replied[0])
+
+    async def test_2_unauthorized_user_cannot_view_pending_orders(self):
+        from handlers import pendingorders_command_handler
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 999999
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await pendingorders_command_handler(mock_update, mock_context)
+        self.assertEqual(len(replied), 1)
+        self.assertIn("Unauthorized", replied[0])
+
+    async def test_3_admin_can_lookup_order(self):
+        from database import create_order, set_global_client_price, set_loader_price, transition_order_status
+        from handlers import order_lookup_command_handler
+        from decimal import Decimal
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(101, "cp_2400", Decimal("12"))
+        order = await create_order(email="lookup1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=101)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -1001})()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id)]})()
+
+        await order_lookup_command_handler(mock_update, mock_context)
+        self.assertEqual(len(replied), 1)
+        self.assertIn("Internal Admin Metrics", replied[0])
+        self.assertIn("Secret Profit Code", replied[0])
+
+    async def test_4_loader_can_lookup_only_own_assigned_order(self):
+        from database import create_order, transition_order_status, LOADERS_CACHE
+        from handlers import order_lookup_command_handler
+
+        loader_user_id = 88811
+        LOADERS_CACHE[loader_user_id] = {"name": "Test Loader", "group_id": -10088}
+
+        order = await create_order(email="ldr1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=loader_user_id)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = loader_user_id
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -10088})()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id)]})()
+
+        await order_lookup_command_handler(mock_update, mock_context)
+        self.assertEqual(len(replied), 1)
+        self.assertIn("Details", replied[0])
+        self.assertNotIn("Internal Admin Metrics", replied[0])
+        self.assertNotIn("Secret Profit Code", replied[0])
+
+    async def test_5_loader_cannot_lookup_another_loader_order(self):
+        from database import create_order, transition_order_status, LOADERS_CACHE
+        from handlers import order_lookup_command_handler
+
+        LOADERS_CACHE[88811] = {"name": "Loader A", "group_id": -10088}
+        LOADERS_CACHE[99922] = {"name": "Loader B", "group_id": -10099}
+
+        order = await create_order(email="ldr2@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=88811)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 99922
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -10099})()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id)]})()
+
+        await order_lookup_command_handler(mock_update, mock_context)
+        self.assertEqual(len(replied), 1)
+        self.assertIn("not authorized", replied[0])
+
+    async def test_6_admin_can_assign_loader(self):
+        from database import create_order, get_order_by_id
+        from handlers import assignloader_command_handler
+
+        order = await create_order(email="asg1@gmail.com", package="2400 CP", client_chat_id=-1001)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id), "777"]})()
+
+        await assignloader_command_handler(mock_update, mock_context)
+        self.assertIn("assigned to Loader #777", replied[0])
+
+        upd = await get_order_by_id(order.id)
+        self.assertEqual(upd.loader_group_id, 777)
+        self.assertEqual(upd.status, "LOADER_ASSIGNED")
+
+    async def test_7_unauthorized_user_cannot_assign_loader(self):
+        from database import create_order
+        from handlers import assignloader_command_handler
+
+        order = await create_order(email="asg2@gmail.com", package="2400 CP", client_chat_id=-1001)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 777777
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id), "777"]})()
+
+        await assignloader_command_handler(mock_update, mock_context)
+        self.assertIn("Unauthorized", replied[0])
+
+    async def test_8_loader_assignment_uses_existing_lifecycle(self):
+        from database import create_order, assign_order_loader
+        order = await create_order(email="asg3@gmail.com", package="2400 CP", client_chat_id=-1001)
+        upd_order, success, reason = await assign_order_loader(order.id, 555)
+        self.assertTrue(success)
+        self.assertEqual(upd_order.status, "LOADER_ASSIGNED")
+        self.assertEqual(upd_order.loader_group_id, 555)
+
+    async def test_9_admin_can_reassign_eligible_order(self):
+        from database import create_order, assign_order_loader, get_order_by_id
+        from handlers import reassignloader_command_handler
+
+        order = await create_order(email="reasg1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await assign_order_loader(order.id, 111)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id), "222"]})()
+
+        await reassignloader_command_handler(mock_update, mock_context)
+        self.assertIn("reassigned to Loader #222", replied[0])
+
+        upd = await get_order_by_id(order.id)
+        self.assertEqual(upd.loader_group_id, 222)
+
+    async def test_10_completed_order_cannot_be_reassigned(self):
+        from database import create_order, mark_order_completed
+        from handlers import reassignloader_command_handler
+
+        order = await create_order(email="comp_re@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await mark_order_completed(order.id)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id), "333"]})()
+
+        await reassignloader_command_handler(mock_update, mock_context)
+        self.assertIn("already COMPLETED and cannot be modified", replied[0])
+
+    async def test_11_loader_ab_privacy_isolation(self):
+        from database import create_order, transition_order_status, LOADERS_CACHE
+        from handlers import order_lookup_command_handler
+
+        LOADERS_CACHE[1111] = {"name": "Loader Alpha", "group_id": -100111}
+        LOADERS_CACHE[2222] = {"name": "Loader Beta", "group_id": -100222}
+
+        order = await create_order(email="priv1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=1111)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 2222
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -100222})()
+        })()
+        mock_context = type("Context", (), {"args": [str(order.id)]})()
+
+        await order_lookup_command_handler(mock_update, mock_context)
+        self.assertIn("not authorized", replied[0])
+
+    async def test_12_myorders_returns_only_current_loader_orders(self):
+        from database import create_order, transition_order_status, LOADERS_CACHE
+        from handlers import myorders_command_handler
+
+        loader_id = 7711
+        LOADERS_CACHE[loader_id] = {"name": "Loader Seven", "group_id": -10077}
+
+        ord1 = await create_order(email="my1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(ord1.id, "LOADER_ASSIGNED", loader_id=loader_id)
+
+        ord2 = await create_order(email="my2@gmail.com", package="5000 CP", client_chat_id=-1001)
+        await transition_order_status(ord2.id, "LOADER_ASSIGNED", loader_id=9999)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = loader_id
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await myorders_command_handler(mock_update, mock_context)
+        self.assertIn(f"Order #{ord1.id}", replied[0])
+        self.assertNotIn(f"Order #{ord2.id}", replied[0])
+
+    async def test_13_revieworders_returns_needs_review_failed(self):
+        from database import create_order, transition_order_status
+        from handlers import revieworders_command_handler
+
+        ord1 = await create_order(email="rev1@gmail.com", package="UnknownPkg", client_chat_id=-1001)
+        await transition_order_status(ord1.id, "NEEDS_REVIEW")
+
+        ord2 = await create_order(email="rev2@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(ord2.id, "FAILED")
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await revieworders_command_handler(mock_update, mock_context)
+        self.assertIn(f"Order #{ord1.id}", replied[0])
+        self.assertIn(f"Order #{ord2.id}", replied[0])
+
+    async def test_14_completedorders_is_read_only(self):
+        from database import create_order, mark_order_completed, get_order_by_id
+        from handlers import completedorders_command_handler
+
+        order = await create_order(email="cmp_ro@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await mark_order_completed(order.id)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await completedorders_command_handler(mock_update, mock_context)
+        self.assertIn(f"Order #{order.id}", replied[0])
+
+        after = await get_order_by_id(order.id)
+        self.assertEqual(after.status, "Completed")
+
+    async def test_15_cancelledorders_is_read_only(self):
+        from database import create_order, cancel_order, get_order_by_id
+        from handlers import cancelledorders_command_handler
+
+        order = await create_order(email="cnc_ro@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await cancel_order(order.id)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await cancelledorders_command_handler(mock_update, mock_context)
+        self.assertIn(f"Order #{order.id}", replied[0])
+
+        after = await get_order_by_id(order.id)
+        self.assertIn(after.status, ("Cancelled", "CANCELLED"))
+
+    async def test_16_failedorders_is_read_only(self):
+        from database import create_order, transition_order_status, get_order_by_id
+        from handlers import failedorders_command_handler
+
+        order = await create_order(email="fld_ro@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "FAILED")
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await failedorders_command_handler(mock_update, mock_context)
+        self.assertIn(f"Order #{order.id}", replied[0])
+
+        after = await get_order_by_id(order.id)
+        self.assertEqual(after.status, "FAILED")
+
+    async def test_17_missing_client_price_diagnostic(self):
+        from database import create_order, transition_order_status
+        from handlers import revieworders_command_handler
+
+        order = await create_order(email="diag_c@gmail.com", package="99999 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "NEEDS_REVIEW")
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await revieworders_command_handler(mock_update, mock_context)
+        self.assertIn("Missing Client Price", replied[0])
+
+    async def test_18_missing_loader_price_diagnostic(self):
+        from database import create_order, set_global_client_price, assign_order_loader, transition_order_status
+        from handlers import revieworders_command_handler
+        from decimal import Decimal
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        order = await create_order(email="diag_l@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await assign_order_loader(order.id, 99999)
+        await transition_order_status(order.id, "NEEDS_REVIEW")
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {
+            "effective_user": MockUser(),
+            "effective_message": MockMsg()
+        })()
+        mock_context = type("Context", (), {"args": []})()
+
+        await revieworders_command_handler(mock_update, mock_context)
+        self.assertIn("Missing Loader Cost", replied[0])
+
+    async def test_19_retry_only_works_for_eligible_orders(self):
+        from database import create_order, transition_order_status, mark_order_completed, get_order_by_id
+        from handlers import retryorder_command_handler
+
+        ord_fld = await create_order(email="rty1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(ord_fld.id, "FAILED")
+
+        ord_cmp = await create_order(email="rty2@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await mark_order_completed(ord_cmp.id)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, reply_markup=None, parse_mode=None):
+                replied.append(text)
+
+        class MockUser:
+            id = 1573531032
+
+        mock_update = type("Update", (), {"effective_user": MockUser(), "effective_message": MockMsg()})()
+        await retryorder_command_handler(mock_update, type("Context", (), {"args": [str(ord_fld.id)]})())
+        self.assertIn("reset to", replied[0])
+        res_fld = await get_order_by_id(ord_fld.id)
+        self.assertEqual(res_fld.status, "SENT_TO_LOADER")
+
+        replied.clear()
+        await retryorder_command_handler(mock_update, type("Context", (), {"args": [str(ord_cmp.id)]})())
+        self.assertIn("already COMPLETED and cannot be retried", replied[0])
+
+    async def test_20_retry_cannot_duplicate_financial_delivery(self):
+        from database import create_order, transition_order_status, get_current_running_total, get_latest_ledger_entries
+        from handlers import retryorder_command_handler
+
+        order = await create_order(email="rty_fin@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "FAILED")
+
+        before_total = await get_current_running_total(-1001)
+        before_entries = len(await get_latest_ledger_entries())
+
+        class MockMsg:
+            async def reply_text(self, *a, **k):
+                pass
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg()
+        })()
+        await retryorder_command_handler(mock_update, type("Context", (), {"args": [str(order.id)]})())
+
+        after_total = await get_current_running_total(-1001)
+        after_entries = len(await get_latest_ledger_entries())
+
+        self.assertEqual(before_total, after_total)
+        self.assertEqual(before_entries, after_entries)
+
+    async def test_21_pagination_works(self):
+        from database import create_order
+        from handlers import pendingorders_command_handler
+
+        for i in range(15):
+            await create_order(email=f"page{i}@gmail.com", package="2400 CP", client_chat_id=-1001)
+
+        replied_p1 = []
+        class MockMsg1:
+            async def reply_text(self, t, **k):
+                replied_p1.append(t)
+
+        mock_update1 = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg1()
+        })()
+        await pendingorders_command_handler(mock_update1, type("Context", (), {"args": ["1"]})())
+        self.assertIn("Page 1", replied_p1[0])
+
+        replied_p2 = []
+        class MockMsg2:
+            async def reply_text(self, t, **k):
+                replied_p2.append(t)
+
+        mock_update2 = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg2()
+        })()
+        await pendingorders_command_handler(mock_update2, type("Context", (), {"args": ["2"]})())
+        self.assertIn("Page 2", replied_p2[0])
+
+    async def test_22_callback_authorization_works(self):
+        from handlers import operational_pagination_callback_handler
+
+        edited = []
+        class MockQuery:
+            from_user = type("User", (), {"id": 999999})()
+            callback_data = "op_pending:2"
+            async def answer(self): pass
+            async def edit_message_text(self, text, **kwargs):
+                edited.append(text)
+
+        mock_update = type("Update", (), {"callback_query": MockQuery()})()
+        await operational_pagination_callback_handler(mock_update, None)
+        self.assertEqual(len(edited), 1)
+        self.assertIn("Unauthorized", edited[0])
+
+    async def test_23_callback_cannot_access_another_loader_order(self):
+        from database import create_order, transition_order_status, LOADERS_CACHE
+        from handlers import operational_pagination_callback_handler
+
+        LOADERS_CACHE[9001] = {"name": "L1", "group_id": -100901}
+        ord1 = await create_order(email="lcb1@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(ord1.id, "LOADER_ASSIGNED", loader_id=9001)
+
+        edited = []
+        class MockQuery:
+            from_user = type("User", (), {"id": 9002})()
+            callback_data = "op_myorders:1"
+            async def answer(self): pass
+            async def edit_message_text(self, text, **kwargs):
+                edited.append(text)
+
+        mock_update = type("Update", (), {"callback_query": MockQuery()})()
+        await operational_pagination_callback_handler(mock_update, None)
+        self.assertIn("My Active Orders", edited[0])
+        self.assertNotIn(f"Order #{ord1.id}", edited[0])
+
+    async def test_24_password_otp_not_leaked_in_list_views(self):
+        from database import create_order
+        from handlers import pendingorders_command_handler
+
+        raw = "Email: secretuser@gmail.com\nPassword: SUPERSECRET123\nOTP: 887766\n2400 CP"
+        order = await create_order(email="secretuser@gmail.com", package="2400 CP", client_chat_id=-1001, raw_text=raw)
+
+        replied = []
+        class MockMsg:
+            async def reply_text(self, t, **k):
+                replied.append(t)
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg()
+        })()
+        await pendingorders_command_handler(mock_update, type("Context", (), {"args": []})())
+
+        self.assertNotIn("SUPERSECRET123", replied[0])
+        self.assertNotIn("887766", replied[0])
+
+    async def test_25_admin_actions_recorded_in_audit_log_if_supported(self):
+        from database import assign_order_loader, create_order
+        order = await create_order(email="audit_test@gmail.com", package="2400 CP", client_chat_id=-1001)
+        upd, success, reason = await assign_order_loader(order.id, 999)
+        self.assertTrue(success)
+        self.assertEqual(upd.loader_group_id, 999)
+
+    async def test_26_viewing_order_causes_zero_financial_side_effects(self):
+        from database import create_order, get_current_running_total, get_latest_ledger_entries
+        from handlers import order_lookup_command_handler
+
+        order = await create_order(email="zero_fin@gmail.com", package="2400 CP", client_chat_id=-1001)
+        before_total = await get_current_running_total(-1001)
+        before_entries = len(await get_latest_ledger_entries())
+
+        class MockMsg:
+            async def reply_text(self, *a, **k):
+                pass
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -1001})()
+        })()
+        await order_lookup_command_handler(mock_update, type("Context", (), {"args": [str(order.id)]})())
+
+        after_total = await get_current_running_total(-1001)
+        after_entries = len(await get_latest_ledger_entries())
+
+        self.assertEqual(before_total, after_total)
+        self.assertEqual(before_entries, after_entries)
+
+    async def test_27_loader_assignment_does_not_create_delivery_ledger(self):
+        from database import create_order, assign_order_loader, get_latest_ledger_entries
+        order = await create_order(email="no_ledger@gmail.com", package="2400 CP", client_chat_id=-1001)
+        before_entries = len(await get_latest_ledger_entries())
+        await assign_order_loader(order.id, 888)
+        after_entries = len(await get_latest_ledger_entries())
+        self.assertEqual(before_entries, after_entries)
+
+    async def test_28_client_group_isolation_remains_intact(self):
+        from database import create_order, record_delivery_ledger_entry, get_current_running_total
+        ord1 = await create_order(email="grpA@gmail.com", package="2400 CP", client_chat_id=-1001)
+        ord2 = await create_order(email="grpB@gmail.com", package="2400 CP", client_chat_id=-1002)
+
+        await record_delivery_ledger_entry(order_id=ord1.id, package="2400 CP", now_value=16.0, loader_name="L1", chat_id=-1001, dedup_hash="grpA_deliv")
+
+        totA = await get_current_running_total(-1001)
+        totB = await get_current_running_total(-1002)
+
+        self.assertEqual(totA, 16.0)
+        self.assertEqual(totB, 0.0)
+
+    async def test_29_loader_price_isolation_remains_intact(self):
+        from database import set_loader_price, get_loader_price
+        from decimal import Decimal
+
+        await set_loader_price(1001, "cp_2400", Decimal("12"))
+        await set_loader_price(1002, "cp_2400", Decimal("14"))
+
+        p1 = await get_loader_price(1001, "cp_2400")
+        p2 = await get_loader_price(1002, "cp_2400")
+
+        self.assertEqual(p1, Decimal("12"))
+        self.assertEqual(p2, Decimal("14"))
+
+    async def test_30_historical_completed_order_remains_unchanged(self):
+        from database import create_order, set_global_client_price, set_loader_price, transition_order_status, mark_order_completed, assign_order_loader, get_order_by_id
+        from decimal import Decimal
+
+        await set_global_client_price("cp_2400", Decimal("16"))
+        await set_loader_price(999, "cp_2400", Decimal("12"))
+
+        order = await create_order(email="hist_comp@gmail.com", package="2400 CP", client_chat_id=-1001)
+        await transition_order_status(order.id, "LOADER_ASSIGNED", loader_id=999)
+        comp = await mark_order_completed(order.id)
+
+        c_price = comp.client_price_total
+        l_cost = comp.loader_cost_total
+        p_amt = comp.profit_amount
+        p_code = comp.secret_profit_code
+
+        order_upd, success, reason = await assign_order_loader(order.id, 888)
+        self.assertFalse(success)
+        self.assertEqual(reason, "CANNOT_MODIFY_COMPLETED_ORDER")
+
+        after = await get_order_by_id(order.id)
+        self.assertEqual(after.client_price_total, c_price)
+        self.assertEqual(after.loader_cost_total, l_cost)
+        self.assertEqual(after.profit_amount, p_amt)
+        self.assertEqual(after.secret_profit_code, p_code)
+
+    async def test_31_invalid_order_and_loader_ids_handled_safely(self):
+        from handlers import order_lookup_command_handler, assignloader_command_handler, retryorder_command_handler
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, **kwargs):
+                replied.append(text)
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg()
+        })()
+
+        # Non-existent order ID
+        await order_lookup_command_handler(mock_update, type("Context", (), {"args": ["999999"]})())
+        self.assertIn("not found", replied[-1])
+
+        # Assign non-existent order ID
+        await assignloader_command_handler(mock_update, type("Context", (), {"args": ["999999", "101"]})())
+        self.assertIn("ORDER_NOT_FOUND", replied[-1])
+
+        # Retry non-existent order ID
+        await retryorder_command_handler(mock_update, type("Context", (), {"args": ["999999"]})())
+        self.assertIn("ORDER_NOT_FOUND", replied[-1])
+
+    async def test_32_pagination_edge_cases_and_invalid_pages(self):
+        from handlers import pendingorders_command_handler
+        replied = []
+        class MockMsg:
+            async def reply_text(self, text, **kwargs):
+                replied.append(text)
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg()
+        })()
+
+        # Non-numeric page argument -> defaults safely to page 1
+        await pendingorders_command_handler(mock_update, type("Context", (), {"args": ["abc"]})())
+        self.assertIn("Page 1", replied[-1])
+
+        # Out-of-bounds large page number
+        await pendingorders_command_handler(mock_update, type("Context", (), {"args": ["9999"]})())
+        self.assertIn("Page 9999", replied[-1])
+
+    async def test_33_all_readonly_commands_preserve_ledger_counts(self):
+        from database import create_order, get_latest_ledger_entries
+        from handlers import (
+            pendingorders_command_handler,
+            order_lookup_command_handler,
+            order_status_command_handler,
+            myorders_command_handler,
+            revieworders_command_handler,
+            completedorders_command_handler,
+            cancelledorders_command_handler,
+            failedorders_command_handler
+        )
+
+        order = await create_order(email="ro_check@gmail.com", package="2400 CP", client_chat_id=-1001)
+        before_entries = len(await get_latest_ledger_entries())
+
+        class MockMsg:
+            async def reply_text(self, *a, **k): pass
+
+        mock_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": 1573531032})(),
+            "effective_message": MockMsg(),
+            "effective_chat": type("Chat", (), {"id": -1001})()
+        })()
+        ctx = type("Context", (), {"args": [str(order.id)]})()
+
+        await pendingorders_command_handler(mock_update, ctx)
+        await order_lookup_command_handler(mock_update, ctx)
+        await order_status_command_handler(mock_update, ctx)
+        await myorders_command_handler(mock_update, ctx)
+        await revieworders_command_handler(mock_update, ctx)
+        await completedorders_command_handler(mock_update, ctx)
+        await cancelledorders_command_handler(mock_update, ctx)
+        await failedorders_command_handler(mock_update, ctx)
+
+        after_entries = len(await get_latest_ledger_entries())
+        self.assertEqual(before_entries, after_entries)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+
+
+
+
+

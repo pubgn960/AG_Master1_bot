@@ -73,9 +73,9 @@ CP_PACK_REGEX = re.compile(
     re.IGNORECASE
 )
 
-# Recovery Codes Header Regex (e.g. "Codes:", "Codes: (solo FB)", "Códigos:", "Recovery Codes:")
+# Recovery Codes Header Regex (e.g. "Codes:", "Codes: (solo FB)", "Códigos:", "Recovery Codes:", "OTP:", "2FA:")
 RECOVERY_HEADER_REGEX = re.compile(
-    r'^\s*(?:codes?|código|códigos|codigo|codigos|recovery\s*codes?|backup\s*codes?)\b',
+    r'^\s*(?:codes?|código|códigos|codigo|codigos|recovery\s*codes?|backup\s*codes?|otp|2fa|authenticator)\b',
     re.IGNORECASE
 )
 

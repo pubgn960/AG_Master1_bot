@@ -90,8 +90,15 @@ class Loader(Base):
         nullable=False
     )
 
+    prices: Mapped[List["LoaderPrice"]] = relationship(
+        "LoaderPrice",
+        back_populates="loader",
+        cascade="all, delete-orphan"
+    )
+
     def __repr__(self) -> str:
         return f"<Loader(id={self.id}, name='{self.loader_name}', group_id={self.group_id})>"
+
 
 
 class AuthorizedUser(Base):
@@ -160,6 +167,11 @@ class Order(Base):
         index=True
     )
 
+    client_price_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    loader_cost_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    profit_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    secret_profit_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     # Relationship to images ordered by position
     images: Mapped[List["Image"]] = relationship(
         "Image",
@@ -167,6 +179,14 @@ class Order(Base):
         cascade="all, delete-orphan",
         order_by="Image.position"
     )
+
+    # Relationship to order line items
+    items: Mapped[List["OrderItem"]] = relationship(
+        "OrderItem",
+        back_populates="order",
+        cascade="all, delete-orphan"
+    )
+
 
     def __repr__(self) -> str:
         img_count = len(self.__dict__['images']) if 'images' in self.__dict__ else self.image_count
@@ -369,6 +389,108 @@ class PaymentTransaction(Base):
         return f"<PaymentTransaction(id={self.id}, provider='{self.provider}', tx_id='{self.transaction_id}', amount={self.amount})>"
 
 
+
+class GlobalClientPrice(Base):
+    """
+    Stores the ONE global client price catalog.
+    All client groups use this same catalog.
+    """
+
+    __tablename__ = "global_client_prices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    package_type: Mapped[str] = mapped_column(String(50), nullable=False, default="normal_cp")  # normal_cp, special_cp, non_cp
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return f"<GlobalClientPrice(product_key='{self.product_key}', price={self.price})>"
+
+
+class LoaderPrice(Base):
+    """
+    Stores private loader-specific cost catalog.
+    Each loader has an independent price catalog (Loader A's prices do not overwrite Loader B's).
+    """
+
+    __tablename__ = "loader_prices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    loader_id: Mapped[int] = mapped_column(ForeignKey("loaders.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_key: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    package_type: Mapped[str] = mapped_column(String(50), nullable=False, default="normal_cp")  # normal_cp, special_cp, non_cp
+    cost: Mapped[float] = mapped_column(Float, nullable=False)
+    currency: Mapped[str] = mapped_column(String(10), nullable=False, default="USD")
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+    loader: Mapped["Loader"] = relationship("Loader", back_populates="prices")
+
+    __table_args__ = (
+        UniqueConstraint("loader_id", "product_key", name="uq_loader_product_key"),
+        Index("idx_loader_product_key", "loader_id", "product_key"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<LoaderPrice(loader_id={self.loader_id}, product_key='{self.product_key}', cost={self.cost})>"
+
+
+class OrderItem(Base):
+    """
+    Represents an individual line item / package within a multi-package order.
+    Calculates client line total, loader line total, and line profit.
+    """
+
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), nullable=False, index=True)
+    product_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    product_type: Mapped[str] = mapped_column(String(50), nullable=False, default="normal_cp")
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    client_unit_price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    client_line_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    loader_unit_cost: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    loader_line_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    profit_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False
+    )
+
+    order: Mapped["Order"] = relationship("Order", back_populates="items")
+
+    def __repr__(self) -> str:
+        return f"<OrderItem(id={self.id}, order_id={self.order_id}, product_key='{self.product_key}', qty={self.quantity}, client_line_total={self.client_line_total})>"
+
+
 class DeliveryLedger(Base):
     """
     Stores individual delivery ledger entries and running totals for accounting.
@@ -382,6 +504,10 @@ class DeliveryLedger(Base):
     order_id: Mapped[Optional[int]] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True)
     package: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     price: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    client_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    loader_cost: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    profit_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    secret_profit_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     before_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     now_value: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     running_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -398,6 +524,7 @@ class DeliveryLedger(Base):
 
     def __repr__(self) -> str:
         return f"<DeliveryLedger(id={self.id}, chat_id={self.chat_id}, order_id={self.order_id}, package='{self.package}', running_total={self.running_total})>"
+
 
 
 class CalculatorLedger(Base):
