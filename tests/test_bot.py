@@ -4871,6 +4871,15 @@ class TestStep2DatabaseSchema(unittest.IsolatedAsyncioTestCase):
             await session.execute(delete(GlobalClientPrice))
             await session.commit()
 
+    async def asyncTearDown(self):
+        from database import AsyncSessionLocal, reload_global_client_prices_cache
+        from models import GlobalClientPrice
+        from sqlalchemy import delete
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.commit()
+        await reload_global_client_prices_cache()
+
 
     async def test_global_client_price_creation_and_update(self):
         from database import set_global_client_price_in_db, get_all_global_client_prices_from_db, GLOBAL_CLIENT_PRICES_CACHE
@@ -7995,6 +8004,164 @@ class TestStep11OperationalControls(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(call_count, 0, "Duplicate delivery ledger event must not attempt resending")
         self.assertEqual(len(sent_messages), 0)
+
+
+class TestStep12RealTelegramBugFixes(unittest.IsolatedAsyncioTestCase):
+    """Test suite verifying minimal safe fixes for Step 12 real Telegram test bugs."""
+
+    async def asyncSetUp(self):
+        from database import init_db, set_global_client_price_in_db
+        await init_db()
+        await set_global_client_price_in_db("cp_2400", 16.0, display_name="2400 CP")
+
+    async def asyncTearDown(self):
+        from database import AsyncSessionLocal, reload_global_client_prices_cache
+        from models import GlobalClientPrice
+        from sqlalchemy import delete
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.commit()
+        await reload_global_client_prices_cache()
+
+    async def test_global_price_precedence_over_legacy_package_prices(self):
+        from pricing_calculator import calculate_order_pricing
+        from utils import calculate_delivered_packages_value
+
+        res = await calculate_order_pricing("2400 CP")
+        self.assertEqual(float(res["client_price_total"]), 16.0, "Global client price 16.0 must be used in calculate_order_pricing")
+
+        val, ok = calculate_delivered_packages_value("2400 CP")
+        self.assertTrue(ok)
+        self.assertEqual(val, 16.0, "Delivered package value must be 16.0")
+
+    async def test_delivery_caption_price_formatting(self):
+        from utils import format_delivered_packages_caption
+        caption = format_delivered_packages_caption([{"package": "2400 CP", "qty": 1}])
+        self.assertIn("💰 Price: 16$", caption, "Caption price must show 16$ rather than 16.5$")
+
+    async def test_save_order_pricing_loader_group_id_no_int32_overflow(self):
+        from database import create_order, save_order_pricing, add_loader
+        # Register loader with Telegram Chat ID -1004475489329
+        telegram_group_id = -1004475489329
+        await add_loader(group_id=telegram_group_id, loader_name="Test Loader Chat")
+
+        order = await create_order(
+            email="int32_test@example.com",
+            client_chat_id=-100111,
+            original_message_id=123,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text="Package: 2400 CP"
+        )
+        order.loader_group_id = telegram_group_id
+
+        # Must execute without throwing PostgreSQL int32 range error
+        updated = await save_order_pricing(order.id)
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.client_price_total, 16.0)
+
+    async def test_delivery_accounting_summary_format(self):
+        from utils import format_delivery_summary_message
+        msg = format_delivery_summary_message(
+            email="test@example.com",
+            client_price=16.0,
+            secret_code="TESTPROFITCODE",
+            before_total=0.0,
+            now_value=16.0,
+            running_total=16.0
+        )
+        self.assertIn("📧 test@example.com", msg)
+        self.assertIn("💵 Client Price: $16", msg)
+        self.assertIn("🔐 Profit: TESTPROFITCODE", msg)
+        self.assertIn("Before: 0", msg)
+        self.assertIn("Now: 16", msg)
+        self.assertIn("Total: 16", msg)
+
+    async def test_album_accounting_and_deduplication(self):
+        from database import create_order, save_order_pricing, get_running_total_current
+        from handlers import process_delivery_ledger_event
+        from unittest.mock import AsyncMock, MagicMock
+
+        order = await create_order(
+            email="album_accounting@example.com",
+            client_chat_id=-100222,
+            original_message_id=456,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text="Package: 2400 CP"
+        )
+        await save_order_pricing(order.id)
+
+        mock_bot = AsyncMock()
+        sent_messages = []
+        async def mock_send_message(chat_id, text, **kwargs):
+            sent_messages.append((chat_id, text))
+            m = MagicMock()
+            m.message_id = 99
+            return m
+        mock_bot.send_message = mock_send_message
+
+        dedup_tag = f"step12_album_dedup_{order.id}"
+
+        # Fetch baseline running total right before delivery event
+        before_rt = await get_running_total_current(chat_id=-100222)
+
+        # First album flush delivery event
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name="Test Loader",
+            bot=mock_bot,
+            chat_id=-100222,
+            dedup_hash=dedup_tag,
+            reply_to_message_id=None
+        )
+
+        after_rt1 = await get_running_total_current(chat_id=-100222)
+        self.assertAlmostEqual(after_rt1, before_rt + 16.0, places=2, msg="Running total must increase by exactly 16.0")
+        self.assertEqual(len(sent_messages), 1, "Exactly ONE accounting summary message must be sent")
+        self.assertIn("💵 Client Price: $16", sent_messages[0][1])
+
+        # Duplicate album flush event with same dedup_hash
+        sent_messages.clear()
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name="Test Loader",
+            bot=mock_bot,
+            chat_id=-100222,
+            dedup_hash=dedup_tag,
+            reply_to_message_id=None
+        )
+
+        after_rt2 = await get_running_total_current(chat_id=-100222)
+        self.assertEqual(after_rt2, after_rt1, "Duplicate album event must NOT increment running total again")
+        self.assertEqual(len(sent_messages), 0, "Duplicate album event must NOT send a second accounting summary")
+
+    async def test_historical_order_price_protection(self):
+        from database import create_order, AsyncSessionLocal
+        order = await create_order(
+            email="historical@example.com",
+            client_chat_id=-100333,
+            original_message_id=789,
+            package="2400 CP",
+            status="Completed",
+            category="A",
+            raw_text="Package: 2400 CP"
+        )
+        async with AsyncSessionLocal() as session:
+            order.client_price_total = 16.5
+            order.price = "$16.5"
+            session.add(order)
+            await session.commit()
+
+        # Re-query historical order and confirm its stored price remains 16.5
+        async with AsyncSessionLocal() as session:
+            h_order = await session.get(order.__class__, order.id)
+            self.assertEqual(h_order.client_price_total, 16.5)
+            self.assertEqual(h_order.price, "$16.5")
 
 
 if __name__ == "__main__":

@@ -846,15 +846,24 @@ async def save_order_pricing(
 
         resolved_loader_id = loader_id
         if resolved_loader_id is None and order.loader_group_id:
+            # Check if order.loader_group_id is a valid 32-bit integer for Loader.id (internal DB primary key)
+            is_valid_loader_id = isinstance(order.loader_group_id, int) and 1 <= order.loader_group_id <= 2147483647
+
             for l_id, l_data in LOADERS_CACHE.items():
-                if l_data.get("group_id") == order.loader_group_id or l_id == order.loader_group_id:
+                if l_data.get("group_id") == order.loader_group_id:
+                    resolved_loader_id = l_id
+                    break
+                elif is_valid_loader_id and l_id == order.loader_group_id:
                     resolved_loader_id = l_id
                     break
 
             if resolved_loader_id is None:
-                stmt_l = select(Loader).where(
-                    or_(Loader.group_id == order.loader_group_id, Loader.id == order.loader_group_id)
-                )
+                if is_valid_loader_id:
+                    stmt_l = select(Loader).where(
+                        or_(Loader.group_id == order.loader_group_id, Loader.id == order.loader_group_id)
+                    )
+                else:
+                    stmt_l = select(Loader).where(Loader.group_id == order.loader_group_id)
                 loader_obj = (await session.execute(stmt_l)).scalar_one_or_none()
                 if loader_obj:
                     resolved_loader_id = loader_obj.id
@@ -1793,6 +1802,13 @@ async def bulk_update_package_prices_in_db(
                         updated_by=updated_by_id,
                         updated_at=now
                     ))
+
+                # Keep GLOBAL_CLIENT_PRICES_CACHE in sync with bulk package updates
+                cp_key = f"cp_{canonical_pkg}"
+                if cp_key in GLOBAL_CLIENT_PRICES_CACHE:
+                    GLOBAL_CLIENT_PRICES_CACHE[cp_key]["price"] = float(new_price)
+                elif canonical_pkg in GLOBAL_CLIENT_PRICES_CACHE:
+                    GLOBAL_CLIENT_PRICES_CACHE[canonical_pkg]["price"] = float(new_price)
 
                 logger.info(f"[PRICE_UPDATE] Category {cat} Package {canonical_pkg}: Old {old_p} -> New {new_price} | Updated By #{updated_by_id}")
 

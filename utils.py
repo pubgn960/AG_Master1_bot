@@ -819,6 +819,38 @@ def format_manual_adjustment_message(before: float, now_val: float, total: float
     )
 
 
+def _get_global_client_price_for_package(pkg_name: Optional[str]) -> Optional[float]:
+    """
+    Helper to check GLOBAL_CLIENT_PRICES_CACHE for a package name or product key.
+    Returns float price or None if not found in cache.
+    """
+    if not pkg_name:
+        return None
+    try:
+        from database import GLOBAL_CLIENT_PRICES_CACHE
+        if not GLOBAL_CLIENT_PRICES_CACHE:
+            return None
+        from order_parser import normalize_package_alias
+        raw_str = str(pkg_name).strip()
+        m_cp = re.search(r'\b(\d{2,6})\b', raw_str)
+        num_raw = m_cp.group(1) if m_cp else re.sub(r'(?i)\bcp\b|\s+', '', raw_str).strip()
+        canonical_pkg = normalize_package_alias(num_raw) if num_raw else normalize_package_alias(raw_str)
+
+        candidate_keys = [
+            f"cp_{canonical_pkg}",
+            f"cp_{num_raw}",
+            f"cp_{raw_str.lower()}",
+            canonical_pkg.lower(),
+            raw_str.lower()
+        ]
+        for key in candidate_keys:
+            if key in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE.get(key, {}).get("price") is not None:
+                return float(GLOBAL_CLIENT_PRICES_CACHE[key]["price"])
+    except Exception:
+        pass
+    return None
+
+
 def calculate_delivered_packages_value(packages_str: str) -> Tuple[Optional[float], bool]:
     """
     Calculates sum of prices for delivered package(s) string (e.g., '10800', '10800+5040', '2x10800').
@@ -841,7 +873,9 @@ def calculate_delivered_packages_value(packages_str: str) -> Tuple[Optional[floa
         qty = p.get("qty", 1)
         canonical_pkg = normalize_package_alias(str(pkg_name))
 
-        unit_price = PACKAGE_PRICES.get(canonical_pkg)
+        unit_price = _get_global_client_price_for_package(pkg_name)
+        if unit_price is None:
+            unit_price = PACKAGE_PRICES.get(canonical_pkg)
         if unit_price is None:
             unit_price = PACKAGE_PRICES.get(str(pkg_name))
         if unit_price is None:
@@ -1459,11 +1493,13 @@ def format_delivered_packages_caption(items: Any) -> str:
         pkg_name = str(item.get("package", "")).strip()
         qty = item.get("qty", 1)
 
-        # Dynamic price resolution: Always look up the CURRENT price from PACKAGE_PRICES first!
+        # Dynamic price resolution: Always look up the CURRENT price from GLOBAL_CLIENT_PRICES_CACHE first!
         from order_parser import normalize_package_alias
         canonical_pkg = normalize_package_alias(pkg_name)
 
-        unit_price = PACKAGE_PRICES.get(canonical_pkg)
+        unit_price = _get_global_client_price_for_package(pkg_name)
+        if unit_price is None:
+            unit_price = PACKAGE_PRICES.get(canonical_pkg)
         if unit_price is None:
             unit_price = PACKAGE_PRICES.get(pkg_name)
         if unit_price is None:
@@ -1477,7 +1513,10 @@ def format_delivered_packages_caption(items: Any) -> str:
             has_unpriced = True
 
         qty_str = f" ×{qty}" if qty > 1 else ""
-        lines.append(f"✅ {pkg_name} CP{qty_str}")
+        if pkg_name.lower().endswith("cp"):
+            lines.append(f"✅ {pkg_name}{qty_str}")
+        else:
+            lines.append(f"✅ {pkg_name} CP{qty_str}")
 
     if not has_unpriced and session_price > 0:
         lines.append("")

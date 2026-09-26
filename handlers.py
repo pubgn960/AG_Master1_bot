@@ -2101,7 +2101,10 @@ async def process_delivery_ledger_event(
 
     order = await get_order_by_id(order_id)
     if order and (order.client_price_total is None or order.secret_profit_code is None):
-        order = await save_order_pricing(order_id)
+        try:
+            order = await save_order_pricing(order_id)
+        except Exception as e:
+            logger.exception(f"[LEDGER] Error saving order pricing for Order #{order_id}: {e}")
 
     now_val: Optional[float] = None
     if order and order.client_price_total is not None:
