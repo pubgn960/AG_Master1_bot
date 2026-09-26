@@ -7942,6 +7942,60 @@ class TestStep11OperationalControls(unittest.IsolatedAsyncioTestCase):
         after_entries = len(await get_latest_ledger_entries())
         self.assertEqual(before_entries, after_entries)
 
+    async def test_34_delivery_ledger_reply_fallback(self):
+        from database import create_order, set_global_client_price, get_latest_ledger_entries
+        from handlers import process_delivery_ledger_event
+        from decimal import Decimal
+
+        await set_global_client_price("cp_2400", Decimal("16.5"))
+        order = await create_order(email="fallback_user@gmail.com", package="2400 CP", client_chat_id=-1001)
+
+        sent_messages = []
+        call_count = 0
+
+        class MockBot:
+            async def send_message(self, chat_id, text, reply_to_message_id=None, parse_mode=None):
+                nonlocal call_count
+                call_count += 1
+                if reply_to_message_id is not None:
+                    raise Exception("BadRequest: message to be replied not found")
+                sent_messages.append(text)
+
+        mock_bot = MockBot()
+        before_entries = len(await get_latest_ledger_entries(limit=1000))
+
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name="Loader #1",
+            bot=mock_bot,
+            chat_id=-1001,
+            dedup_hash=f"fallback_dedup_{order.id}",
+            reply_to_message_id=999999
+        )
+
+        self.assertEqual(call_count, 2, "Bot must retry without reply_to_message_id when reply fails")
+        self.assertEqual(len(sent_messages), 1, "Fallback message must be successfully sent")
+        self.assertIn("Client Price: $16.5", sent_messages[0])
+
+        after_entries = len(await get_latest_ledger_entries(limit=1000))
+        self.assertEqual(after_entries, before_entries + 1, "Exactly ONE DeliveryLedger entry must be created")
+
+        # Re-run with same dedup_hash -> must block duplicate and send 0 additional messages
+        sent_messages.clear()
+        call_count = 0
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name="Loader #1",
+            bot=mock_bot,
+            chat_id=-1001,
+            dedup_hash=f"fallback_dedup_{order.id}",
+            reply_to_message_id=999999
+        )
+        self.assertEqual(call_count, 0, "Duplicate delivery ledger event must not attempt resending")
+        self.assertEqual(len(sent_messages), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

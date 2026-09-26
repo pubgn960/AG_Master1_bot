@@ -2161,7 +2161,18 @@ async def process_delivery_ledger_event(
             parse_mode="HTML"
         )
     except Exception as e:
-        logger.exception(f"[LEDGER] Failed to send ledger notification message: {e}")
+        if reply_to_message_id:
+            logger.warning(f"[LEDGER] Reply message send failed ({e}), retrying without reply_to_message_id...")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=ledger_msg,
+                    parse_mode="HTML"
+                )
+            except Exception as e2:
+                logger.exception(f"[LEDGER] Failed to send ledger notification message fallback: {e2}")
+        else:
+            logger.exception(f"[LEDGER] Failed to send ledger notification message: {e}")
 
 
 async def undo_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
