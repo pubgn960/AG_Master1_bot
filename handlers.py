@@ -1969,7 +1969,8 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
     """
     Command /setloaderprice.
     Must be executed by replying to a Telegram message containing a loader price list.
-    Saves/updates private loader cost prices for the target loader.
+    Automatically resolves target loader via Telegram group/chat ID of the replied message context,
+    while preserving backward compatibility for explicit /setloaderprice <loader_id> arguments.
     """
     message = update.effective_message
     if not message:
@@ -1987,7 +1988,7 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
 
     replied_text = reply_msg.text or reply_msg.caption or ""
     if not replied_text or not replied_text.strip():
-        await message.reply_text("❌ No valid prices found.", quote=True)
+        await message.reply_text("❌ No valid loader prices found.", quote=True)
         return
 
     from database import (
@@ -2003,48 +2004,81 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
     explicit_loader_id: Optional[int] = None
 
     if args:
-        try:
-            explicit_loader_id = int(args[0])
-        except ValueError:
+        if args[0].isdigit():
+            val = int(args[0])
+            if 1 <= val <= 2147483647:
+                explicit_loader_id = val
+            else:
+                await message.reply_text(f"❌ Loader ID #{args[0]} not found.", quote=True)
+                return
+        else:
             await message.reply_text("❌ Invalid loader_id format. Usage: /setloaderprice <loader_id>", quote=True)
             return
 
+    if not LOADERS_CACHE:
+        await reload_loaders_cache()
+
     target_loader_id: Optional[int] = None
 
-    if user_is_admin:
-        if explicit_loader_id is not None:
-            loaders = await get_all_loaders()
-            loader_exists = any(l.id == explicit_loader_id for l in loaders) or explicit_loader_id in LOADERS_CACHE
-            if not loader_exists:
-                await message.reply_text(f"❌ Loader ID #{explicit_loader_id} not found.", quote=True)
-                return
+    if explicit_loader_id is not None:
+        # Backward compatibility mode: explicit loader_id specified by admin/loader
+        loader_found = False
+        if explicit_loader_id in LOADERS_CACHE:
             target_loader_id = explicit_loader_id
+            loader_found = True
         else:
-            await message.reply_text("❌ Admins must specify a loader ID: /setloaderprice <loader_id>", quote=True)
+            loaders = await get_all_loaders()
+            for l in loaders:
+                if l.id == explicit_loader_id:
+                    target_loader_id = l.id
+                    loader_found = True
+                    break
+
+        if not loader_found:
+            await message.reply_text(f"❌ Loader ID #{explicit_loader_id} not found.", quote=True)
             return
+
+        reply_chat = getattr(reply_msg, "chat", None)
+        target_group_id = reply_chat.id if reply_chat else (chat.id if chat else None)
+
+        if not user_is_admin:
+            user_loader_id = None
+            for l_id, l_data in LOADERS_CACHE.items():
+                g_id = l_data.get("group_id")
+                if g_id is not None and (g_id == target_group_id or g_id == (chat.id if chat else None) or g_id == user.id):
+                    user_loader_id = l_id
+                    break
+
+            if user_loader_id != target_loader_id:
+                await message.reply_text("❌ You are not authorized to update another loader's prices.", quote=True)
+                return
     else:
-        if not LOADERS_CACHE:
-            await reload_loaders_cache()
+        # Primary workflow: Automatic loader resolution via Telegram Group/Chat ID context
+        reply_chat = getattr(reply_msg, "chat", None)
+        target_group_id = reply_chat.id if reply_chat else (chat.id if chat else None)
 
         matching_loader_id: Optional[int] = None
+
+        # 1. Search in LOADERS_CACHE by group_id
         for l_id, l_data in LOADERS_CACHE.items():
-            if l_data.get("group_id") == user.id or l_id == user.id or (chat and l_data.get("group_id") == chat.id):
+            g_id = l_data.get("group_id")
+            if g_id is not None and (g_id == target_group_id or (chat and g_id == chat.id) or g_id == user.id):
                 matching_loader_id = l_id
                 break
 
-        if not matching_loader_id:
+        # 2. Search DB by group_id if not found in cache
+        if matching_loader_id is None:
             loaders = await get_all_loaders()
             for l in loaders:
-                if l.group_id == user.id or l.id == user.id or (chat and l.group_id == chat.id):
+                if l.group_id is not None and (l.group_id == target_group_id or (chat and l.group_id == chat.id) or l.group_id == user.id):
                     matching_loader_id = l.id
                     break
 
-        if not matching_loader_id:
-            await message.reply_text("❌ You are not authorized to update loader prices.", quote=True)
-            return
-
-        if explicit_loader_id is not None and explicit_loader_id != matching_loader_id:
-            await message.reply_text("❌ You are not authorized to update another loader's prices.", quote=True)
+        if matching_loader_id is None:
+            if user_is_admin:
+                await message.reply_text("❌ This group is not registered as a Loader Group.", quote=True)
+            else:
+                await message.reply_text("❌ You are not authorized to update loader prices.", quote=True)
             return
 
         target_loader_id = matching_loader_id
@@ -2055,7 +2089,7 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
             err_msg = parsed["errors"][0]
             await message.reply_text(f"❌ {err_msg}", quote=True)
         else:
-            await message.reply_text("❌ No valid prices found.", quote=True)
+            await message.reply_text("❌ No valid loader prices found.", quote=True)
         return
 
     try:

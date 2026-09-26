@@ -5675,7 +5675,7 @@ class TestStep5LoaderPricesAndSetCommand(unittest.IsolatedAsyncioTestCase):
         ctx_admin_no_args = type("Context", (), {"args": []})()
 
         await setloaderprice_command_handler(up_admin_no_args, ctx_admin_no_args)
-        self.assertIn("Admins must specify a loader ID", up_admin_no_args.effective_message.replied_text)
+        self.assertIn("This group is not registered as a Loader Group", up_admin_no_args.effective_message.replied_text)
 
         # 7. Command without reply is rejected
         class MockCmdMsgNoReply:
@@ -8162,6 +8162,185 @@ class TestStep12RealTelegramBugFixes(unittest.IsolatedAsyncioTestCase):
             h_order = await session.get(order.__class__, order.id)
             self.assertEqual(h_order.client_price_total, 16.5)
             self.assertEqual(h_order.price, "$16.5")
+
+
+class TestSetLoaderPriceReplyBased(unittest.IsolatedAsyncioTestCase):
+    """
+    Dedicated test suite for reply-based /setloaderprice loader identification,
+    privacy/isolation, group_id resolution (-1004475489329), and error cases.
+    """
+
+    async def asyncSetUp(self):
+        from database import engine, Base, LOADER_PRICES_CACHE, LOADERS_CACHE, AsyncSessionLocal
+        from sqlalchemy import delete
+        from models import LoaderPrice, Loader, Order
+
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Loader))
+            await session.execute(delete(Order))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+
+    async def test_setloaderprice_reply_based_scenarios(self):
+        from decimal import Decimal
+        from database import (
+            add_loader,
+            get_loader_price,
+            LOADER_PRICES_CACHE,
+            LOADERS_CACHE,
+            create_order,
+            save_order_pricing,
+            AsyncSessionLocal
+        )
+        from handlers import setloaderprice_command_handler
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # 1. Admin replies to Loader A price list -> Loader A prices saved
+        group_id_a = -1004475489329  # 64-bit negative BIGINT Telegram Group ID
+        loader_a = await add_loader(group_id=group_id_a, loader_name="Loader Group A")
+
+        class MockRepliedMsgA:
+            chat = type("Chat", (), {"id": group_id_a})()
+            text = "2400 CP ➡️ $12\n5000 CP ➡️ $25\n10800 CP ➡️ $50"
+            caption = None
+
+        class MockCmdMsg:
+            def __init__(self, reply_msg):
+                self.reply_to_message = reply_msg
+                self.text = "/setloaderprice"
+                self.replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_admin_a = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": group_id_a})(),
+            "effective_message": MockCmdMsg(MockRepliedMsgA())
+        })()
+        ctx = type("Context", (), {"args": []})()
+
+        await setloaderprice_command_handler(up_admin_a, ctx)
+        self.assertIn("Loader price list updated", up_admin_a.effective_message.replied_text)
+        self.assertIn("Products updated: 3", up_admin_a.effective_message.replied_text)
+
+        price_a_2400 = await get_loader_price(loader_a.id, "cp_2400")
+        self.assertEqual(price_a_2400, Decimal("12"))
+
+        # 2 & 3. Admin replies to Loader B price list -> Loader B prices saved independently ($13 vs $12)
+        group_id_b = -1009999999999
+        loader_b = await add_loader(group_id=group_id_b, loader_name="Loader Group B")
+
+        class MockRepliedMsgB:
+            chat = type("Chat", (), {"id": group_id_b})()
+            text = "2400 CP ➡️ $13"
+            caption = None
+
+        up_admin_b = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": group_id_b})(),
+            "effective_message": MockCmdMsg(MockRepliedMsgB())
+        })()
+
+        await setloaderprice_command_handler(up_admin_b, ctx)
+        self.assertIn("Loader price list updated", up_admin_b.effective_message.replied_text)
+
+        # Confirm isolation: Loader A remains $12, Loader B is $13
+        price_a_check = await get_loader_price(loader_a.id, "cp_2400")
+        price_b_check = await get_loader_price(loader_b.id, "cp_2400")
+        self.assertEqual(price_a_check, Decimal("12"))
+        self.assertEqual(price_b_check, Decimal("13"))
+
+        # 4. Telegram Group ID (-1004475489329) resolution safety:
+        # Confirm group_id_a is matched via Loader.group_id and not confused with Loader.id (integer primary key)
+        self.assertNotEqual(loader_a.id, group_id_a)
+        self.assertEqual(loader_a.group_id, group_id_a)
+
+        # 5. /setloaderprice without reply -> rejected
+        up_no_reply = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": group_id_a})(),
+            "effective_message": MockCmdMsg(None)
+        })()
+        await setloaderprice_command_handler(up_no_reply, ctx)
+        self.assertIn("Reply to a price-list message", up_no_reply.effective_message.replied_text)
+
+        # 6. Unauthorized user / unregistered group -> rejected
+        class MockRepliedMsgUnreg:
+            chat = type("Chat", (), {"id": -1008888888888})()
+            text = "2400 CP ➡️ $10"
+            caption = None
+
+        up_unreg = type("Update", (), {
+            "effective_user": type("User", (), {"id": 888888})(),
+            "effective_chat": type("Chat", (), {"id": -1008888888888})(),
+            "effective_message": MockCmdMsg(MockRepliedMsgUnreg())
+        })()
+        await setloaderprice_command_handler(up_unreg, ctx)
+        self.assertIn("not authorized", up_unreg.effective_message.replied_text.lower())
+
+        # 7. Invalid price list -> rejected, existing prices unchanged
+        class MockRepliedMsgInvalid:
+            chat = type("Chat", (), {"id": group_id_a})()
+            text = "Invalid text with no prices"
+            caption = None
+
+        up_invalid = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": group_id_a})(),
+            "effective_message": MockCmdMsg(MockRepliedMsgInvalid())
+        })()
+        await setloaderprice_command_handler(up_invalid, ctx)
+        self.assertIn("No valid loader prices found", up_invalid.effective_message.replied_text)
+        # Verify Loader A prices are untouched
+        self.assertEqual(await get_loader_price(loader_a.id, "cp_2400"), Decimal("12"))
+
+        # 8. Successful update -> loader price cache refreshed
+        self.assertIn(loader_a.id, LOADER_PRICES_CACHE)
+        self.assertEqual(float(LOADER_PRICES_CACHE[loader_a.id]["cp_2400"]["cost"]), 12.0)
+
+        # 9. Existing order pricing remains unchanged after updating loader prices
+        order = await create_order(
+            email="existing_order_test@example.com",
+            client_chat_id=-100555,
+            original_message_id=111,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text="Package: 2400 CP"
+        )
+        await save_order_pricing(order.id, loader_id=loader_a.id)
+
+        # Save baseline price
+        async with AsyncSessionLocal() as session:
+            h_order = await session.get(order.__class__, order.id)
+            saved_loader_cost = h_order.loader_cost_total
+
+        # Update Loader A price list
+        class MockRepliedMsgUpdate:
+            chat = type("Chat", (), {"id": group_id_a})()
+            text = "2400 CP ➡️ $15"
+            caption = None
+
+        up_update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": group_id_a})(),
+            "effective_message": MockCmdMsg(MockRepliedMsgUpdate())
+        })()
+        await setloaderprice_command_handler(up_update, ctx)
+
+        # Verify historical order pricing remains unchanged
+        async with AsyncSessionLocal() as session:
+            h_order_after = await session.get(order.__class__, order.id)
+            self.assertEqual(h_order_after.loader_cost_total, saved_loader_cost)
 
 
 if __name__ == "__main__":
