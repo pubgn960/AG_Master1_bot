@@ -9,6 +9,7 @@ import time
 import html
 import logging
 from enum import Enum
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from telegram import Update, Bot, ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton
 from config import Config
