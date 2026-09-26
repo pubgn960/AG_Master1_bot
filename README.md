@@ -1,4 +1,4 @@
-# Telegram Email Image Delivery Bot (v1.3.0) 🚀
+# AG_Master1_bot
 
 [![Python CI](https://github.com/pubgn960/smartbot-v2/actions/workflows/python.yml/badge.svg)](https://github.com/pubgn960/smartbot-v2/actions/workflows/python.yml)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/release/python-3120/)
