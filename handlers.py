@@ -143,7 +143,8 @@ from utils import (
     format_calculator_total_message,
     format_running_total_current_message,
     format_pay_record_message,
-    format_manual_adjustment_message
+    format_manual_adjustment_message,
+    format_delivery_summary_message
 )
 from database import (
     update_order_package_progress,
@@ -495,6 +496,31 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             order = priced_order
             if order.client_price_total and order.client_price_total > 0:
                 catb_total_price = order.client_price_total
+
+        c_price = float(order.client_price_total) if (order and order.client_price_total) else catb_total_price
+        if c_price > 0:
+            creation_ledger_entry, _ = await record_delivery_ledger_entry(
+                order_id=order.id,
+                package=package_desc or f"Category B Order #{order.id}",
+                now_value=c_price,
+                loader_name="System",
+                dedup_hash=f"catb_create_{order.id}",
+                is_manual=False,
+                chat_id=chat.id
+            )
+            if creation_ledger_entry:
+                acct_msg = format_delivery_summary_message(
+                    email=order.email,
+                    client_price=c_price,
+                    secret_code=None,
+                    before_total=creation_ledger_entry.before_total,
+                    now_value=c_price,
+                    running_total=creation_ledger_entry.running_total
+                )
+                try:
+                    await message.reply_text(acct_msg)
+                except Exception as e_acct:
+                    logger.error(f"[CLIENT] Failed to send creation accounting summary for Order #{order.id}: {e_acct}")
 
         if wv_enabled:
             wallet_deducted = False
@@ -2196,6 +2222,10 @@ async def process_delivery_ledger_event(
     from utils import format_delivery_summary_message, format_ledger_entry_message
 
     order = await get_order_by_id(order_id)
+    if order and order.category == "B":
+        logger.info(f"[LEDGER] Category B Order #{order_id} accounting was recorded at order creation. Skipping delivery ledger event.")
+        return
+
     if order and (order.client_price_total is None or order.secret_profit_code is None):
         try:
             order = await save_order_pricing(order_id)
@@ -4558,28 +4588,11 @@ async def admin_profit_code_completion_handler(update: Update, context: ContextT
         await message.reply_text(f"⚠️ Order #{target_order.id} ({html.escape(target_order.email)}) is already completed with profit code <b>{profit_code}</b>.", parse_mode="HTML")
         return True
 
-    if not completed_order or not ledger_entry:
+    if not completed_order:
         await message.reply_text(f"❌ Failed to complete Order #{target_order.id}: {status_code}")
         return True
 
-    # 3. Format & Send Accounting Summary Message
-    from utils import format_delivery_summary_message
-    client_p = completed_order.client_price_total if completed_order.client_price_total is not None else ledger_entry.now_value
-    summary_text = format_delivery_summary_message(
-        email=completed_order.email,
-        client_price=client_p,
-        secret_code=profit_code,
-        before_total=ledger_entry.before_total,
-        now_value=ledger_entry.now_value,
-        running_total=ledger_entry.running_total
-    )
-
-    try:
-        await message.reply_text(summary_text, parse_mode="HTML")
-    except Exception as e:
-        logger.exception(f"[PROFIT_CODE] Failed to send accounting summary for Order #{completed_order.id}: {e}")
-
-    # 4. Trigger image delivery / caption update in Client Group so caption displays Email & Profit Code under delivery image
+    # 3. Trigger image delivery / caption update in Client Group so caption displays Email & Profit Code under delivery image
     try:
         from delivery import deliver_order_by_id
         await deliver_order_by_id(
@@ -4589,8 +4602,13 @@ async def admin_profit_code_completion_handler(update: Update, context: ContextT
             allow_completed=True
         )
     except Exception as e_del:
-        logger.warning(f"[PROFIT_CODE] Failed to trigger image delivery/caption update for Order #{completed_order.id}: {e_del}")
+        logger.warning(f"[PROFIT_CODE] Caption update for Order #{completed_order.id} encountered notice: {e_del}")
 
+    # 4. Reply to admin confirming completion and profit code assignment
+    await message.reply_text(
+        f"✅ Secret profit code <b>{profit_code}</b> assigned to Order #{completed_order.id} ({html.escape(completed_order.email)}) and marked as Completed.",
+        parse_mode="HTML"
+    )
     return True
 
 

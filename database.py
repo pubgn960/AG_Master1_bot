@@ -981,7 +981,7 @@ async def save_order_pricing(
         order.loader_cost_total = float(l_total) if l_total is not None else order.loader_cost_total
         if p_amount is not None:
             order.profit_amount = float(p_amount)
-        if code:
+        if code and order.category != "B":
             order.secret_profit_code = code
 
         if c_total is not None:
@@ -3782,22 +3782,9 @@ async def complete_category_b_order_with_profit_code(
         await session.commit()
         await session.refresh(order)
 
-    # Record Delivery Ledger Entry & Update Running Total exactly once
-    now_val = float(order.client_price_total) if order.client_price_total else 0.0
-    dedup_hash = f"catb_complete_{order.id}_{code_clean}"
-    chat_id = order.loader_group_id or order.client_chat_id or BOT_SETTINGS.get("delivery_group_id")
+        stmt_l = select(DeliveryLedger).where(DeliveryLedger.order_id == order_id).order_by(DeliveryLedger.id.desc())
+        existing_ledger = (await session.execute(stmt_l)).scalars().first()
 
-    entry, is_new = await record_delivery_ledger_entry(
-        order_id=order.id,
-        package=order.package or "Category B Package",
-        now_value=now_val,
-        loader_name="Admin",
-        dedup_hash=dedup_hash,
-        is_manual=False,
-        chat_id=chat_id,
-        secret_profit_code=code_clean
-    )
-
-    return order, entry, is_new, "SUCCESS"
+        return order, existing_ledger, True, "SUCCESS"
 
 

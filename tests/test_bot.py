@@ -9649,8 +9649,58 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(saved.client_price_total)
         self.assertEqual(float(saved.client_price_total), 16.0)
 
-    async def test_admin_submits_profit_code_and_updates_accounting_summary(self):
-        from database import create_order, save_order_pricing, get_order_by_id, execute_manual_adjustment, get_running_total_current, execute_pay_reset
+    async def test_category_b_order_creation_records_ledger_and_sends_accounting_summary_immediately(self):
+        from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_running_total_current, execute_manual_adjustment, execute_pay_reset
+        from utils import format_delivery_summary_message
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(50.0, admin_id=admin_id, chat_id=chat_id)
+
+        order = await create_order(
+            email="catb_creation@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Pending Approval"
+        )
+        order = await save_order_pricing(order.id)
+
+        # Record creation ledger entry immediately
+        c_price = float(order.client_price_total)
+        entry, is_new = await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400",
+            now_value=c_price,
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=chat_id
+        )
+        self.assertTrue(is_new)
+        self.assertEqual(entry.before_total, 50.0)
+        self.assertEqual(entry.running_total, 66.0)
+
+        cur_rt = await get_running_total_current(chat_id=chat_id)
+        self.assertEqual(cur_rt, 66.0)
+
+        # Verify initial creation accounting summary (No profit code yet)
+        summary_text = format_delivery_summary_message(
+            email=order.email,
+            client_price=c_price,
+            secret_code=None,
+            before_total=entry.before_total,
+            now_value=c_price,
+            running_total=entry.running_total
+        )
+
+        self.assertIn("Price: $16", summary_text)
+        self.assertIn("Before: 50", summary_text)
+        self.assertIn("Now: 16", summary_text)
+        self.assertIn("Total: 66", summary_text)
+
+    async def test_admin_submits_profit_code_without_double_charging_running_total(self):
+        from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_order_by_id, execute_manual_adjustment, get_running_total_current, execute_pay_reset
         from handlers import admin_profit_code_completion_handler, BOT_SETTINGS, AUTH_USERS_CACHE
         from unittest.mock import AsyncMock, MagicMock
 
@@ -9669,9 +9719,20 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
             category="B",
             status="Approved"
         )
-        await save_order_pricing(order.id)
+        order = await save_order_pricing(order.id)
 
-        # Mock update from admin
+        # Record creation time accounting
+        await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400",
+            now_value=float(order.client_price_total),
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=chat_id
+        )
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 66.0)
+
+        # Admin submits profit code V post-delivery
         update = MagicMock()
         update.effective_user.id = admin_id
         update.effective_chat.id = chat_id
@@ -9685,26 +9746,17 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated_order.status, "Completed")
         self.assertEqual(updated_order.secret_profit_code, "V")
 
-        # Check running total updated from 50 to 66
+        # Running total MUST remain 66.0 (NOT 82.0!)
         cur_rt = await get_running_total_current(chat_id=chat_id)
-        self.assertEqual(cur_rt, 66.0)
+        self.assertEqual(cur_rt, 66.0, "Profit code submission MUST NOT double charge running total!")
 
         # Verify reply message format
         update.effective_message.reply_text.assert_called_once()
         reply_msg = update.effective_message.reply_text.call_args[0][0]
-
-        self.assertIn("Price: $16", reply_msg)
-        self.assertIn("V", reply_msg)
-        self.assertIn("Before: 50", reply_msg)
-        self.assertIn("Now: 16", reply_msg)
-        self.assertIn("Total: 66", reply_msg)
-
-        # Ensure NO loader cost or profit amount shown
-        self.assertNotIn("Profit:", reply_msg)
-        self.assertNotIn("Loader Cost", reply_msg)
+        self.assertIn("Secret profit code <b>V</b> assigned", reply_msg)
 
     async def test_duplicate_profit_code_submission_blocked(self):
-        from database import create_order, save_order_pricing, complete_category_b_order_with_profit_code, get_running_total_current, execute_pay_reset
+        from database import create_order, save_order_pricing, record_delivery_ledger_entry, complete_category_b_order_with_profit_code, get_running_total_current, execute_pay_reset
         from handlers import admin_profit_code_completion_handler, AUTH_USERS_CACHE
         from unittest.mock import AsyncMock, MagicMock
 
@@ -9721,7 +9773,15 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
             category="B",
             status="Approved"
         )
-        await save_order_pricing(order.id)
+        order = await save_order_pricing(order.id)
+        await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400",
+            now_value=float(order.client_price_total),
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=chat_id
+        )
 
         # First completion
         await complete_category_b_order_with_profit_code(order.id, "V", admin_id)
