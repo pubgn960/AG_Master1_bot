@@ -8394,6 +8394,26 @@ class TestSetLoaderPriceReplyBased(unittest.IsolatedAsyncioTestCase):
         cmd_names = [cmd.command for cmd in sent_bot_commands]
         self.assertIn("setloaderprice", cmd_names, "setloaderprice must be present in Telegram BotCommand list passed to set_my_commands")
 
+    async def test_loaderadd_creation_and_cache_reload(self):
+        from database import add_loader, reload_loaders_cache, LOADERS_CACHE
+
+        group_id = -1004475489329
+        loader_name = "Real Telegram Test Group"
+
+        # J. /loaderadd creates Loader with internal INTEGER id and BIGINT group_id
+        loader = await add_loader(group_id=group_id, loader_name=loader_name)
+        self.assertIsNotNone(loader.id)
+        self.assertIsInstance(loader.id, int)
+        self.assertGreaterEqual(loader.id, 1)
+        self.assertEqual(loader.group_id, group_id)
+
+        # K. reload_loaders_cache() correctly reloads registered Loader into RAM cache
+        LOADERS_CACHE.clear()
+        cache = await reload_loaders_cache()
+        self.assertIn(loader.id, cache)
+        self.assertEqual(cache[loader.id]["group_id"], group_id)
+        self.assertEqual(cache[loader.id]["name"], loader_name)
+
 
 if __name__ == "__main__":
     unittest.main()

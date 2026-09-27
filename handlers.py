@@ -505,7 +505,7 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"<b>Remaining Balance:</b> ${format_wallet_amount(bal_val)}\n\n"
                     f"Order is now being processed."
                 )
-                await message.reply_text(client_pay_msg, parse_mode="HTML", quote=True)
+                await message.reply_text(client_pay_msg, parse_mode="HTML")
             except Exception as e:
                 logger.error(f"[WALLET] Failed to send payment confirmation to customer: {e}")
 
@@ -557,7 +557,7 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"<b>Remaining Needed:</b> ${format_wallet_amount(needed)}\n\n"
                     f"Please top up your wallet in this group to process your order."
                 )
-                await message.reply_text(insufficient_msg, parse_mode="HTML", quote=True)
+                await message.reply_text(insufficient_msg, parse_mode="HTML")
             except Exception as e:
                 logger.error(f"[WALLET] Failed to send insufficient balance notice to customer: {e}")
 
@@ -1983,12 +1983,12 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
 
     reply_msg = message.reply_to_message
     if not reply_msg:
-        await message.reply_text("❌ Reply to a price-list message and use /setloaderprice.", quote=True)
+        await message.reply_text("❌ Reply to a price-list message and use /setloaderprice.")
         return
 
     replied_text = reply_msg.text or reply_msg.caption or ""
     if not replied_text or not replied_text.strip():
-        await message.reply_text("❌ No valid loader prices found.", quote=True)
+        await message.reply_text("❌ No valid loader prices found.")
         return
 
     from database import (
@@ -2009,10 +2009,10 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
             if 1 <= val <= 2147483647:
                 explicit_loader_id = val
             else:
-                await message.reply_text(f"❌ Loader ID #{args[0]} not found.", quote=True)
+                await message.reply_text(f"❌ Loader ID #{args[0]} not found.")
                 return
         else:
-            await message.reply_text("❌ Invalid loader_id format. Usage: /setloaderprice <loader_id>", quote=True)
+            await message.reply_text("❌ Invalid loader_id format. Usage: /setloaderprice <loader_id>")
             return
 
     if not LOADERS_CACHE:
@@ -2035,7 +2035,7 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
                     break
 
         if not loader_found:
-            await message.reply_text(f"❌ Loader ID #{explicit_loader_id} not found.", quote=True)
+            await message.reply_text(f"❌ Loader ID #{explicit_loader_id} not found.")
             return
 
         reply_chat = getattr(reply_msg, "chat", None)
@@ -2050,7 +2050,7 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
                     break
 
             if user_loader_id != target_loader_id:
-                await message.reply_text("❌ You are not authorized to update another loader's prices.", quote=True)
+                await message.reply_text("❌ You are not authorized to update another loader's prices.")
                 return
     else:
         # Primary workflow: Automatic loader resolution via Telegram Group/Chat ID context
@@ -2076,9 +2076,9 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
 
         if matching_loader_id is None:
             if user_is_admin:
-                await message.reply_text("❌ This group is not registered as a Loader Group.", quote=True)
+                await message.reply_text("❌ This group is not registered as a Loader Group.")
             else:
-                await message.reply_text("❌ You are not authorized to update loader prices.", quote=True)
+                await message.reply_text("❌ You are not authorized to update loader prices.")
             return
 
         target_loader_id = matching_loader_id
@@ -2087,9 +2087,9 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
     if not parsed["valid"] or parsed["counts"]["total"] == 0 or parsed["errors"]:
         if parsed["errors"]:
             err_msg = parsed["errors"][0]
-            await message.reply_text(f"❌ {err_msg}", quote=True)
+            await message.reply_text(f"❌ {err_msg}")
         else:
-            await message.reply_text("❌ No valid loader prices found.", quote=True)
+            await message.reply_text("❌ No valid loader prices found.")
         return
 
     try:
@@ -2100,13 +2100,13 @@ async def setloaderprice_command_handler(update: Update, context: ContextTypes.D
                 "✅ Loader price list updated\n"
                 f"Products updated: {cnt}"
             )
-            await message.reply_text(resp, quote=True)
+            await message.reply_text(resp)
             logger.info(f"[SET_LOADER_PRICE] Updated loader #{target_loader_id} price list ({cnt} products).")
         else:
-            await message.reply_text("❌ Database update failed. Transaction rolled back.", quote=True)
+            await message.reply_text("❌ Database update failed. Transaction rolled back.")
     except Exception as e:
         logger.exception(f"[SET_LOADER_PRICE] Error updating loader prices: {e}")
-        await message.reply_text("❌ Database update failed. Transaction rolled back.", quote=True)
+        await message.reply_text("❌ Database update failed. Transaction rolled back.")
 
 
 
@@ -4240,15 +4240,15 @@ async def handle_client_cancellation_request(update: Update, context: ContextTyp
     order_updated, status_reason = await request_order_cancellation(order.id, user_id=user.id if user else None)
 
     if status_reason == "ALREADY_DELIVERED":
-        await message.reply_text("⚠️ This order has already been delivered and cannot be cancelled.", quote=True)
+        await message.reply_text("⚠️ This order has already been delivered and cannot be cancelled.")
         return True
 
     if status_reason == "ALREADY_CANCELLED":
-        await message.reply_text("❌ This order has already been cancelled.", quote=True)
+        await message.reply_text("❌ This order has already been cancelled.")
         return True
 
     if status_reason == "ALREADY_REQUESTED":
-        await message.reply_text("⏳ Cancellation request already sent to the loader. Please wait.", quote=True)
+        await message.reply_text("⏳ Cancellation request already sent to the loader. Please wait.")
         return True
 
     if status_reason != "SUCCESS" or not order_updated:
@@ -4313,7 +4313,7 @@ async def handle_client_cancellation_request(update: Update, context: ContextTyp
         except Exception as e:
             logger.error(f"[CANCEL_REQ] Failed to send cancellation prompt to Loader Group: {e}")
 
-    await message.reply_text("⏳ Cancellation request sent to loader. Please wait.", quote=True)
+    await message.reply_text("⏳ Cancellation request sent to loader. Please wait.")
     return True
 
 
