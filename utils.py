@@ -819,17 +819,15 @@ def format_manual_adjustment_message(before: float, now_val: float, total: float
     )
 
 
-def _get_global_client_price_for_package(pkg_name: Optional[str]) -> Optional[float]:
+def _get_global_client_price_for_package(pkg_name: Optional[str], category: str = "A") -> Optional[float]:
     """
-    Helper to check GLOBAL_CLIENT_PRICES_CACHE for a package name or product key.
-    Returns float price or None if not found in cache.
+    Helper to check GLOBAL_CLIENT_PRICES_CACHE, category PACKAGE_PRICES, and PRODUCT_CATALOG reference prices.
+    Returns float price or None if not found.
     """
     if not pkg_name:
         return None
     try:
         from database import GLOBAL_CLIENT_PRICES_CACHE
-        if not GLOBAL_CLIENT_PRICES_CACHE:
-            return None
         from order_parser import normalize_package_alias
         raw_str = str(pkg_name).strip()
         m_cp = re.search(r'\b(\d{2,6})\b', raw_str)
@@ -843,9 +841,23 @@ def _get_global_client_price_for_package(pkg_name: Optional[str]) -> Optional[fl
             canonical_pkg.lower(),
             raw_str.lower()
         ]
+        if GLOBAL_CLIENT_PRICES_CACHE:
+            for key in candidate_keys:
+                if key in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE.get(key, {}).get("price") is not None:
+                    return float(GLOBAL_CLIENT_PRICES_CACHE[key]["price"])
+
+        cat_map = PACKAGE_PRICES_CAT_B if (category or "A").upper() == "B" else PACKAGE_PRICES_CAT_A
+        if canonical_pkg in cat_map:
+            return float(cat_map[canonical_pkg])
+        if num_raw in cat_map:
+            return float(cat_map[num_raw])
+        if raw_str in cat_map:
+            return float(cat_map[raw_str])
+
+        from product_catalog import PRODUCT_CATALOG
         for key in candidate_keys:
-            if key in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE.get(key, {}).get("price") is not None:
-                return float(GLOBAL_CLIENT_PRICES_CACHE[key]["price"])
+            if key in PRODUCT_CATALOG and PRODUCT_CATALOG[key].get("reference_price") is not None:
+                return float(PRODUCT_CATALOG[key]["reference_price"])
     except Exception:
         pass
     return None

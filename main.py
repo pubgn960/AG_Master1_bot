@@ -20,7 +20,16 @@ from telegram.ext import (
 )
 
 from config import Config
-from database import init_db, cleanup_old_records, check_order_timeouts, reload_bot_settings_cache, reload_auth_users_cache, reload_loaders_cache
+from database import (
+    init_db,
+    cleanup_old_records,
+    check_order_timeouts,
+    reload_bot_settings_cache,
+    reload_auth_users_cache,
+    reload_loaders_cache,
+    reload_global_client_prices_cache,
+    reload_loader_prices_cache
+)
 from utils import setup_logging
 from handlers import (
     source_group_handler,
@@ -155,10 +164,12 @@ async def post_init(application: Application) -> None:
     logger.info("Initializing database schema...")
     await init_db()
 
-    # Load Settings, Authorized Users, Client Groups, and Loaders from DB once on startup into RAM
+    # Load Settings, Authorized Users, Client Groups, Loaders, and Price Caches from DB once on startup into RAM
     await reload_bot_settings_cache()
     await reload_auth_users_cache()
     await reload_loaders_cache()
+    await reload_global_client_prices_cache()
+    await reload_loader_prices_cache()
 
     # Register Clean & Frequently Used Bot Commands for Telegram '/' menu UI
     raw_commands = [

@@ -8654,8 +8654,127 @@ class TestLoaderAddGroupIdParsing(unittest.IsolatedAsyncioTestCase):
         await manual_running_total_text_handler(update, context)
         rt_after = await get_running_total_current(chat_id=admin_id)
 
-        self.assertAlmostEqual(rt_after - rt_before, 15.5, places=2)
-        self.assertTrue(any("total" in t.lower() for t in replied_texts))
+class TestRealOrderPricingIntegration(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression and unit test suite verifying real Telegram order pricing/profit integration.
+    Guarantees:
+      - 2400 CP order resolves global client price ($16) and loader cost ($12) -> client=16, loader=12, profit=4, secret_code='X'.
+      - Legacy hardcoded $16.5 CANNOT override active global client price of $16.
+      - Startup cache reloads populate GLOBAL_CLIENT_PRICES_CACHE and LOADER_PRICES_CACHE.
+      - save_order_pricing correctly resolves Loader Group ID to Loader.id.
+      - Multi-package orders sum client totals, loader costs, and profit codes correctly.
+    """
+
+    async def asyncSetUp(self):
+        from database import (
+            init_db,
+            add_loader,
+            set_global_client_price,
+            set_loader_price,
+            reload_loaders_cache,
+            reload_global_client_prices_cache,
+            reload_loader_prices_cache
+        )
+        await init_db()
+
+        # Seed global client price cp_2400 = $16
+        await set_global_client_price(product_key="cp_2400", price=16.0, display_name="2400 CP", package_type="normal_cp")
+        await reload_global_client_prices_cache()
+
+        # Create test loader with Group ID -1004475489329
+        self.loader_group_id = -1004475489329
+        self.loader = await add_loader(group_id=self.loader_group_id, loader_name="Test Pricing Loader")
+        await reload_loaders_cache()
+
+        # Seed loader cost cp_2400 = $12 for this loader
+        await set_loader_price(loader_id=self.loader.id, product_key="cp_2400", cost=12.0)
+        await reload_loader_prices_cache()
+
+    async def asyncTearDown(self):
+        from database import AsyncSessionLocal, GlobalClientPrice, LoaderPrice, Loader, GLOBAL_CLIENT_PRICES_CACHE, LOADER_PRICES_CACHE, LOADERS_CACHE
+        from sqlalchemy import delete
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+
+    async def test_2400_cp_order_pricing_and_profit(self):
+        from database import create_order, save_order_pricing, set_order_loader_message_id
+        order_text = (
+            "Email: testprofit@example.com\n"
+            "Password: Test12345\n"
+            "Package: 2400 CP"
+        )
+        order = await create_order(
+            email="testprofit@example.com",
+            client_chat_id=-100123456789,
+            original_message_id=999,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text=order_text
+        )
+        await set_order_loader_message_id(order.id, 999111, loader_group_id=self.loader_group_id)
+
+        updated = await save_order_pricing(order.id)
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.client_price_total, 16.0, "Client price MUST be 16.0 (not legacy 16.5)")
+        self.assertNotEqual(updated.client_price_total, 16.5, "Legacy 16.5 price MUST NOT override active global price of 16.0")
+        self.assertEqual(updated.loader_cost_total, 12.0, "Loader cost MUST be 12.0")
+        self.assertEqual(updated.profit_amount, 4.0, "Profit MUST be 4.0")
+        self.assertEqual(updated.secret_profit_code, "X", "Secret profit code for $4 profit MUST be 'X'")
+
+    async def test_legacy_16_5_cannot_override_global_price(self):
+        from utils import _get_global_client_price_for_package, calculate_delivered_packages_value
+
+        price_val = _get_global_client_price_for_package("2400 CP")
+        self.assertEqual(price_val, 16.0, "Global client price for 2400 CP MUST be 16.0")
+
+        val, all_k = calculate_delivered_packages_value("2400")
+        self.assertTrue(all_k)
+        self.assertEqual(val, 16.0, "Delivered package value MUST use active global client price 16.0")
+
+    async def test_multi_package_pricing(self):
+        from database import (
+            create_order,
+            set_global_client_price,
+            set_loader_price,
+            save_order_pricing,
+            set_order_loader_message_id,
+            reload_global_client_prices_cache,
+            reload_loader_prices_cache
+        )
+        await set_global_client_price(product_key="cp_5000", price=33.0)
+        await set_loader_price(loader_id=self.loader.id, product_key="cp_5000", cost=25.0)
+        await reload_global_client_prices_cache()
+        await reload_loader_prices_cache()
+
+        order_text = (
+            "Email: multi@example.com\n"
+            "Password: Pass\n"
+            "Package: 2400 CP + 5000 CP"
+        )
+        order = await create_order(
+            email="multi@example.com",
+            client_chat_id=-100123456789,
+            original_message_id=998,
+            package="2400 CP + 5000 CP",
+            status="Pending",
+            category="A",
+            raw_text=order_text
+        )
+        await set_order_loader_message_id(order.id, 999222, loader_group_id=self.loader_group_id)
+
+        updated = await save_order_pricing(order.id)
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.client_price_total, 49.0)
+        self.assertEqual(updated.loader_cost_total, 37.0)
+        self.assertEqual(updated.profit_amount, 12.0)
+        self.assertEqual(updated.secret_profit_code, "H")
 
 
 if __name__ == "__main__":

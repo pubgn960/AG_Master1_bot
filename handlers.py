@@ -584,6 +584,14 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             package_progress=init_progress_json
         )
 
+        try:
+            from database import save_order_pricing
+            priced_ord = await save_order_pricing(order.id)
+            if priced_ord:
+                order = priced_ord
+        except Exception as e_pr:
+            logger.warning(f"[CLIENT] Initial save_order_pricing for Order #{order.id} failed: {e_pr}")
+
         # Auto-detect price for supported packages and unknown package prompts
         if parsed_init_pkg:
             test_price_val = parsed_init_pkg.get("total_price")
