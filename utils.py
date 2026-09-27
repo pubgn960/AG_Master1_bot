@@ -788,19 +788,10 @@ def format_pay_record_message(before: float, paid: float, current: float) -> str
 
 def format_manual_adjustment_message(before: float, now_val: float, total: float) -> str:
     """
-    Formats manual + / - adjustments:
-    ━━━━━━━━━━━━━━━━━━
-
-    Before
-    64$
-
-    Now
-    +10$ (or -10$)
-
-    Total
-    74$ (or 64$)
-
-    ━━━━━━━━━━━━━━━━━━
+    Formats manual + / - adjustments in compact bot-style format:
+    Before: 300$
+    Now: -200$
+    Total: 100$
     """
     if now_val >= 0:
         now_str = f"+{_fmt_price_val(now_val)}"
@@ -808,14 +799,9 @@ def format_manual_adjustment_message(before: float, now_val: float, total: float
         now_str = f"-{_fmt_price_val(abs(now_val))}"
 
     return (
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "Before\n"
-        f"{_fmt_price_val(before)}$\n\n"
-        "Now\n"
-        f"{now_str}$\n\n"
-        "Total\n"
-        f"{_fmt_price_val(total)}$\n\n"
-        "━━━━━━━━━━━━━━━━━━"
+        f"Before: {_fmt_price_val(before)}$\n"
+        f"Now: {now_str}$\n"
+        f"Total: {_fmt_price_val(total)}$"
     )
 
 

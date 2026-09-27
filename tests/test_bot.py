@@ -9168,9 +9168,9 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
         update.effective_message.reply_text.assert_called_once()
         reply_text = update.effective_message.reply_text.call_args[0][0]
 
-        self.assertIn("Before\n1000$", reply_text)
-        self.assertIn("Now\n+200$", reply_text)
-        self.assertIn("Total\n1200$", reply_text)
+        self.assertIn("Before: 1000$", reply_text)
+        self.assertIn("Now: +200$", reply_text)
+        self.assertIn("Total: 1200$", reply_text)
         self.assertEqual(await get_running_total_current(chat_id=chat_id), 1200.0)
 
     async def test_b_negative_200_adjustment(self):
@@ -9195,9 +9195,7 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
         update1.effective_message.reply_text.assert_called_once()
         reply1 = update1.effective_message.reply_text.call_args[0][0]
 
-        self.assertIn("Before\n1000$", reply1)
-        self.assertIn("Now\n-200$", reply1)
-        self.assertIn("Total\n800$", reply1)
+        self.assertEqual(reply1, "Before: 1000$\nNow: -200$\nTotal: 800$")
         self.assertEqual(await get_running_total_current(chat_id=chat_id), 800.0)
 
         # Scenario 2: Before 250$, Now -200$, Total 50$
@@ -9215,9 +9213,7 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
         update2.effective_message.reply_text.assert_called_once()
         reply2 = update2.effective_message.reply_text.call_args[0][0]
 
-        self.assertIn("Before\n250$", reply2)
-        self.assertIn("Now\n-200$", reply2)
-        self.assertIn("Total\n50$", reply2)
+        self.assertEqual(reply2, "Before: 250$\nNow: -200$\nTotal: 50$")
         self.assertEqual(await get_running_total_current(chat_id=chat_id), 50.0)
 
     async def test_c_negative_decimal_adjustment(self):
@@ -9243,9 +9239,7 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
         update.effective_message.reply_text.assert_called_once()
         reply = update.effective_message.reply_text.call_args[0][0]
 
-        self.assertIn("Before\n100$", reply)
-        self.assertIn("Now\n-12.5$", reply)
-        self.assertIn("Total\n87.5$", reply)
+        self.assertEqual(reply, "Before: 100$\nNow: -12.5$\nTotal: 87.5$")
         self.assertEqual(await get_running_total_current(chat_id=chat_id), 87.5)
 
     async def test_d_telegram_group_id_is_not_treated_as_balance_adjustment(self):
