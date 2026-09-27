@@ -32,6 +32,7 @@ from keywords import contains_order_keyword
 from email_parser import extract_email, extract_order_id, extract_package, extract_last_email
 from media_collector import media_collector, user_session_manager
 from delivery import deliver_order_by_id, deliver_images_for_email
+from order_parser import parse_order_v2, get_dynamic_package_prices
 from database import (
     BOT_SETTINGS,
     AUTH_USERS_CACHE,

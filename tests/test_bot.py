@@ -267,6 +267,54 @@ class TestGroupCategoryRouting(unittest.IsolatedAsyncioTestCase):
         await remove_client_group_category(chat_id_b)
         await delete_orders_by_email(email)
 
+    async def test_category_b_source_group_handler_no_name_error(self):
+        """Regression test: Category B source_group_handler execution must NOT raise NameError for parse_order_v2."""
+        from database import init_db, set_client_group_category, get_all_orders_by_email, delete_orders_by_email
+        from handlers import source_group_handler
+        from unittest.mock import MagicMock, AsyncMock
+
+        await init_db()
+        chat_id_b = -100888777666
+        email_catb = "catb_no_nameerror@example.com"
+        await set_client_group_category(chat_id_b, "Pakistan CODM Shop B", "B")
+
+        text_content = (
+            f"Email: {email_catb}\n"
+            "Password: SecretPassword123\n"
+            "Platform: Facebook\n"
+            "2400 CP"
+        )
+
+        update = MagicMock()
+        update.effective_user.id = 987654321  # Customer ID (not admin)
+        update.effective_chat.id = chat_id_b
+        update.effective_chat.title = "Pakistan CODM Shop B"
+        update.effective_message.message_id = 8881
+        update.effective_message.text = text_content
+        update.effective_message.caption = None
+        update.effective_message.photo = []
+        update.effective_message.document = None
+        update.effective_message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot.set_message_reaction = AsyncMock()
+        context.bot.copy_message = AsyncMock()
+
+        try:
+            # Must complete without raising NameError or exception
+            await source_group_handler(update, context)
+
+            orders = await get_all_orders_by_email(email_catb)
+            self.assertTrue(len(orders) > 0, "Category B order must be created in DB")
+            catb_order = orders[0]
+            self.assertEqual(catb_order.category, "B")
+            self.assertEqual(catb_order.email, email_catb)
+            self.assertIn("2400", catb_order.package)
+            self.assertNotEqual(catb_order.package, "Standard Package", "Parsed package must remain 2400 CP, not Standard Package")
+        finally:
+            await remove_client_group_category(chat_id_b)
+            await delete_orders_by_email(email_catb)
+
 
 class TestIgnoreAdminAndDeliveryUserMessages(unittest.IsolatedAsyncioTestCase):
     """Tests ignoring Super Admin and Delivery User messages in Client Group."""
