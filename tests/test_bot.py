@@ -8415,8 +8415,252 @@ class TestSetLoaderPriceReplyBased(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache[loader.id]["name"], loader_name)
 
 
+class TestLoaderAddGroupIdParsing(unittest.IsolatedAsyncioTestCase):
+    """Comprehensive test suite for /loaderadd group ID parsing, duplicate protection,
+    handler isolation, and running-total protection.
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, reload_loaders_cache
+        from handlers import LOADER_ADD_SESSION
+        await init_db()
+        LOADER_ADD_SESSION.clear()
+        await reload_loaders_cache()
+
+    async def test_admin_loaderadd_single_arg_success(self):
+        from handlers import loaderadd_command
+        from database import get_all_loaders, LOADERS_CACHE, get_current_running_total
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        group_id = -1004475489399
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": [str(group_id)]})()
+
+        rt_before = await get_current_running_total()
+        await loaderadd_command(update, context)
+        rt_after = await get_current_running_total()
+
+        self.assertEqual(rt_before, rt_after, "Running total MUST NOT be changed by /loaderadd!")
+        self.assertTrue(any("added" in t.lower() or "loader group" in t.lower() for t in replied_texts))
+
+        loaders = await get_all_loaders()
+        loader = next((l for l in loaders if l.group_id == group_id), None)
+        self.assertIsNotNone(loader)
+        self.assertIsInstance(loader.id, int)
+        self.assertGreater(loader.id, 0)
+        self.assertEqual(loader.group_id, group_id)
+
+        # Confirm RAM cache has it
+        self.assertIn(loader.id, LOADERS_CACHE)
+
+    async def test_admin_loaderadd_two_args_success(self):
+        from handlers import loaderadd_command
+        from database import get_all_loaders
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        group_id = -1004475489330
+        loader_name = "AlphaLoader"
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": [str(group_id), loader_name]})()
+
+        await loaderadd_command(update, context)
+
+        loaders = await get_all_loaders()
+        loader = next((l for l in loaders if l.group_id == group_id), None)
+        self.assertIsNotNone(loader)
+        self.assertEqual(loader.loader_name, loader_name)
+
+    async def test_loaderadd_duplicate_rejected(self):
+        from handlers import loaderadd_command
+        from database import add_loader, reload_loaders_cache
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        group_id = -1004475489331
+
+        await add_loader(group_id=group_id, loader_name="ExistingLoader")
+        await reload_loaders_cache()
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": [str(group_id)]})()
+
+        await loaderadd_command(update, context)
+
+        self.assertTrue(any("already registered" in t.lower() for t in replied_texts))
+
+    async def test_loaderadd_invalid_group_id(self):
+        from handlers import loaderadd_command
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["not_a_number"]})()
+
+        await loaderadd_command(update, context)
+
+        self.assertTrue(any("invalid loader group id" in t.lower() for t in replied_texts))
+
+    async def test_non_admin_loaderadd_rejected(self):
+        from handlers import loaderadd_command
+
+        non_admin_id = 9999888877
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": non_admin_id})(),
+            "effective_chat": type("Chat", (), {"id": non_admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["-1004475489332"]})()
+
+        await loaderadd_command(update, context)
+
+        self.assertTrue(any("not authorized" in t.lower() for t in replied_texts))
+
+    async def test_group_id_text_message_does_not_mutate_running_total(self):
+        from handlers import manual_running_total_text_handler
+        from database import get_current_running_total
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        raw_text = "-1004475489329"
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"text": raw_text, "reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {})()
+
+        rt_before = await get_current_running_total()
+        await manual_running_total_text_handler(update, context)
+        rt_after = await get_current_running_total()
+
+        self.assertEqual(rt_before, rt_after, "Standalone group ID text string MUST NOT update running total!")
+        self.assertEqual(len(replied_texts), 0, "No reply message should be sent by running total handler for group ID text.")
+
+    async def test_wizard_session_group_id_isolation(self):
+        from handlers import manual_running_total_text_handler, loader_text_wizard_handler, LOADER_ADD_SESSION
+        from database import get_current_running_total
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # Step 1: User enters wizard session
+        LOADER_ADD_SESSION[admin_id] = {"step": 1, "chat_id": admin_id}
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"text": "-1004475489333", "reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {})()
+
+        rt_before = await get_current_running_total()
+        # manual_running_total_text_handler should ignore users in LOADER_ADD_SESSION
+        await manual_running_total_text_handler(update, context)
+        rt_after = await get_current_running_total()
+
+        self.assertEqual(rt_before, rt_after, "Running total MUST NOT change when user is in LOADER_ADD_SESSION!")
+
+        # Process with loader_text_wizard_handler
+        await loader_text_wizard_handler(update, context)
+        self.assertTrue(any("loader name" in t.lower() for t in replied_texts))
+        self.assertEqual(LOADER_ADD_SESSION[admin_id]["group_id"], -1004475489333)
+
+    async def test_ordinary_amount_text_still_updates_running_total(self):
+        from handlers import manual_running_total_text_handler
+        from database import get_running_total_current
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"text": "+15.5", "reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {})()
+
+        rt_before = await get_running_total_current(chat_id=admin_id)
+        await manual_running_total_text_handler(update, context)
+        rt_after = await get_running_total_current(chat_id=admin_id)
+
+        self.assertAlmostEqual(rt_after - rt_before, 15.5, places=2)
+        self.assertTrue(any("total" in t.lower() for t in replied_texts))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

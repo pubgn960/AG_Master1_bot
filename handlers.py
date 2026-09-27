@@ -2631,10 +2631,15 @@ async def manual_running_total_text_handler(update: Update, context: ContextType
     """
     Handles plain numeric messages starting with '+' or '-' (e.g. +10, -10, +16.5, -4.5).
     Super Admin only. Scoped to the current chat group. Everyone else must be ignored.
+    Prevents Telegram Group IDs (e.g. -1004475489329) or wizard inputs from being treated as amounts.
     """
     user = update.effective_user
     if not user or not is_super_admin(user.id):
         # Silently ignore non-super-admins
+        return
+
+    # Guard 1: Ignore if user has an active loader add wizard session
+    if user.id in LOADER_ADD_SESSION:
         return
 
     msg_text = update.effective_message.text.strip() if update.effective_message and update.effective_message.text else ""
@@ -2642,10 +2647,20 @@ async def manual_running_total_text_handler(update: Update, context: ContextType
         return
 
     raw_num = msg_text
+    # Guard 2: Ignore Telegram Group IDs (e.g. -1004475489329 or long negative integer strings > 8 digits)
+    clean_digits = raw_num.lstrip("-+")
+    if raw_num.startswith("-100") or len(clean_digits) > 8:
+        logger.info(f"[RUNNING_TOTAL] Ignored non-amount text (Telegram Group ID format): '{raw_num}'")
+        return
+
     try:
         val = float(raw_num)
     except ValueError:
         return  # Not a plain numeric adjustment
+
+    if abs(val) >= 100000000:
+        logger.info(f"[RUNNING_TOTAL] Ignored excessive numeric amount: {val}")
+        return
 
     chat_id = update.effective_chat.id if update.effective_chat else None
     entry, before_val, now_val, after_val, action_type = await execute_manual_adjustment(val, admin_id=user.id, chat_id=chat_id)
@@ -3199,33 +3214,73 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def loaderadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /loaderadd command. Supports direct arguments (/loaderadd <group_id> <name>)
-    or step-by-step interactive wizard (/loaderadd -> Ask Group ID -> Ask Loader Name).
+    Handles /loaderadd <group_id> [loader_name] command for Super Admin users.
+    Explicitly parses group_id, enforces duplicate protection, updates database & LOADERS_CACHE,
+    and returns user-friendly status responses.
     """
     if not await check_admin_permission(update):
         return
 
     user = update.effective_user
     chat = update.effective_chat
-    uid = user.id if user else None
-    args = context.args or []
-
-    if len(args) >= 2 and args[0].lstrip("-").isdigit():
-        group_id = int(args[0])
-        loader_name = " ".join(args[1:])
-        await add_loader(group_id, loader_name)
-        LOADER_ADD_SESSION.pop(uid, None)
-        await update.effective_message.reply_text("✅ Loader Added Successfully")
+    message = update.effective_message
+    if not message:
         return
 
-    # Interactive Step-by-Step wizard reserved strictly for this admin user
-    if uid:
-        LOADER_ADD_SESSION[uid] = {
-            "step": 1,
-            "chat_id": chat.id if chat else None,
-            "created_at": datetime.now(timezone.utc)
-        }
-        await update.effective_message.reply_text("Send Loader Group ID")
+    args = context.args or []
+
+    if not args:
+        await message.reply_text("❌ Usage: /loaderadd <loader_group_id>")
+        return
+
+    group_id_str = args[0].strip()
+    if not (group_id_str.lstrip("-").isdigit() and len(group_id_str.lstrip("-")) > 0):
+        await message.reply_text("❌ Invalid Loader Group ID.")
+        return
+
+    try:
+        group_id = int(group_id_str)
+    except ValueError:
+        await message.reply_text("❌ Invalid Loader Group ID.")
+        return
+
+    if len(args) >= 2:
+        loader_name = " ".join(args[1:])
+    elif chat and chat.type in ("group", "supergroup") and chat.id == group_id and chat.title:
+        loader_name = chat.title
+    else:
+        loader_name = f"Loader Group ({group_id})"
+
+    from database import LOADERS_CACHE, reload_loaders_cache, get_all_loaders, add_loader
+
+    if not LOADERS_CACHE:
+        await reload_loaders_cache()
+
+    # Duplicate check: verify if group_id is already registered
+    is_duplicate = any(l.get("group_id") == group_id for l in LOADERS_CACHE.values())
+    if not is_duplicate:
+        loaders_db = await get_all_loaders()
+        is_duplicate = any(l.group_id == group_id for l in loaders_db)
+
+    if is_duplicate:
+        await message.reply_text("⚠️ This Loader Group is already registered.")
+        return
+
+    try:
+        loader = await add_loader(group_id, loader_name)
+        await reload_loaders_cache()
+        if user and user.id in LOADER_ADD_SESSION:
+            LOADER_ADD_SESSION.pop(user.id, None)
+
+        resp = (
+            "✅ <b>Loader Group Added</b>\n\n"
+            f"<b>Group ID:</b> <code>{group_id}</code>"
+        )
+        await message.reply_text(resp, parse_mode="HTML")
+        logger.info(f"[LOADER_MGMT] Admin #{user.id if user else 'Unknown'} registered Loader Group {group_id} ('{loader_name}').")
+    except Exception as e:
+        logger.exception(f"[LOADER_MGMT] Failed to register loader group {group_id}: {e}")
+        await message.reply_text(f"❌ Failed to add loader group: {e}")
 
 
 async def loader_text_wizard_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
