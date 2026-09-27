@@ -232,11 +232,11 @@ async def deliver_order_by_id(
                     selected_delivery_items = [it]
                     break
 
-    # Build screenshot caption containing ONLY packages delivered in this session (skip if secret profit code caption set)
-    if not order.secret_profit_code and not (caption_text and "\n" in caption_text):
-        delivered_caption_block = format_delivered_packages_caption(selected_delivery_items)
-        if delivered_caption_block and "📦 Delivered Package" not in email_for_caption:
-            email_for_caption = f"{email_for_caption}\n\n{delivered_caption_block}"
+    # Build screenshot caption containing ONLY packages delivered in this session
+    include_price_in_caption = (order.category != "B" and not order.secret_profit_code)
+    delivered_caption_block = format_delivered_packages_caption(selected_delivery_items, include_price=include_price_in_caption)
+    if delivered_caption_block and "📦 Delivered Package" not in email_for_caption:
+        email_for_caption = f"{email_for_caption}\n\n{delivered_caption_block}"
 
     # Auto-save price if missing
     if not order.price:

@@ -9699,6 +9699,38 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Now: 16", summary_text)
         self.assertIn("Total: 66", summary_text)
 
+    async def test_category_b_delivery_caption_exact_format(self):
+        from database import create_order, save_order_pricing, get_order_by_id
+        from utils import format_delivered_packages_caption
+
+        order = await create_order(
+            email="testcatb2@example.com",
+            client_chat_id=-100123456789,
+            package="2400",
+            category="B",
+            status="Completed"
+        )
+        order = await save_order_pricing(order.id)
+        order.secret_profit_code = "V"
+
+        header = f"{order.email}\n{order.secret_profit_code}"
+        items = [{"package": "2400 CP", "qty": 1}]
+        pkg_block = format_delivered_packages_caption(items, include_price=False)
+        full_caption = f"{header}\n\n{pkg_block}"
+
+        expected = (
+            "testcatb2@example.com\n"
+            "V\n\n"
+            "📦 Delivered Package\n\n"
+            "✅ 2400 CP"
+        )
+
+        self.assertEqual(full_caption, expected)
+        self.assertNotIn("Price:", full_caption)
+        self.assertNotIn("Loader Cost", full_caption)
+        self.assertNotIn("Profit", full_caption)
+        self.assertNotIn("Before:", full_caption)
+
     async def test_admin_submits_profit_code_without_double_charging_running_total(self):
         from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_order_by_id, execute_manual_adjustment, get_running_total_current, execute_pay_reset
         from handlers import admin_profit_code_completion_handler, BOT_SETTINGS, AUTH_USERS_CACHE

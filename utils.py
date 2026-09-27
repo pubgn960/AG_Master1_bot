@@ -1457,7 +1457,7 @@ def format_loader_card_summary(progress_data: Any, total_price: Optional[float] 
     return format_package_status_block(progress_data, total_price)
 
 
-def format_delivered_packages_caption(items: Any) -> str:
+def format_delivered_packages_caption(items: Any, include_price: bool = True) -> str:
     """
     Formats the screenshot delivery caption for Client Group displaying ONLY the packages delivered in this session and calculating session total price.
     Example:
@@ -1516,7 +1516,7 @@ def format_delivered_packages_caption(items: Any) -> str:
         else:
             lines.append(f"✅ {pkg_name} CP{qty_str}")
 
-    if not has_unpriced and session_price > 0:
+    if include_price and not has_unpriced and session_price > 0:
         lines.append("")
         t_str = f"{session_price:g}$" if isinstance(session_price, float) else f"{session_price}$"
         lines.append(f"💰 Price: {t_str}")
