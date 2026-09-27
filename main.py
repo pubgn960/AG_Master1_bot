@@ -184,6 +184,8 @@ async def post_init(application: Application) -> None:
         BotCommand("stats", "Statistics"),
         BotCommand("exportprices", "Export Price List"),
         BotCommand("updateprices", "Bulk Update Prices"),
+        BotCommand("setclientprice", "Set Global Client Prices"),
+        BotCommand("setloaderprice", "Set Loader Price List (Reply)"),
         BotCommand("calculate", "Add or Subtract Amount"),
         BotCommand("total", "View Current Total"),
         BotCommand("pay", "Record Payment & Reset Total"),

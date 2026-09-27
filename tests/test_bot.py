@@ -8342,6 +8342,58 @@ class TestSetLoaderPriceReplyBased(unittest.IsolatedAsyncioTestCase):
             h_order_after = await session.get(order.__class__, order.id)
             self.assertEqual(h_order_after.loader_cost_total, saved_loader_cost)
 
+    async def test_setloaderprice_registration_and_menu_visibility(self):
+        from main import build_application, post_init
+        from handlers import help_command
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        dummy_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz123456789"
+        with patch.object(Config, "BOT_TOKEN", dummy_token):
+            app = build_application()
+        registered_commands = []
+        for group_handlers in app.handlers.values():
+            for handler in group_handlers:
+                if hasattr(handler, "commands"):
+                    registered_commands.extend(list(handler.commands))
+
+        self.assertIn("setloaderprice", registered_commands, "setloaderprice CommandHandler must be registered in build_application()")
+
+        # B. /setloaderprice appears in help output
+        class MockHelpMsg:
+            replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        up_help = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_message": MockHelpMsg()
+        })()
+        ctx_help = type("Context", (), {})()
+
+        await help_command(up_help, ctx_help)
+        self.assertIn("/setloaderprice", up_help.effective_message.replied_text, "/setloaderprice must appear in /help output")
+
+        # C. /setloaderprice appears in BotCommand list passed to set_my_commands()
+        mock_bot = AsyncMock()
+        mock_bot.set_my_commands = AsyncMock()
+        app.bot = mock_bot
+
+        with patch("main.init_db", AsyncMock()), \
+             patch("main.reload_bot_settings_cache", AsyncMock()), \
+             patch("main.reload_auth_users_cache", AsyncMock()), \
+             patch("main.reload_loaders_cache", AsyncMock()), \
+             patch("main.check_order_timeouts", AsyncMock(return_value=0)):
+            await post_init(app)
+
+        mock_bot.set_my_commands.assert_called_once()
+        sent_bot_commands = mock_bot.set_my_commands.call_args[0][0]
+        cmd_names = [cmd.command for cmd in sent_bot_commands]
+        self.assertIn("setloaderprice", cmd_names, "setloaderprice must be present in Telegram BotCommand list passed to set_my_commands")
+
 
 if __name__ == "__main__":
     unittest.main()
