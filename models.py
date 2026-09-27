@@ -34,6 +34,7 @@ class Settings(Base):
     delivery_group_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     payment_review_group_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     payment_review_group_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    payment_verification_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

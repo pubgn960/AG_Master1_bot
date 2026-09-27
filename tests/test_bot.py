@@ -8963,6 +8963,175 @@ class TestOrder12FixAndSeedingRegression(unittest.IsolatedAsyncioTestCase):
         pass
 
 
+class TestAdminPaymentVerificationSetting(unittest.IsolatedAsyncioTestCase):
+    """Regression test suite for Admin Payment Verification ON/OFF setting."""
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal, set_payment_verification_status
+        from models import PaymentTransaction
+        from sqlalchemy import delete
+        await init_db()
+        await set_payment_verification_status(True)
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(PaymentTransaction))
+            await session.commit()
+
+    async def test_a_default_setting_is_on_fresh_db(self):
+        from database import get_payment_verification_status, BOT_SETTINGS
+        status = await get_payment_verification_status()
+        self.assertTrue(status, "Default payment verification status MUST be True on fresh DB")
+        self.assertTrue(BOT_SETTINGS.get("payment_verification_enabled"), "BOT_SETTINGS cache MUST have payment_verification_enabled=True")
+
+    async def test_b_c_admin_can_turn_off_and_status(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import paymentverification_command_handler
+        from database import get_payment_verification_status
+
+        admin_update = MagicMock()
+        admin_update.effective_user.id = 1573531032
+        admin_update.effective_message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.args = ["off"]
+
+        await paymentverification_command_handler(admin_update, ctx)
+        admin_update.effective_message.reply_text.assert_called_once()
+        reply = admin_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Payment Verification Disabled", reply)
+        self.assertIn("Payment verification is now OFF.", reply)
+
+        status = await get_payment_verification_status()
+        self.assertFalse(status, "Status must be False after turning OFF")
+
+        # Test status command
+        status_update = MagicMock()
+        status_update.effective_user.id = 1573531032
+        status_update.effective_message.reply_text = AsyncMock()
+        status_ctx = MagicMock()
+        status_ctx.args = ["status"]
+
+        await paymentverification_command_handler(status_update, status_ctx)
+        status_reply = status_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Status: 🔴 OFF", status_reply)
+
+    async def test_d_e_f_payment_message_while_off_is_noop(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import source_group_handler
+        from database import set_payment_verification_status, AsyncSessionLocal, BOT_SETTINGS, get_running_total_current
+        from models import PaymentTransaction
+        from sqlalchemy import select, func
+
+        await set_payment_verification_status(False)
+        chat_id = -100987654321
+        BOT_SETTINGS["source_group_id"] = chat_id
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot.copy_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.bot = mock_bot
+
+        # Payment message containing txid/amount
+        pay_update = MagicMock()
+        pay_update.effective_chat.id = chat_id
+        pay_update.effective_chat.title = "Client Group"
+        pay_update.effective_user.id = 888777666
+        pay_update.effective_user.is_bot = False
+        pay_update.effective_message.message_id = 701
+        pay_update.effective_message.text = "Paid $100 USDT TXID: ABC123XYZ999"
+        pay_update.effective_message.photo = []
+        pay_update.effective_message.document = None
+        pay_update.effective_message.reply_to_message = None
+        pay_update.effective_message.reply_text = AsyncMock()
+
+        rt_before = await get_running_total_current(chat_id=chat_id)
+
+        await source_group_handler(pay_update, ctx)
+
+        # D. PaymentTransaction count must be 0
+        async with AsyncSessionLocal() as session:
+            tx_count = (await session.execute(select(func.count()).select_from(PaymentTransaction))).scalar_one()
+            self.assertEqual(tx_count, 0, "No PaymentTransaction record should be created when OFF")
+
+        # E. No review group messages
+        mock_bot.copy_message.assert_not_called()
+
+        # F. Running balance must be unchanged
+        rt_after = await get_running_total_current(chat_id=chat_id)
+        self.assertEqual(rt_before, rt_after, "Running balance MUST not change when OFF")
+
+    async def test_g_h_i_turn_on_and_payment_workflow(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import paymentverification_command_handler
+        from database import set_payment_verification_status, get_payment_verification_status
+
+        await set_payment_verification_status(False)
+
+        admin_update = MagicMock()
+        admin_update.effective_user.id = 1573531032
+        admin_update.effective_message.reply_text = AsyncMock()
+        ctx = MagicMock()
+        ctx.args = ["on"]
+
+        await paymentverification_command_handler(admin_update, ctx)
+        reply = admin_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Payment Verification Enabled", reply)
+        self.assertIn("Payment verification is now ON.", reply)
+
+        status = await get_payment_verification_status()
+        self.assertTrue(status, "Status MUST be True after turning ON")
+
+    async def test_j_setting_survives_db_reload(self):
+        from database import set_payment_verification_status, reload_bot_settings_cache, get_payment_verification_status, BOT_SETTINGS
+
+        await set_payment_verification_status(False)
+        BOT_SETTINGS.clear()  # Simulate memory flush
+
+        await reload_bot_settings_cache()
+        status = await get_payment_verification_status()
+        self.assertFalse(status, "Setting MUST remain OFF after database reload/restart")
+
+        await set_payment_verification_status(True)
+
+    async def test_k_unauthorized_user_blocked(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import paymentverification_command_handler
+        from database import set_payment_verification_status, get_payment_verification_status
+
+        await set_payment_verification_status(True)
+
+        unauth_update = MagicMock()
+        unauth_update.effective_user.id = 999000111  # Non-admin user
+        unauth_update.effective_message.reply_text = AsyncMock()
+        ctx = MagicMock()
+        ctx.args = ["off"]
+
+        await paymentverification_command_handler(unauth_update, ctx)
+        unauth_update.effective_message.reply_text.assert_called_with("⛔ You are not authorized to use this command.")
+
+        status = await get_payment_verification_status()
+        self.assertTrue(status, "Setting MUST NOT change when unauthorized user invokes command")
+
+    async def test_l_normal_order_flow_unaffected(self):
+        from database import create_order, save_order_pricing, set_payment_verification_status
+        await set_payment_verification_status(False)
+
+        order = await create_order(
+            email="test_normal_off@example.com",
+            client_chat_id=-100111,
+            original_message_id=55,
+            package="2400 CP",
+            status="Pending",
+            category="A"
+        )
+        self.assertIsNotNone(order)
+        priced = await save_order_pricing(order.id)
+        self.assertIsNotNone(priced)
+        self.assertEqual(priced.client_price_total, 16.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

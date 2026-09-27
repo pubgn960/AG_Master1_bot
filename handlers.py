@@ -88,7 +88,9 @@ from database import (
     register_binance_identity,
     get_binance_identity,
     get_user_by_binance_uid,
-    get_all_group_binance_identities
+    get_all_group_binance_identities,
+    get_payment_verification_status,
+    set_payment_verification_status
 )
 from models import Order
 from utils import (
@@ -242,69 +244,70 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.debug(f"[CLIENT] Message {message.message_id} in Client Group has no media or text content.")
         return
 
-    # Check for Client Payment Screenshot / Payment OCR Details
-    pay_info = extract_payment_info(text_content)
-    if pay_info["is_payment"]:
-        amt = pay_info["amount"]
-        tx_id = pay_info["transaction_id"]
-        curr = pay_info.get("currency", "USDT")
+    # Check for Client Payment Screenshot / Payment OCR Details (only if Payment Verification is ENABLED)
+    if BOT_SETTINGS.get("payment_verification_enabled", True):
+        pay_info = extract_payment_info(text_content)
+        if pay_info["is_payment"]:
+            amt = pay_info["amount"]
+            tx_id = pay_info["transaction_id"]
+            curr = pay_info.get("currency", "USDT")
 
-        if amt and amt > Decimal("0") and tx_id:
-            # Verify payment using project verification module
-            is_verified, v_code, v_msg = await verify_payment_transaction(
-                provider="Binance",
-                transaction_id=tx_id,
-                amount=float(amt),
-                currency=curr
-            )
-
-            if is_verified:
-                p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
-                    chat_id=chat.id,
-                    amount=amt,
-                    transaction_id=tx_id,
+            if amt and amt > Decimal("0") and tx_id:
+                # Verify payment using project verification module
+                is_verified, v_code, v_msg = await verify_payment_transaction(
                     provider="Binance",
+                    transaction_id=tx_id,
+                    amount=float(amt),
                     currency=curr
                 )
-                msg_text = format_payment_verification_message(
-                    amount=amt,
-                    tx_id=tx_id,
-                    before_total=before_v,
-                    now_payment=now_v,
-                    running_total=after_v
-                )
+
+                if is_verified:
+                    p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
+                        chat_id=chat.id,
+                        amount=amt,
+                        transaction_id=tx_id,
+                        provider="Binance",
+                        currency=curr
+                    )
+                    msg_text = format_payment_verification_message(
+                        amount=amt,
+                        tx_id=tx_id,
+                        before_total=before_v,
+                        now_payment=now_v,
+                        running_total=after_v
+                    )
+                    await message.reply_text(msg_text, parse_mode="HTML")
+                    return
+                elif v_code == "DUPLICATE_TRANSACTION":
+                    p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
+                        chat_id=chat.id,
+                        amount=amt,
+                        transaction_id=tx_id,
+                        provider="Binance",
+                        currency=curr
+                    )
+                    msg_text = format_payment_verification_message(
+                        amount=amt,
+                        tx_id=tx_id,
+                        before_total=before_v,
+                        now_payment=0.0,
+                        running_total=after_v
+                    )
+                    await message.reply_text(msg_text, parse_mode="HTML")
+                    return
+                elif v_code in ("MISSING_API_CREDENTIALS", "UNVERIFIED", "PENDING"):
+                    msg_text = format_payment_pending_message(amount=amt, tx_id=tx_id)
+                    await message.reply_text(msg_text, parse_mode="HTML")
+                    return
+                else:
+                    msg_text = format_payment_rejected_message(reason=v_msg)
+                    await message.reply_text(msg_text, parse_mode="HTML")
+                    return
+            elif amt and amt > Decimal("0") and not tx_id:
+                # Payment amount present without transaction ID -> Pending Verification (NO balance change)
+                msg_text = format_payment_pending_message(amount=amt, tx_id=None)
                 await message.reply_text(msg_text, parse_mode="HTML")
                 return
-            elif v_code == "DUPLICATE_TRANSACTION":
-                p_tx, before_v, now_v, after_v, is_new, res_code = await process_verified_payment_deduction(
-                    chat_id=chat.id,
-                    amount=amt,
-                    transaction_id=tx_id,
-                    provider="Binance",
-                    currency=curr
-                )
-                msg_text = format_payment_verification_message(
-                    amount=amt,
-                    tx_id=tx_id,
-                    before_total=before_v,
-                    now_payment=0.0,
-                    running_total=after_v
-                )
-                await message.reply_text(msg_text, parse_mode="HTML")
-                return
-            elif v_code in ("MISSING_API_CREDENTIALS", "UNVERIFIED", "PENDING"):
-                msg_text = format_payment_pending_message(amount=amt, tx_id=tx_id)
-                await message.reply_text(msg_text, parse_mode="HTML")
-                return
-            else:
-                msg_text = format_payment_rejected_message(reason=v_msg)
-                await message.reply_text(msg_text, parse_mode="HTML")
-                return
-        elif amt and amt > Decimal("0") and not tx_id:
-            # Payment amount present without transaction ID -> Pending Verification (NO balance change)
-            msg_text = format_payment_pending_message(amount=amt, tx_id=None)
-            await message.reply_text(msg_text, parse_mode="HTML")
-            return
 
     # Check if this customer message is a cancellation request replying to an order message
     if message.reply_to_message:
@@ -4217,7 +4220,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/loaderremove &lt;id&gt;</code> - Delete a Loader\n\n"
         "<b>Payment Review Workflow:</b>\n"
         "• <code>/approve &lt;id&gt;</code> - Approve Category B order & forward to Loader\n"
-        "• <code>/reject &lt;id&gt;</code> - Reject Category B order\n\n"
+        "• <code>/reject &lt;id&gt;</code> - Reject Category B order\n"
+        "• <code>/paymentverification [on|off|status]</code> - Toggle Payment Verification\n\n"
         "<b>User Management:</b>\n"
         "• <code>/user delivery add &lt;id&gt;</code> - Add Delivery User\n"
         "• <code>/user delivery remove &lt;id&gt;</code> - Remove Delivery User\n"
@@ -4253,6 +4257,59 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <code>/resetledger</code> - Reset ledger running total\n"
     )
     await update.effective_message.reply_text(help_msg, parse_mode="HTML")
+
+
+async def paymentverification_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /paymentverification [on|off|status] command for Super Admins.
+    Toggles payment verification feature persistently in database and RAM cache.
+    """
+    if not await check_admin_permission(update):
+        return
+
+    args = context.args or []
+    if not args:
+        prompt = (
+            "⚠️ <b>Usage:</b>\n"
+            "• <code>/paymentverification on</code>\n"
+            "• <code>/paymentverification off</code>\n"
+            "• <code>/paymentverification status</code>"
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="HTML")
+        return
+
+    sub = args[0].lower()
+
+    if sub == "on":
+        await set_payment_verification_status(True)
+        resp = (
+            "✅ <b>Payment Verification Enabled</b>\n\n"
+            "Payment verification is now ON."
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    elif sub == "off":
+        await set_payment_verification_status(False)
+        resp = (
+            "🔴 <b>Payment Verification Disabled</b>\n\n"
+            "Payment verification is now OFF."
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    elif sub == "status":
+        is_on = await get_payment_verification_status()
+        status_str = "🟢 ON" if is_on else "🔴 OFF"
+        resp = (
+            f"💳 <b>Payment Verification</b>\n"
+            f"Status: {status_str}"
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    else:
+        prompt = (
+            "⚠️ <b>Usage:</b>\n"
+            "• <code>/paymentverification on</code>\n"
+            "• <code>/paymentverification off</code>\n"
+            "• <code>/paymentverification status</code>"
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="HTML")
 
 
 async def removesource_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

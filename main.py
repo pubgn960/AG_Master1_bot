@@ -51,6 +51,7 @@ from handlers import (
     category_check_command,
     remove_category_command,
     paymentgroup_command,
+    paymentverification_command_handler,
     approve_order_command,
     reject_order_command,
     loaderadd_command,
@@ -180,6 +181,7 @@ async def post_init(application: Application) -> None:
         BotCommand("source", "Set Client Group"),
         BotCommand("delivery", "Set Loader Group"),
         BotCommand("paymentgroup", "Set Payment Review Group"),
+        BotCommand("paymentverification", "Toggle Payment Verification"),
         BotCommand("a", "Set Category A"),
         BotCommand("b", "Set Category B"),
         BotCommand("category", "View Group Category"),
@@ -255,6 +257,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("source", source_command))
     application.add_handler(CommandHandler("delivery", delivery_command))
     application.add_handler(CommandHandler("paymentgroup", paymentgroup_command))
+    application.add_handler(CommandHandler("paymentverification", paymentverification_command_handler))
     application.add_handler(CommandHandler(["a", "A"], category_a_command))
     application.add_handler(CommandHandler(["b", "B"], category_b_command))
     application.add_handler(CommandHandler("category", category_check_command))
