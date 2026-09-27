@@ -1039,7 +1039,7 @@ class TestDeliverySessionRouting(unittest.TestCase):
         self.assertIn("📦 Delivered Package(s)", caption)
         self.assertIn("✅ 10800 CP", caption)
         self.assertIn("✅ 5040 CP", caption)
-        self.assertIn("💰 Price: 97$", caption)
+        self.assertIn("💰 Price: 98.5$", caption)
         self.assertNotIn("2400", caption)
 
         # 2. Mark progress as delivered
@@ -1827,7 +1827,7 @@ class TestDeliveryLedgerSystem(unittest.IsolatedAsyncioTestCase):
         mock_bot.send_message.assert_called_once()
         call_kwargs = mock_bot.send_message.call_args.kwargs
         self.assertEqual(call_kwargs["chat_id"], -100999)
-        self.assertEqual(call_kwargs["text"], "Before 0$\nNow 64$\nTotal 64$")
+        self.assertEqual(call_kwargs["text"], "Before 0$\nNow 65.5$\nTotal 65.5$")
 
         last_e = await get_last_ledger_entry()
         self.assertIsNotNone(last_e)
@@ -1855,11 +1855,11 @@ class TestDeliveryLedgerSystem(unittest.IsolatedAsyncioTestCase):
 
         val, known = calculate_delivered_packages_value("10800+5040")
         self.assertTrue(known)
-        self.assertEqual(val, 97.0)
+        self.assertEqual(val, 98.5)
 
         e, ok = await record_delivery_ledger_entry(order_id=102, package="10800+5040", now_value=val, loader_name="Loader B", dedup_hash="102:multi:1")
         self.assertTrue(ok)
-        self.assertEqual(e.now_value, 97.0)
+        self.assertEqual(e.now_value, 98.5)
 
     async def test_duplicate_delivery_blocked(self):
         from database import record_delivery_ledger_entry
@@ -2209,32 +2209,32 @@ class TestSimpleRunningTotalSystem(unittest.IsolatedAsyncioTestCase):
 
         val, ok = calculate_delivered_packages_value("5040+2400")
         self.assertTrue(ok)
-        self.assertEqual(val, 49.5)
+        self.assertEqual(val, 49.0)
 
         e, _ = await record_delivery_ledger_entry(order_id=702, package="5040+2400", now_value=val, dedup_hash="pd_multi")
-        self.assertEqual(e.now_value, 49.5)
+        self.assertEqual(e.now_value, 49.0)
 
     async def test_second_and_third_partial_delivery_exact_now_values(self):
         from utils import parse_test_order_packages, mark_selected_packages_delivered, calculate_delivered_packages_value
         from database import record_delivery_ledger_entry, get_running_total_current
 
-        # Order: 10800 + 5040 + 2400 (Prices: 64$, 33$, 16.5$ -> Total: 113.5$)
+        # Order: 10800 + 5040 + 2400 (Prices: 65.5$, 33$, 16$ -> Total: 114.5$)
         parsed = parse_test_order_packages("10800+5040+2400")
         items = parsed["packages"]
 
-        # Step 1: First delivery (10800 + 2400) -> Now: 80.5$, Before: 0$, Total: 80.5$
+        # Step 1: First delivery (10800 + 2400) -> Now: 81.5$, Before: 0$, Total: 81.5$
         sel1 = [{"package": "10800"}, {"package": "2400"}]
         updated1, is_all1, _ = mark_selected_packages_delivered(items, loader_id=1, selected_items=sel1)
         val1, ok1 = calculate_delivered_packages_value("10800+2400")
         self.assertTrue(ok1)
-        self.assertEqual(val1, 80.5)
+        self.assertEqual(val1, 81.5)
 
         e1, _ = await record_delivery_ledger_entry(order_id=801, package="10800+2400", now_value=val1, dedup_hash="ex_1")
         self.assertEqual(e1.before_total, 0.0)
-        self.assertEqual(e1.now_value, 80.5)
-        self.assertEqual(e1.running_total, 80.5)
+        self.assertEqual(e1.now_value, 81.5)
+        self.assertEqual(e1.running_total, 81.5)
 
-        # Step 2: Second delivery (5040) -> Now: 33$, Before: 80.5$, Total: 113.5$
+        # Step 2: Second delivery (5040) -> Now: 33$, Before: 81.5$, Total: 114.5$
         sel2 = [{"package": "5040"}]
         updated2, is_all2, _ = mark_selected_packages_delivered(updated1, loader_id=1, selected_items=sel2)
         val2, ok2 = calculate_delivered_packages_value("5040")
@@ -2242,10 +2242,10 @@ class TestSimpleRunningTotalSystem(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(val2, 33.0)
 
         e2, _ = await record_delivery_ledger_entry(order_id=801, package="5040", now_value=val2, dedup_hash="ex_2")
-        self.assertEqual(e2.before_total, 80.5)
+        self.assertEqual(e2.before_total, 81.5)
         self.assertEqual(e2.now_value, 33.0)
-        self.assertEqual(e2.running_total, 113.5)
-        self.assertEqual(await get_running_total_current(), 113.5)
+        self.assertEqual(e2.running_total, 114.5)
+        self.assertEqual(await get_running_total_current(), 114.5)
 
 
 class TestMultiPackageSelectionRegression(unittest.TestCase):
@@ -2326,7 +2326,7 @@ class TestMultiPackageSelectionRegression(unittest.TestCase):
 
         total_price, ok = calculate_delivered_packages_value(pkg_str)
         self.assertTrue(ok)
-        self.assertEqual(total_price, 97.0)
+        self.assertEqual(total_price, 98.5)
 
 
 class TestSuperAdminLogicPermissionsAndOrderBypass(unittest.IsolatedAsyncioTestCase):
@@ -2673,14 +2673,14 @@ class TestPackageMultiplierExpansionEngine(unittest.IsolatedAsyncioTestCase):
         pkg_str_1 = "+".join([it["package"] for it in selected_1])
         price_1, ok1 = calculate_delivered_packages_value(pkg_str_1)
         self.assertTrue(ok1)
-        self.assertEqual(price_1, 128.0)
+        self.assertEqual(price_1, 131.0)
 
         entry_1, ok_l1 = await record_delivery_ledger_entry(order_id=1, package=pkg_str_1, now_value=price_1)
         self.assertTrue(ok_l1)
         self.assertEqual(entry_1.before_total, 0.0)
-        self.assertEqual(entry_1.now_value, 128.0)
-        self.assertEqual(entry_1.running_total, 128.0)
-        self.assertEqual(await get_running_total_current(), 128.0)
+        self.assertEqual(entry_1.now_value, 131.0)
+        self.assertEqual(entry_1.running_total, 131.0)
+        self.assertEqual(await get_running_total_current(), 131.0)
 
         # 2. Second Delivery: Loader selects remaining 1 of 10800
         pending_idx = [i for i, it in enumerate(updated_items_1) if it.get("status") == "Pending"][0]
@@ -2698,14 +2698,14 @@ class TestPackageMultiplierExpansionEngine(unittest.IsolatedAsyncioTestCase):
         pkg_str_2 = "+".join([it["package"] for it in selected_2])
         price_2, ok2 = calculate_delivered_packages_value(pkg_str_2)
         self.assertTrue(ok2)
-        self.assertEqual(price_2, 64.0)
+        self.assertEqual(price_2, 65.5)
 
         entry_2, ok_l2 = await record_delivery_ledger_entry(order_id=1, package=pkg_str_2, now_value=price_2)
         self.assertTrue(ok_l2)
-        self.assertEqual(entry_2.before_total, 128.0)
-        self.assertEqual(entry_2.now_value, 64.0)
-        self.assertEqual(entry_2.running_total, 192.0)
-        self.assertEqual(await get_running_total_current(), 192.0)
+        self.assertEqual(entry_2.before_total, 131.0)
+        self.assertEqual(entry_2.now_value, 65.5)
+        self.assertEqual(entry_2.running_total, 196.5)
+        self.assertEqual(await get_running_total_current(), 196.5)
 
 
 class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
@@ -8775,6 +8775,192 @@ class TestRealOrderPricingIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.loader_cost_total, 37.0)
         self.assertEqual(updated.profit_amount, 12.0)
         self.assertEqual(updated.secret_profit_code, "H")
+
+
+class TestOrder12FixAndSeedingRegression(unittest.IsolatedAsyncioTestCase):
+    """
+    Comprehensive regression tests for Order #12 pricing fix:
+      1. Empty table startup seeding populates global_client_prices from PRODUCT_CATALOG.
+      2. Custom price protection: seed_and_load_global_client_prices does not overwrite custom prices.
+      3. Catalog fallback: get_global_client_price and _get_global_client_price_for_package return 16.0 even when cache is unpopulated.
+      4. $16 / $12 / $4 / X calculation in calculate_order_pricing and save_order_pricing.
+      5. Real Category A order-to-delivery workflow: $16 ledger increment, running total update, and deduplication.
+    """
+
+    async def asyncSetUp(self):
+        from database import AsyncSessionLocal, init_db, GlobalClientPrice, LoaderPrice, Loader, GLOBAL_CLIENT_PRICES_CACHE, LOADER_PRICES_CACHE, LOADERS_CACHE
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+
+    async def asyncTearDown(self):
+        from database import AsyncSessionLocal, GlobalClientPrice, LoaderPrice, Loader, GLOBAL_CLIENT_PRICES_CACHE, LOADER_PRICES_CACHE, LOADERS_CACHE
+        from sqlalchemy import delete
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+
+    async def test_empty_table_startup_seeding(self):
+        from database import seed_and_load_global_client_prices, GLOBAL_CLIENT_PRICES_CACHE, get_all_global_client_prices_from_db
+        from product_catalog import PRODUCT_CATALOG
+
+        cache = await seed_and_load_global_client_prices()
+        self.assertEqual(len(cache), len(PRODUCT_CATALOG))
+        self.assertIn("cp_2400", cache)
+        self.assertEqual(cache["cp_2400"]["price"], 16.0)
+
+        db_rows = await get_all_global_client_prices_from_db()
+        self.assertEqual(len(db_rows), len(PRODUCT_CATALOG))
+
+    async def test_custom_price_protection_during_seeding(self):
+        from database import seed_and_load_global_client_prices, set_global_client_price
+        await set_global_client_price("cp_2400", 18.0)
+
+        cache = await seed_and_load_global_client_prices()
+        self.assertEqual(cache["cp_2400"]["price"], 18.0, "Seeding MUST NOT overwrite existing custom price!")
+
+    async def test_catalog_fallback_priority(self):
+        from database import get_global_client_price, GLOBAL_CLIENT_PRICES_CACHE
+        from utils import _get_global_client_price_for_package
+
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+        price1 = await get_global_client_price("cp_2400")
+        self.assertEqual(price1, 16.0)
+
+        price2 = _get_global_client_price_for_package("2400 CP")
+        self.assertEqual(price2, 16.0)
+
+    async def test_order_12_exact_financial_calculation(self):
+        from database import (
+            add_loader,
+            set_loader_price,
+            reload_loaders_cache,
+            reload_loader_prices_cache,
+            create_order,
+            set_order_loader_message_id,
+            save_order_pricing,
+            seed_and_load_global_client_prices
+        )
+
+        await seed_and_load_global_client_prices()
+
+        loader_group_id = -1004475489329
+        loader = await add_loader(group_id=loader_group_id, loader_name="Order 12 Loader")
+        await reload_loaders_cache()
+        await set_loader_price(loader_id=loader.id, product_key="cp_2400", cost=12.0)
+        await reload_loader_prices_cache()
+
+        order_text = (
+            "Email: testprofit12@example.com\n"
+            "Password: Test12345\n"
+            "Package: 2400 CP"
+        )
+        order = await create_order(
+            email="testprofit12@example.com",
+            client_chat_id=-100123456789,
+            original_message_id=99912,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text=order_text
+        )
+        await set_order_loader_message_id(order.id, 88812, loader_group_id=loader_group_id)
+
+        priced_ord = await save_order_pricing(order.id)
+        self.assertIsNotNone(priced_ord)
+        self.assertEqual(priced_ord.client_price_total, 16.0, "Client price total MUST be $16.0")
+        self.assertEqual(priced_ord.loader_cost_total, 12.0, "Loader cost total MUST be $12.0")
+        self.assertEqual(priced_ord.profit_amount, 4.0, "Profit amount MUST be $4.0")
+        self.assertEqual(priced_ord.secret_profit_code, "X", "Secret profit code MUST be 'X'")
+
+    async def test_order_12_delivery_workflow_and_ledger_dedup(self):
+        from database import (
+            add_loader,
+            set_loader_price,
+            reload_loaders_cache,
+            reload_loader_prices_cache,
+            create_order,
+            set_order_loader_message_id,
+            seed_and_load_global_client_prices,
+            get_running_total_current,
+            get_latest_ledger_entries
+        )
+        from handlers import process_delivery_ledger_event
+
+        await seed_and_load_global_client_prices()
+
+        loader_group_id = -1004475489329
+        loader = await add_loader(group_id=loader_group_id, loader_name="Order 12 Delivery Loader")
+        await reload_loaders_cache()
+        await set_loader_price(loader_id=loader.id, product_key="cp_2400", cost=12.0)
+        await reload_loader_prices_cache()
+
+        order = await create_order(
+            email="testdelivery12@example.com",
+            client_chat_id=-100123456789,
+            original_message_id=99913,
+            package="2400 CP",
+            status="Pending",
+            category="A",
+            raw_text="Email: testdelivery12@example.com\nPackage: 2400 CP"
+        )
+        await set_order_loader_message_id(order.id, 88813, loader_group_id=loader_group_id)
+
+        rt_before = await get_running_total_current(chat_id=loader_group_id)
+
+        mock_bot = type("Bot", (), {
+            "send_message": self._async_noop,
+            "send_photo": self._async_noop,
+            "copy_message": self._async_noop
+        })()
+
+        # First delivery event: Ledger increment $16
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name=loader.loader_name,
+            bot=mock_bot,
+            chat_id=loader_group_id,
+            dedup_hash=f"dedup_ord12_{order.id}",
+            reply_to_message_id=88813
+        )
+
+        rt_after = await get_running_total_current(chat_id=loader_group_id)
+        self.assertEqual(rt_after - rt_before, 16.0, "Running total MUST increment by exact $16.0 (not $16.5)")
+
+        entries = await get_latest_ledger_entries(limit=1)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].now_value, 16.0)
+
+        # Duplicate delivery event: must NOT record duplicate ledger entry
+        await process_delivery_ledger_event(
+            order_id=order.id,
+            package_str="2400 CP",
+            loader_name=loader.loader_name,
+            bot=mock_bot,
+            chat_id=loader_group_id,
+            dedup_hash=f"dedup_ord12_{order.id}",
+            reply_to_message_id=88813
+        )
+
+        rt_dup = await get_running_total_current(chat_id=loader_group_id)
+        self.assertEqual(rt_dup, rt_after, "Duplicate delivery MUST NOT increment running total!")
+
+    async def _async_noop(self, *args, **kwargs):
+        pass
 
 
 if __name__ == "__main__":

@@ -200,7 +200,7 @@ async def init_db() -> None:
     await reload_bot_settings_cache()
     await reload_loaders_cache()
     await seed_and_load_package_prices()
-    await reload_global_client_prices_cache()
+    await seed_and_load_global_client_prices()
     await reload_loader_prices_cache()
 
 
@@ -1893,6 +1893,38 @@ async def reload_loader_prices_cache(loader_id: Optional[int] = None) -> Dict[in
     return LOADER_PRICES_CACHE
 
 
+async def seed_and_load_global_client_prices() -> Dict[str, Dict[str, Any]]:
+    """
+    Seeds global client prices into DB from PRODUCT_CATALOG reference prices if table is empty.
+    Never overwrites existing custom prices.
+    Reloads in-memory GLOBAL_CLIENT_PRICES_CACHE directly from database upon completion.
+    """
+    from product_catalog import PRODUCT_CATALOG
+    async with AsyncSessionLocal() as session:
+        stmt = select(GlobalClientPrice)
+        res = await session.execute(stmt)
+        existing_prices = list(res.scalars().all())
+
+        if not existing_prices:
+            now = datetime.now(timezone.utc)
+            for pkey, item in PRODUCT_CATALOG.items():
+                ref_p = item.get("reference_price")
+                if ref_p is not None:
+                    session.add(GlobalClientPrice(
+                        product_key=pkey,
+                        display_name=item.get("display_name") or pkey.replace("_", " ").upper(),
+                        package_type=item.get("package_type") or "normal_cp",
+                        price=float(ref_p),
+                        currency=item.get("currency") or "USD",
+                        active=True,
+                        updated_at=now
+                    ))
+            await session.commit()
+            logger.info(f"[GLOBAL_PRICE_DB] Seeded {len(PRODUCT_CATALOG)} default global client prices into database.")
+
+    return await reload_global_client_prices_cache()
+
+
 async def get_all_global_client_prices_from_db() -> List[GlobalClientPrice]:
     """Retrieves all GlobalClientPrice records from DB."""
     async with AsyncSessionLocal() as session:
@@ -1904,17 +1936,24 @@ async def get_all_global_client_prices_from_db() -> List[GlobalClientPrice]:
 async def get_global_client_price(product_key: str) -> Optional[float]:
     """
     Retrieves the global client price for a specific product_key.
-    Checks RAM cache first, falls back to DB query.
-    Returns float price or None if not found.
+    Prioritizes active custom DB/cache price, then PRODUCT_CATALOG reference_price, otherwise None.
     """
     pkey = product_key.strip().lower()
-    if pkey in GLOBAL_CLIENT_PRICES_CACHE:
-        return GLOBAL_CLIENT_PRICES_CACHE[pkey].get("price")
+    if pkey in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE[pkey].get("active") is not False:
+        cached_val = GLOBAL_CLIENT_PRICES_CACHE[pkey].get("price")
+        if cached_val is not None:
+            return float(cached_val)
+
     async with AsyncSessionLocal() as session:
         stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey, GlobalClientPrice.active == True)
         item = (await session.execute(stmt)).scalar_one_or_none()
-        if item:
-            return item.price
+        if item and item.price is not None:
+            return float(item.price)
+
+    from product_catalog import PRODUCT_CATALOG
+    if pkey in PRODUCT_CATALOG and PRODUCT_CATALOG[pkey].get("reference_price") is not None:
+        return float(PRODUCT_CATALOG[pkey]["reference_price"])
+
     return None
 
 

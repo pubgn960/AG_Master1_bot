@@ -841,11 +841,19 @@ def _get_global_client_price_for_package(pkg_name: Optional[str], category: str 
             canonical_pkg.lower(),
             raw_str.lower()
         ]
+        # 1. Active custom DB/cache price
         if GLOBAL_CLIENT_PRICES_CACHE:
             for key in candidate_keys:
                 if key in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE.get(key, {}).get("price") is not None:
                     return float(GLOBAL_CLIENT_PRICES_CACHE[key]["price"])
 
+        # 2. PRODUCT_CATALOG reference price (takes precedence over legacy PACKAGE_PRICES)
+        from product_catalog import PRODUCT_CATALOG
+        for key in candidate_keys:
+            if key in PRODUCT_CATALOG and PRODUCT_CATALOG[key].get("reference_price") is not None:
+                return float(PRODUCT_CATALOG[key]["reference_price"])
+
+        # 3. Legacy category package prices map fallback
         cat_map = PACKAGE_PRICES_CAT_B if (category or "A").upper() == "B" else PACKAGE_PRICES_CAT_A
         if canonical_pkg in cat_map:
             return float(cat_map[canonical_pkg])
@@ -853,11 +861,6 @@ def _get_global_client_price_for_package(pkg_name: Optional[str], category: str 
             return float(cat_map[num_raw])
         if raw_str in cat_map:
             return float(cat_map[raw_str])
-
-        from product_catalog import PRODUCT_CATALOG
-        for key in candidate_keys:
-            if key in PRODUCT_CATALOG and PRODUCT_CATALOG[key].get("reference_price") is not None:
-                return float(PRODUCT_CATALOG[key]["reference_price"])
     except Exception:
         pass
     return None
