@@ -9132,6 +9132,170 @@ class TestAdminPaymentVerificationSetting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(priced.client_price_total, 16.0)
 
 
+class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase):
+    """Regression test suite for Manual Running Total Adjustments (+200, -200, -12.5, group ID safety, authorization)."""
+
+    async def asyncSetUp(self):
+        from database import init_db, execute_pay_reset, AUTH_USERS_CACHE
+        from handlers import LOADER_ADD_SESSION, PRICE_INPUT_SESSION
+        await init_db()
+        super_admin_id = 1573531032
+        AUTH_USERS_CACHE[super_admin_id] = "admin"
+        LOADER_ADD_SESSION.clear()
+        PRICE_INPUT_SESSION.clear()
+        await execute_pay_reset(admin_id=super_admin_id, chat_id=-100998877)
+
+    async def test_a_positive_200_adjustment(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import manual_running_total_text_handler
+        from database import execute_manual_adjustment, get_running_total_current
+
+        super_admin_id = 1573531032
+        chat_id = -100998877
+
+        # Set initial running total to 1000$
+        await execute_manual_adjustment(1000.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 1000.0)
+
+        # Authorized user sends +200
+        update = MagicMock()
+        update.effective_user.id = super_admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "+200"
+        update.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update, None)
+        update.effective_message.reply_text.assert_called_once()
+        reply_text = update.effective_message.reply_text.call_args[0][0]
+
+        self.assertIn("Before\n1000$", reply_text)
+        self.assertIn("Now\n+200$", reply_text)
+        self.assertIn("Total\n1200$", reply_text)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 1200.0)
+
+    async def test_b_negative_200_adjustment(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import manual_running_total_text_handler
+        from database import execute_manual_adjustment, get_running_total_current, execute_pay_reset
+
+        super_admin_id = 1573531032
+        chat_id = -100998877
+
+        # Scenario 1: Before 1000$, Now -200$, Total 800$
+        await execute_manual_adjustment(1000.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 1000.0)
+
+        update1 = MagicMock()
+        update1.effective_user.id = super_admin_id
+        update1.effective_chat.id = chat_id
+        update1.effective_message.text = "-200"
+        update1.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update1, None)
+        update1.effective_message.reply_text.assert_called_once()
+        reply1 = update1.effective_message.reply_text.call_args[0][0]
+
+        self.assertIn("Before\n1000$", reply1)
+        self.assertIn("Now\n-200$", reply1)
+        self.assertIn("Total\n800$", reply1)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 800.0)
+
+        # Scenario 2: Before 250$, Now -200$, Total 50$
+        await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(250.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 250.0)
+
+        update2 = MagicMock()
+        update2.effective_user.id = super_admin_id
+        update2.effective_chat.id = chat_id
+        update2.effective_message.text = "-200"
+        update2.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update2, None)
+        update2.effective_message.reply_text.assert_called_once()
+        reply2 = update2.effective_message.reply_text.call_args[0][0]
+
+        self.assertIn("Before\n250$", reply2)
+        self.assertIn("Now\n-200$", reply2)
+        self.assertIn("Total\n50$", reply2)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 50.0)
+
+    async def test_c_negative_decimal_adjustment(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import manual_running_total_text_handler
+        from database import execute_manual_adjustment, get_running_total_current, execute_pay_reset
+
+        super_admin_id = 1573531032
+        chat_id = -100998877
+
+        # Before 100$, Now -12.5$, Total 87.5$
+        await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(100.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 100.0)
+
+        update = MagicMock()
+        update.effective_user.id = super_admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "-12.5"
+        update.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update, None)
+        update.effective_message.reply_text.assert_called_once()
+        reply = update.effective_message.reply_text.call_args[0][0]
+
+        self.assertIn("Before\n100$", reply)
+        self.assertIn("Now\n-12.5$", reply)
+        self.assertIn("Total\n87.5$", reply)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 87.5)
+
+    async def test_d_telegram_group_id_is_not_treated_as_balance_adjustment(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import manual_running_total_text_handler
+        from database import execute_manual_adjustment, get_running_total_current, execute_pay_reset
+
+        super_admin_id = 1573531032
+        chat_id = -100998877
+
+        await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(500.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0)
+
+        # Telegram Group ID input
+        update = MagicMock()
+        update.effective_user.id = super_admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "-1004475489329"
+        update.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update, None)
+        update.effective_message.reply_text.assert_not_called()
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0, "Telegram Group ID MUST NOT alter running total!")
+
+    async def test_e_unauthorized_user_blocked(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import manual_running_total_text_handler
+        from database import execute_manual_adjustment, get_running_total_current, execute_pay_reset
+
+        super_admin_id = 1573531032
+        unauth_user_id = 999888777
+        chat_id = -100998877
+
+        await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(500.0, admin_id=super_admin_id, chat_id=chat_id)
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0)
+
+        # Non-super-admin tries to adjust -200
+        update = MagicMock()
+        update.effective_user.id = unauth_user_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "-200"
+        update.effective_message.reply_text = AsyncMock()
+
+        await manual_running_total_text_handler(update, None)
+        update.effective_message.reply_text.assert_not_called()
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0, "Unauthorized user MUST NOT alter running total!")
+
+
 if __name__ == "__main__":
     unittest.main()
 
