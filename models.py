@@ -173,6 +173,7 @@ class Order(Base):
     loader_cost_total: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     secret_profit_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    client_delivered_msg_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, index=True)
 
     # Relationship to images ordered by position
     images: Mapped[List["Image"]] = relationship(

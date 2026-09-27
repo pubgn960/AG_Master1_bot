@@ -4592,15 +4592,10 @@ async def admin_profit_code_completion_handler(update: Update, context: ContextT
         await message.reply_text(f"❌ Failed to complete Order #{target_order.id}: {status_code}")
         return True
 
-    # 3. Trigger image delivery / caption update in Client Group so caption displays Email & Profit Code under delivery image
+    # 3. Trigger caption update in Client Group so caption displays Email & Profit Code under existing delivery image
     try:
-        from delivery import deliver_order_by_id
-        await deliver_order_by_id(
-            bot=context.bot,
-            order_id=completed_order.id,
-            caption_text=f"{completed_order.email}\n{profit_code}",
-            allow_completed=True
-        )
+        from delivery import update_client_group_delivery_caption
+        await update_client_group_delivery_caption(completed_order, context.bot)
     except Exception as e_del:
         logger.warning(f"[PROFIT_CODE] Caption update for Order #{completed_order.id} encountered notice: {e_del}")
 

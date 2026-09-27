@@ -120,7 +120,8 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
             ("client_price_total", "FLOAT"),
             ("loader_cost_total", "FLOAT"),
             ("profit_amount", "FLOAT"),
-            ("secret_profit_code", "VARCHAR(100)")
+            ("secret_profit_code", "VARCHAR(100)"),
+            ("client_delivered_msg_id", bigint_type)
         ]
         for col_name, col_type in columns_to_add:
             if col_name.lower() not in existing_columns:
@@ -3786,5 +3787,16 @@ async def complete_category_b_order_with_profit_code(
         existing_ledger = (await session.execute(stmt_l)).scalars().first()
 
         return order, existing_ledger, True, "SUCCESS"
+
+
+async def update_order_client_delivered_msg_id(order_id: int, msg_id: int) -> None:
+    """Updates client_delivered_msg_id for an order in database."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Order).where(Order.id == order_id)
+        res = await session.execute(stmt)
+        ord_obj = res.scalar_one_or_none()
+        if ord_obj:
+            ord_obj.client_delivered_msg_id = msg_id
+            await session.commit()
 
 

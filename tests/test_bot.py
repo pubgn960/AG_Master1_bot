@@ -9731,6 +9731,41 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Profit", full_caption)
         self.assertNotIn("Before:", full_caption)
 
+    async def test_update_client_group_delivery_caption_edits_existing_message(self):
+        from database import create_order, save_order_pricing, update_order_client_delivered_msg_id, get_order_by_id
+        from delivery import update_client_group_delivery_caption
+        from unittest.mock import AsyncMock, MagicMock
+
+        chat_id = -100123456789
+        order = await create_order(
+            email="testcatb3@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Delivered"
+        )
+        order = await save_order_pricing(order.id)
+        order.secret_profit_code = "V"
+        await update_order_client_delivered_msg_id(order.id, 54321)
+
+        refreshed_order = await get_order_by_id(order.id)
+        refreshed_order.secret_profit_code = "V"
+        self.assertEqual(refreshed_order.client_delivered_msg_id, 54321)
+
+        mock_bot = MagicMock()
+        mock_bot.edit_message_caption = AsyncMock()
+
+        success = await update_client_group_delivery_caption(refreshed_order, mock_bot)
+        self.assertTrue(success)
+
+        mock_bot.edit_message_caption.assert_called_once()
+        call_kwargs = mock_bot.edit_message_caption.call_args[1]
+        self.assertEqual(call_kwargs["chat_id"], chat_id)
+        self.assertEqual(call_kwargs["message_id"], 54321)
+        self.assertIn("testcatb3@example.com\nV", call_kwargs["caption"])
+        self.assertIn("📦 Delivered Package", call_kwargs["caption"])
+        self.assertIn("✅ 2400 CP", call_kwargs["caption"])
+
     async def test_admin_submits_profit_code_without_double_charging_running_total(self):
         from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_order_by_id, execute_manual_adjustment, get_running_total_current, execute_pay_reset
         from handlers import admin_profit_code_completion_handler, BOT_SETTINGS, AUTH_USERS_CACHE

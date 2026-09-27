@@ -29,7 +29,8 @@ from database import (
     update_order_price,
     update_order_package_progress,
     get_delivery_session_by_msg_id,
-    close_delivery_session
+    close_delivery_session,
+    update_order_client_delivered_msg_id
 )
 from models import Order, Image
 from utils import (
@@ -290,6 +291,10 @@ async def deliver_order_by_id(
             delivered_count += len(batch)
             if len(sent) > 0:
                 last_sent_customer_msg_id = sent[0].message_id
+                try:
+                    await update_order_client_delivered_msg_id(order.id, sent[0].message_id)
+                except Exception as e_save_msg:
+                    logger.warning(f"[DELIVERY] Failed to save client_delivered_msg_id for Order #{order.id}: {e_save_msg}")
 
     # Save previously delivered package counts BEFORE marking progress
     prev_delivered_counts = {}
@@ -521,3 +526,53 @@ async def deliver_images_for_email(
             success = True
 
     return success
+
+
+async def update_client_group_delivery_caption(order: Order, bot: Any) -> bool:
+    """
+    Edits the caption of the ALREADY DELIVERED photo message in the Client Group
+    to include the secret profit code (e.g. email\nsecret_code\n\n📦 Delivered Package\n✅ 2400 CP).
+    """
+    if not order or not order.client_delivered_msg_id:
+        logger.warning(f"[PROFIT_CODE] Cannot edit delivery caption for Order #{getattr(order, 'id', 'N/A')}: client_delivered_msg_id is missing.")
+        return False
+
+    client_chat_id = order.client_chat_id or BOT_SETTINGS.get("source_group_id")
+    if not client_chat_id:
+        logger.warning(f"[PROFIT_CODE] Client Group ID not found for Order #{order.id}.")
+        return False
+
+    # Format delivered package block without price line
+    progress_items = []
+    if order.package_progress:
+        try:
+            progress_items = json.loads(order.package_progress)
+        except Exception:
+            progress_items = []
+
+    if not progress_items and order.package:
+        parsed_pkg = parse_test_order_packages(order.package)
+        if parsed_pkg:
+            progress_items = [
+                {"package": item["package"], "qty": item["qty"], "unit_price": item["unit_price"], "status": "Delivered"}
+                for item in parsed_pkg["packages"]
+            ]
+
+    delivered_caption_block = format_delivered_packages_caption(progress_items, include_price=False)
+    header = f"{order.email}\n{order.secret_profit_code}" if order.secret_profit_code else order.email
+    if delivered_caption_block:
+        full_caption = f"{header}\n\n{delivered_caption_block}"
+    else:
+        full_caption = header
+
+    try:
+        await bot.edit_message_caption(
+            chat_id=client_chat_id,
+            message_id=order.client_delivered_msg_id,
+            caption=full_caption
+        )
+        logger.info(f"[PROFIT_CODE] Successfully edited Client Group delivery caption for Order #{order.id} (msg {order.client_delivered_msg_id}).")
+        return True
+    except Exception as e:
+        logger.exception(f"[PROFIT_CODE] Failed to edit Client Group delivery caption for Order #{order.id} (msg {order.client_delivered_msg_id}): {e}")
+        return False
