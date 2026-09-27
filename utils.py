@@ -638,17 +638,15 @@ def format_delivery_summary_message(
     running_total: Union[Decimal, float, int, str]
 ) -> str:
     """
-    Formats complete Delivery Summary message according to Step 7 requirements:
+    Formats complete Delivery Summary message:
 
-    📧 customer@email.com
-    💵 Client Price: $137
-    🔐 Profit: X
+    Price: $16
+    V
 
-    Before: 875
-    Now: 137
-    Total: 1012
+    Before: 50
+    Now: 16
+    Total: 66
     """
-    email_str = (email or "customer@email.com").strip()
     c_price_str = _fmt_price_val(client_price)
     code_str = secret_code if secret_code else "N/A"
     b_str = _fmt_price_val(before_total)
@@ -656,9 +654,8 @@ def format_delivery_summary_message(
     t_str = _fmt_price_val(running_total)
 
     return (
-        f"📧 {email_str}\n"
-        f"💵 Client Price: ${c_price_str}\n"
-        f"🔐 Profit: {code_str}\n\n"
+        f"Price: ${c_price_str}\n"
+        f"{code_str}\n\n"
         f"Before: {b_str}\n"
         f"Now: {n_str}\n"
         f"Total: {t_str}"

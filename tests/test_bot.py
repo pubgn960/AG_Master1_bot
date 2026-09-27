@@ -6061,9 +6061,10 @@ class TestStep7DeliveryAlbumGroupingAndSummary(unittest.IsolatedAsyncioTestCase)
             now_value=137.0,
             running_total=1012.0
         )
-        self.assertIn("📧 cust1@gmail.com", msg)
-        self.assertIn("💵 Client Price: $137", msg)
-        self.assertIn("🔐 Profit: X", msg)
+        self.assertIn("Price: $137", msg)
+        self.assertIn("X", msg)
+        self.assertNotIn("cust1@gmail.com", msg)
+        self.assertNotIn("Profit:", msg)
         self.assertIn("Before: 875", msg)
         self.assertIn("Now: 137", msg)
         self.assertIn("Total: 1012", msg)
@@ -6217,8 +6218,9 @@ class TestStep7DeliveryAlbumGroupingAndSummary(unittest.IsolatedAsyncioTestCase)
             now_value=float(pricing["client_price_total"]),
             running_total=149.0
         )
-        self.assertIn("💵 Client Price: $49", summary)
-        self.assertIn("🔐 Profit: H", summary)
+        self.assertIn("Price: $49", summary)
+        self.assertIn("H", summary)
+        self.assertNotIn("Profit:", summary)
         self.assertNotIn("37", summary)
 
     async def test_privacy_non_exposure(self):
@@ -6232,7 +6234,8 @@ class TestStep7DeliveryAlbumGroupingAndSummary(unittest.IsolatedAsyncioTestCase)
             now_value=49.0,
             running_total=49.0
         )
-        self.assertIn("🔐 Profit: H", summary)
+        self.assertIn("H", summary)
+        self.assertNotIn("Profit:", summary)
         self.assertNotIn("Loader Cost", summary)
         self.assertNotIn("Actual Profit", summary)
         self.assertNotIn("cost", summary.lower())
@@ -7985,7 +7988,7 @@ class TestStep11OperationalControls(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(call_count, 2, "Bot must retry without reply_to_message_id when reply fails")
         self.assertEqual(len(sent_messages), 1, "Fallback message must be successfully sent")
-        self.assertIn("Client Price: $16.5", sent_messages[0])
+        self.assertIn("Price: $16.5", sent_messages[0])
 
         after_entries = len(await get_latest_ledger_entries(limit=1000))
         self.assertEqual(after_entries, before_entries + 1, "Exactly ONE DeliveryLedger entry must be created")
@@ -8071,12 +8074,9 @@ class TestStep12RealTelegramBugFixes(unittest.IsolatedAsyncioTestCase):
             now_value=16.0,
             running_total=16.0
         )
-        self.assertIn("📧 test@example.com", msg)
-        self.assertIn("💵 Client Price: $16", msg)
-        self.assertIn("🔐 Profit: TESTPROFITCODE", msg)
-        self.assertIn("Before: 0", msg)
-        self.assertIn("Now: 16", msg)
-        self.assertIn("Total: 16", msg)
+        self.assertEqual(msg, "Price: $16\nTESTPROFITCODE\n\nBefore: 0\nNow: 16\nTotal: 16")
+        self.assertNotIn("test@example.com", msg)
+        self.assertNotIn("Profit:", msg)
 
     async def test_album_accounting_and_deduplication(self):
         from database import create_order, save_order_pricing, get_running_total_current
@@ -8122,7 +8122,7 @@ class TestStep12RealTelegramBugFixes(unittest.IsolatedAsyncioTestCase):
         after_rt1 = await get_running_total_current(chat_id=-100222)
         self.assertAlmostEqual(after_rt1, before_rt + 16.0, places=2, msg="Running total must increase by exactly 16.0")
         self.assertEqual(len(sent_messages), 1, "Exactly ONE accounting summary message must be sent")
-        self.assertIn("💵 Client Price: $16", sent_messages[0][1])
+        self.assertIn("Price: $16", sent_messages[0][1])
 
         # Duplicate album flush event with same dedup_hash
         sent_messages.clear()
