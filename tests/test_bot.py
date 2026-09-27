@@ -9295,6 +9295,90 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
         update.effective_message.reply_text.assert_not_called()
         self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0, "Unauthorized user MUST NOT alter running total!")
 
+    async def test_f_application_dispatch_routing(self):
+        from unittest.mock import patch, AsyncMock, PropertyMock
+        from datetime import datetime, timezone
+        from telegram import Update, Message, User, Chat
+        from telegram.ext import ExtBot
+        from config import Config
+        from main import build_application
+        from database import execute_pay_reset, execute_manual_adjustment, get_running_total_current
+        from handlers import LOADER_ADD_SESSION
+
+        super_admin_id = 1573531032
+        chat_id = -100998877
+
+        dummy_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz123456789"
+        with patch.object(Config, "BOT_TOKEN", dummy_token):
+            app = build_application()
+        app._initialized = True
+
+        admin_user = User(id=super_admin_id, first_name="Admin", is_bot=False)
+        group_chat = Chat(id=chat_id, type="group", title="Test Group")
+
+        with patch.object(Message, "reply_text", new_callable=AsyncMock) as mock_reply, \
+             patch.object(ExtBot, "id", new_callable=PropertyMock, return_value=9999999):
+            try:
+                # 1. Test +200 dispatch through Application handler routing
+                await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+                await execute_manual_adjustment(1000.0, admin_id=super_admin_id, chat_id=chat_id)
+
+                msg_plus = Message(message_id=1001, date=datetime.now(timezone.utc), chat=group_chat, from_user=admin_user, text="+200")
+                upd_plus = Update(update_id=1001, message=msg_plus)
+                mock_reply.reset_mock()
+                await app.process_update(upd_plus)
+                mock_reply.assert_called_once()
+                self.assertEqual(await get_running_total_current(chat_id=chat_id), 1200.0)
+
+                # 2. Test -200 dispatch through Application handler routing
+                await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+                await execute_manual_adjustment(1000.0, admin_id=super_admin_id, chat_id=chat_id)
+
+                msg_minus = Message(message_id=1002, date=datetime.now(timezone.utc), chat=group_chat, from_user=admin_user, text="-200")
+                upd_minus = Update(update_id=1002, message=msg_minus)
+                mock_reply.reset_mock()
+                await app.process_update(upd_minus)
+                mock_reply.assert_called_once()
+                self.assertEqual(await get_running_total_current(chat_id=chat_id), 800.0)
+
+                # 3. Test -12.5 decimal dispatch through Application handler routing
+                await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+                await execute_manual_adjustment(100.0, admin_id=super_admin_id, chat_id=chat_id)
+
+                msg_dec = Message(message_id=1003, date=datetime.now(timezone.utc), chat=group_chat, from_user=admin_user, text="-12.5")
+                upd_dec = Update(update_id=1003, message=msg_dec)
+                mock_reply.reset_mock()
+                await app.process_update(upd_dec)
+                mock_reply.assert_called_once()
+                self.assertEqual(await get_running_total_current(chat_id=chat_id), 87.5)
+
+                # 4. Test Telegram Group ID -1004475489329 dispatch is NOT treated as adjustment
+                await execute_pay_reset(admin_id=super_admin_id, chat_id=chat_id)
+                await execute_manual_adjustment(500.0, admin_id=super_admin_id, chat_id=chat_id)
+
+                msg_group_id = Message(message_id=1004, date=datetime.now(timezone.utc), chat=group_chat, from_user=admin_user, text="-1004475489329")
+                upd_group_id = Update(update_id=1004, message=msg_group_id)
+                mock_reply.reset_mock()
+                await app.process_update(upd_group_id)
+                mock_reply.assert_not_called()
+                self.assertEqual(await get_running_total_current(chat_id=chat_id), 500.0)
+
+                # 5. Test generic non-numeric text bypasses manual_running_total_text_handler and reaches loader_text_wizard_handler
+                private_chat = Chat(id=super_admin_id, type="private")
+                LOADER_ADD_SESSION[super_admin_id] = {"step": 1, "chat_id": super_admin_id, "created_at": datetime.now(timezone.utc)}
+
+                msg_wizard = Message(message_id=1005, date=datetime.now(timezone.utc), chat=private_chat, from_user=admin_user, text="NonNumericText")
+                upd_wizard = Update(update_id=1005, message=msg_wizard)
+                mock_reply.reset_mock()
+                await app.process_update(upd_wizard)
+                mock_reply.assert_called_once()
+                self.assertIn("Invalid Loader Group ID", mock_reply.call_args[0][0])
+
+            finally:
+                LOADER_ADD_SESSION.clear()
+            if hasattr(app, "shutdown"):
+                await app.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

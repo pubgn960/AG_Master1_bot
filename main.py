@@ -339,7 +339,16 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(calc_undo_callback_handler, pattern="^calc_undo_"))
     application.add_handler(CallbackQueryHandler(running_total_undo_callback_handler, pattern="^rt_undo_"))
 
-    # Register loader_text_wizard_handler first for interactive wizard text inputs
+    # Register manual_running_total_text_handler FIRST in group 0 for + / - numeric adjustments
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(r"^[\+\-]\d+(\.\d+)?$") & (~filters.COMMAND),
+            manual_running_total_text_handler
+        ),
+        group=0
+    )
+
+    # Register loader_text_wizard_handler for interactive wizard text inputs
     application.add_handler(
         MessageHandler(
             filters.TEXT & (~filters.COMMAND),
@@ -360,15 +369,6 @@ def build_application() -> Application:
         MessageHandler(
             filters.TEXT & (~filters.COMMAND),
             bulk_price_update_text_handler
-        ),
-        group=0
-    )
-
-    # Register manual_running_total_text_handler for + / - numeric adjustments
-    application.add_handler(
-        MessageHandler(
-            filters.Regex(r"^[\+\-]\d+(\.\d+)?$") & (~filters.COMMAND),
-            manual_running_total_text_handler
         ),
         group=0
     )
