@@ -93,7 +93,10 @@ from database import (
     get_payment_verification_status,
     set_payment_verification_status,
     get_wallet_verification_status,
-    set_wallet_verification_status
+    set_wallet_verification_status,
+    save_order_pricing,
+    get_eligible_category_b_orders_by_email,
+    complete_category_b_order_with_profit_code
 )
 from models import Order
 from utils import (
@@ -487,6 +490,12 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             raw_text=text_content
         )
 
+        priced_order = await save_order_pricing(order.id)
+        if priced_order:
+            order = priced_order
+            if order.client_price_total and order.client_price_total > 0:
+                catb_total_price = order.client_price_total
+
         if wv_enabled:
             wallet_deducted = False
             wallet_obj = None
@@ -631,7 +640,6 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         try:
-            from database import save_order_pricing
             priced_ord = await save_order_pricing(order.id)
             if priced_ord:
                 order = priced_ord
@@ -4407,6 +4415,183 @@ async def walletverification_command_handler(update: Update, context: ContextTyp
             "• <code>/walletverification status</code>"
         )
         await update.effective_message.reply_text(prompt, parse_mode="HTML")
+
+
+def parse_admin_profit_code_input(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Parses admin profit code completion input formats:
+    Format 1:
+        test@example.com
+        V
+        or Email: test@example.com\nV
+        or test@example.com V
+    Format 2:
+        #46 V
+        or 46 V
+        or #46\nV
+
+    Returns dict with keys:
+        - "email": Optional[str]
+        - "order_id": Optional[int]
+        - "profit_code": str
+    or None if text is not a profit code submission.
+    """
+    if not text or not text.strip():
+        return None
+
+    raw = text.strip()
+
+    # Do not match plain numeric manual running total adjustments (+200, -200, -12.5)
+    if re.match(r'^\s*[\+\-]?\d+(\.\d+)?\s*$', raw):
+        return None
+
+    # Guard: Do not match multi-line order creation text containing passwords, platforms, etc.
+    if re.search(r'\b(password|pass|pwd|contrase[nñ]a|platform|facebook|meta|activision)\b', raw, re.IGNORECASE):
+        return None
+
+    # Check Format 2: Order ID + Profit Code (e.g. "#46 V", "46 V", "#46\nV")
+    m_id = re.match(r'^\s*#?(\d+)\s+([A-Za-z\+]+)\s*$', raw) or re.match(r'^\s*#?(\d+)\n+([A-Za-z\+]+)\s*$', raw)
+    if m_id:
+        oid = int(m_id.group(1))
+        code = m_id.group(2).strip().upper()
+        if re.match(r'^[A-Z\+]+$', code):
+            return {
+                "email": None,
+                "order_id": oid,
+                "profit_code": code
+            }
+
+    # Check Format 1: Email + Profit Code
+    from email_parser import extract_email
+    email = extract_email(raw)
+    if not email:
+        return None
+
+    # Remove email and common labels
+    cleaned = re.sub(re.escape(email), '', raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\b(email|correo|code|profit|codigo)\b\s*:?', '', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return None
+
+    # Extract code component
+    m_code = re.search(r'\b([A-Za-z\+]+)\b', cleaned)
+    if not m_code:
+        return None
+
+    code = m_code.group(1).strip().upper()
+    if not re.match(r'^[A-Z\+]+$', code):
+        return None
+
+    return {
+        "email": email.lower().strip(),
+        "order_id": None,
+        "profit_code": code
+    }
+
+
+async def admin_profit_code_completion_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Handler for Admin completion / profit code submission input (e.g. "test@example.com\\nV" or "#46 V").
+    Validates admin permissions, resolves target Category B order unambiguously,
+    saves secret profit code, updates status to Completed, updates delivery ledger/running total exactly once,
+    posts accounting summary, and updates delivery image caption in Client Group.
+    """
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not message or not user or not chat:
+        return False
+
+    text_content = message.text or message.caption or ""
+    parsed = parse_admin_profit_code_input(text_content)
+    if not parsed:
+        return False
+
+    # 1. Authorization check
+    if not (is_super_admin(user.id) or is_admin(user.id) or is_delivery_user(user.id)):
+        logger.warning(f"[PROFIT_CODE] Unauthorized user {user.id} attempted profit code submission.")
+        await message.reply_text("⛔ You are not authorized to submit profit codes or complete orders.")
+        return True
+
+    target_order_id = parsed.get("order_id")
+    target_email = parsed.get("email")
+    profit_code = parsed["profit_code"]
+
+    target_order = None
+
+    if target_order_id is not None:
+        target_order = await get_order_by_id(target_order_id)
+        if not target_order:
+            await message.reply_text(f"❌ Order #{target_order_id} not found.")
+            return True
+    elif target_email:
+        eligible_orders = await get_eligible_category_b_orders_by_email(target_email)
+        if not eligible_orders:
+            await message.reply_text(f"❌ No active Category B order found for <code>{html.escape(target_email)}</code>.", parse_mode="HTML")
+            return True
+        elif len(eligible_orders) > 1:
+            # Ambiguity handling: Prompt admin for Order ID
+            msg_amb = f"⚠️ <b>Multiple active Category B orders found for {html.escape(target_email)}:</b>\n\n"
+            for ord_item in eligible_orders:
+                msg_amb += f"• <b>Order #{ord_item.id}</b> — {html.escape(ord_item.package or 'N/A')} ({html.escape(ord_item.status)})\n"
+            msg_amb += f"\nPlease submit using Order ID: <code>#&lt;order_id&gt; {profit_code}</code> (e.g. <code>#{eligible_orders[0].id} {profit_code}</code>)"
+            await message.reply_text(msg_amb, parse_mode="HTML")
+            return True
+        else:
+            target_order = eligible_orders[0]
+
+    if not target_order:
+        await message.reply_text("❌ Could not resolve target order.")
+        return True
+
+    # 2. Complete order with profit code
+    completed_order, ledger_entry, is_new, status_code = await complete_category_b_order_with_profit_code(
+        order_id=target_order.id,
+        profit_code=profit_code,
+        admin_user_id=user.id
+    )
+
+    if status_code == "ALREADY_COMPLETED" and not is_new:
+        await message.reply_text(f"⚠️ Order #{target_order.id} ({html.escape(target_order.email)}) is already completed with profit code <b>{profit_code}</b>.", parse_mode="HTML")
+        return True
+
+    if not completed_order or not ledger_entry:
+        await message.reply_text(f"❌ Failed to complete Order #{target_order.id}: {status_code}")
+        return True
+
+    # 3. Format & Send Accounting Summary Message
+    from utils import format_delivery_summary_message
+    client_p = completed_order.client_price_total if completed_order.client_price_total is not None else ledger_entry.now_value
+    summary_text = format_delivery_summary_message(
+        email=completed_order.email,
+        client_price=client_p,
+        secret_code=profit_code,
+        before_total=ledger_entry.before_total,
+        now_value=ledger_entry.now_value,
+        running_total=ledger_entry.running_total
+    )
+
+    try:
+        await message.reply_text(summary_text, parse_mode="HTML")
+    except Exception as e:
+        logger.exception(f"[PROFIT_CODE] Failed to send accounting summary for Order #{completed_order.id}: {e}")
+
+    # 4. Trigger image delivery / caption update in Client Group so caption displays Email & Profit Code under delivery image
+    try:
+        from delivery import deliver_order_by_id
+        await deliver_order_by_id(
+            bot=context.bot,
+            order_id=completed_order.id,
+            caption_text=f"{completed_order.email}\n{profit_code}",
+            allow_completed=True
+        )
+    except Exception as e_del:
+        logger.warning(f"[PROFIT_CODE] Failed to trigger image delivery/caption update for Order #{completed_order.id}: {e_del}")
+
+    return True
 
 
 async def removesource_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

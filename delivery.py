@@ -103,7 +103,8 @@ async def deliver_order_by_id(
     loader_reply_msg_id: Optional[int] = None,
     target_delivery_chat_id: Optional[int] = None,
     caption_text: Optional[str] = None,
-    session_images: Optional[List[Image]] = None
+    session_images: Optional[List[Image]] = None,
+    allow_completed: bool = False
 ) -> bool:
     """
     Delivers stored image albums for an order to the Client Group, placing Email as the caption
@@ -139,7 +140,7 @@ async def deliver_order_by_id(
         return False
 
     # Duplicate delivery prevention
-    if order.status == "Delivered":
+    if order.status == "Delivered" and not allow_completed:
         logger.info(f"[DELIVERY] Duplicate Delivery | Order #{order_id} is already delivered. Ignored.")
         if loader_chat_id and loader_reply_msg_id:
             try:
@@ -185,9 +186,14 @@ async def deliver_order_by_id(
 
     total_images = len(all_images)
 
-    # Determine Email for First Image Caption: extract last email from loader caption or fallback to DB order.email
-    caption_email = extract_last_email(caption_text)
-    email_for_caption = caption_email if caption_email else order.email
+    # Determine Email / Caption for First Image: display email & secret profit code if available
+    if caption_text and "\n" in caption_text:
+        email_for_caption = caption_text
+    elif order.secret_profit_code:
+        email_for_caption = f"{order.email}\n{order.secret_profit_code}"
+    else:
+        caption_email = extract_last_email(caption_text)
+        email_for_caption = caption_email if caption_email else order.email
 
     # Fetch active delivery session to determine packages selected for THIS session
     active_ds = None
@@ -226,10 +232,11 @@ async def deliver_order_by_id(
                     selected_delivery_items = [it]
                     break
 
-    # Build screenshot caption containing ONLY packages delivered in this session
-    delivered_caption_block = format_delivered_packages_caption(selected_delivery_items)
-    if delivered_caption_block and "📦 Delivered Package" not in email_for_caption:
-        email_for_caption = f"{email_for_caption}\n\n{delivered_caption_block}"
+    # Build screenshot caption containing ONLY packages delivered in this session (skip if secret profit code caption set)
+    if not order.secret_profit_code and not (caption_text and "\n" in caption_text):
+        delivered_caption_block = format_delivered_packages_caption(selected_delivery_items)
+        if delivered_caption_block and "📦 Delivered Package" not in email_for_caption:
+            email_for_caption = f"{email_for_caption}\n\n{delivered_caption_block}"
 
     # Auto-save price if missing
     if not order.price:

@@ -9605,6 +9605,245 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
                 await app.shutdown()
 
 
+class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression test suite for Category B Order + Post-Delivery Profit Code Workflow.
+    Verifies:
+    1. Automatic client price calculation on Category B order creation
+    2. Saving client_price_total to DB at order creation time
+    3. Category B workflow execution without wallet requirements
+    4. Admin completion with profit code (e.g. test@example.com\\nV or #46 V)
+    5. Formatting of compact accounting summary (Price, Code, Before, Now, Total)
+    6. Concealment of actual profit amount and loader cost
+    7. Exact single increment of running total
+    8. Duplicate completion submission blocking
+    9. Preservation of historical client price when global catalog updates
+    10. Ambiguous email error prompt listing Order IDs
+    11. parse_admin_profit_code_input safety guards
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal, reload_global_client_prices_cache
+        from models import Order, DeliveryLedger, Wallet, WalletTransaction
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(DeliveryLedger))
+            await session.execute(delete(WalletTransaction))
+            await session.execute(delete(Wallet))
+            await session.execute(delete(Order))
+            await session.commit()
+        await reload_global_client_prices_cache()
+
+    async def test_category_b_order_creation_calculates_and_saves_client_price_immediately(self):
+        from database import create_order, get_order_by_id, save_order_pricing
+        order = await create_order(
+            email="catb_test1@example.com",
+            client_chat_id=-100123456789,
+            package="2400",
+            category="B",
+            status="Pending"
+        )
+        await save_order_pricing(order.id)
+        saved = await get_order_by_id(order.id)
+        self.assertIsNotNone(saved.client_price_total)
+        self.assertEqual(float(saved.client_price_total), 16.0)
+
+    async def test_admin_submits_profit_code_and_updates_accounting_summary(self):
+        from database import create_order, save_order_pricing, get_order_by_id, execute_manual_adjustment, get_running_total_current, execute_pay_reset
+        from handlers import admin_profit_code_completion_handler, BOT_SETTINGS, AUTH_USERS_CACHE
+        from unittest.mock import AsyncMock, MagicMock
+
+        chat_id = -100123456789
+        BOT_SETTINGS["client_group_id"] = chat_id
+        admin_id = 1573531032
+        AUTH_USERS_CACHE[admin_id] = "super_admin"
+
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+        await execute_manual_adjustment(50.0, admin_id=admin_id, chat_id=chat_id)
+
+        order = await create_order(
+            email="catb_test2@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Approved"
+        )
+        await save_order_pricing(order.id)
+
+        # Mock update from admin
+        update = MagicMock()
+        update.effective_user.id = admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "catb_test2@example.com\nV"
+        update.effective_message.reply_text = AsyncMock()
+
+        handled = await admin_profit_code_completion_handler(update, None)
+        self.assertTrue(handled)
+
+        updated_order = await get_order_by_id(order.id)
+        self.assertEqual(updated_order.status, "Completed")
+        self.assertEqual(updated_order.secret_profit_code, "V")
+
+        # Check running total updated from 50 to 66
+        cur_rt = await get_running_total_current(chat_id=chat_id)
+        self.assertEqual(cur_rt, 66.0)
+
+        # Verify reply message format
+        update.effective_message.reply_text.assert_called_once()
+        reply_msg = update.effective_message.reply_text.call_args[0][0]
+
+        self.assertIn("Price: $16", reply_msg)
+        self.assertIn("V", reply_msg)
+        self.assertIn("Before: 50", reply_msg)
+        self.assertIn("Now: 16", reply_msg)
+        self.assertIn("Total: 66", reply_msg)
+
+        # Ensure NO loader cost or profit amount shown
+        self.assertNotIn("Profit:", reply_msg)
+        self.assertNotIn("Loader Cost", reply_msg)
+
+    async def test_duplicate_profit_code_submission_blocked(self):
+        from database import create_order, save_order_pricing, complete_category_b_order_with_profit_code, get_running_total_current, execute_pay_reset
+        from handlers import admin_profit_code_completion_handler, AUTH_USERS_CACHE
+        from unittest.mock import AsyncMock, MagicMock
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        AUTH_USERS_CACHE[admin_id] = "super_admin"
+
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+
+        order = await create_order(
+            email="catb_dup@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Approved"
+        )
+        await save_order_pricing(order.id)
+
+        # First completion
+        await complete_category_b_order_with_profit_code(order.id, "V", admin_id)
+        rt1 = await get_running_total_current(chat_id=chat_id)
+        self.assertEqual(rt1, 16.0)
+
+        # Second completion attempt via handler
+        update = MagicMock()
+        update.effective_user.id = admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "catb_dup@example.com\nV"
+        update.effective_message.reply_text = AsyncMock()
+
+        await admin_profit_code_completion_handler(update, None)
+
+        rt2 = await get_running_total_current(chat_id=chat_id)
+        self.assertEqual(rt2, 16.0, "Duplicate submission must NOT increment running total!")
+        update.effective_message.reply_text.assert_called_once()
+        self.assertIn("already completed", update.effective_message.reply_text.call_args[0][0])
+
+    async def test_historical_client_price_immutability(self):
+        from database import create_order, save_order_pricing, get_order_by_id, GLOBAL_CLIENT_PRICES_CACHE
+        order = await create_order(
+            email="catb_hist@example.com",
+            client_chat_id=-100123456789,
+            package="2400",
+            category="B",
+            status="Pending"
+        )
+        await save_order_pricing(order.id)
+
+        # Change global price in cache for cp_2400 to 25.0
+        orig_val = GLOBAL_CLIENT_PRICES_CACHE.get("cp_2400")
+        GLOBAL_CLIENT_PRICES_CACHE["cp_2400"] = {"price": 25.0, "display_name": "2400 CP", "package_type": "normal_cp"}
+
+        try:
+            # Save pricing again, historical price must remain 16.0
+            await save_order_pricing(order.id)
+            saved = await get_order_by_id(order.id)
+            self.assertEqual(float(saved.client_price_total), 16.0)
+        finally:
+            if orig_val:
+                GLOBAL_CLIENT_PRICES_CACHE["cp_2400"] = orig_val
+
+    async def test_ambiguous_email_prompts_admin_for_order_id(self):
+        from database import create_order, save_order_pricing, get_order_by_id
+        from handlers import admin_profit_code_completion_handler, AUTH_USERS_CACHE
+        from unittest.mock import AsyncMock, MagicMock
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        AUTH_USERS_CACHE[admin_id] = "super_admin"
+
+        o1 = await create_order(email="catb_amb@example.com", client_chat_id=chat_id, package="2400", category="B", status="Approved")
+        await save_order_pricing(o1.id)
+        o2 = await create_order(email="catb_amb@example.com", client_chat_id=chat_id, package="5000", category="B", status="Approved")
+        await save_order_pricing(o2.id)
+
+        # Admin submits email without Order ID
+        update = MagicMock()
+        update.effective_user.id = admin_id
+        update.effective_chat.id = chat_id
+        update.effective_message.text = "catb_amb@example.com\nV"
+        update.effective_message.reply_text = AsyncMock()
+
+        await admin_profit_code_completion_handler(update, None)
+        update.effective_message.reply_text.assert_called_once()
+        reply_amb = update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Multiple active Category B orders found", reply_amb)
+        self.assertIn(f"Order #{o1.id}", reply_amb)
+        self.assertIn(f"Order #{o2.id}", reply_amb)
+
+        # Admin submits explicit Order ID: #<o2.id> V
+        update2 = MagicMock()
+        update2.effective_user.id = admin_id
+        update2.effective_chat.id = chat_id
+        update2.effective_message.text = f"#{o2.id} V"
+        update2.effective_message.reply_text = AsyncMock()
+
+        await admin_profit_code_completion_handler(update2, None)
+        u2 = await get_order_by_id(o2.id)
+        self.assertEqual(u2.status, "Completed")
+        self.assertEqual(u2.secret_profit_code, "V")
+
+        u1 = await get_order_by_id(o1.id)
+        self.assertEqual(u1.status, "Approved")
+
+    def test_parse_admin_profit_code_input_guards(self):
+        from handlers import parse_admin_profit_code_input
+
+        # Valid inputs
+        p1 = parse_admin_profit_code_input("test@example.com\nV")
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1["email"], "test@example.com")
+        self.assertEqual(p1["profit_code"], "V")
+
+        p2 = parse_admin_profit_code_input("#46 V")
+        self.assertIsNotNone(p2)
+        self.assertEqual(p2["order_id"], 46)
+        self.assertEqual(p2["profit_code"], "V")
+
+        p3 = parse_admin_profit_code_input("46 X+C")
+        self.assertIsNotNone(p3)
+        self.assertEqual(p3["order_id"], 46)
+        self.assertEqual(p3["profit_code"], "X+C")
+
+        # Invalid inputs that must return None
+        self.assertIsNone(parse_admin_profit_code_input("+200"))
+        self.assertIsNone(parse_admin_profit_code_input("-200"))
+        self.assertIsNone(parse_admin_profit_code_input("-12.5"))
+
+        # Order creation text containing password / platform
+        order_creation_text = (
+            "catb@example.com\n"
+            "Pass:\n"
+            "secret123\n"
+            "Platform: Activision\n"
+            "Package: 2400"
+        )
+        self.assertIsNone(parse_admin_profit_code_input(order_creation_text))
+
+
 if __name__ == "__main__":
     unittest.main()
 

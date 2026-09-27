@@ -970,14 +970,19 @@ async def save_order_pricing(
         )
 
         c_total = calc_res["client_price_total"]
+        if order.client_price_total is not None and client_price_map is None and c_total is not None:
+            c_total = Decimal(str(order.client_price_total))
+
         l_total = calc_res["loader_cost_total"]
         p_amount = calc_res["profit_amount"]
         code = calc_res["secret_profit_code"]
 
-        order.client_price_total = float(c_total) if c_total is not None else None
-        order.loader_cost_total = float(l_total) if l_total is not None else None
-        order.profit_amount = float(p_amount) if p_amount is not None else None
-        order.secret_profit_code = code
+        order.client_price_total = float(c_total) if c_total is not None else order.client_price_total
+        order.loader_cost_total = float(l_total) if l_total is not None else order.loader_cost_total
+        if p_amount is not None:
+            order.profit_amount = float(p_amount)
+        if code:
+            order.secret_profit_code = code
 
         if c_total is not None:
             order.price = f"${float(c_total):g}"
@@ -3704,5 +3709,95 @@ async def process_verified_payment_deduction(
             await session.rollback()
             logger.error(f"[PAYMENT_DEDUCTION_FAILED] Transaction rolled back for TxID {norm_txid}: {e}")
             raise e
+
+
+async def get_eligible_category_b_orders_by_email(email: str) -> List[Order]:
+    """
+    Retrieves active/eligible Category B orders for a customer email.
+    Excludes cancelled or expired orders.
+    """
+    email_clean = email.lower().strip()
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(Order)
+            .options(joinedload(Order.images), joinedload(Order.items))
+            .where(
+                Order.email == email_clean,
+                Order.category == "B",
+                Order.status.notin_(["Cancelled", "CANCELLED", "Expired", "EXPIRED"])
+            )
+            .order_by(Order.id.desc())
+        )
+        res = await session.execute(stmt)
+        return list(res.unique().scalars().all())
+
+
+async def complete_category_b_order_with_profit_code(
+    order_id: int,
+    profit_code: str,
+    admin_user_id: int
+) -> Tuple[Optional[Order], Optional[Any], bool, str]:
+    """
+    Completes a Category B order with a secret profit code, updates order status to Completed,
+    saves profit code, uses already-saved client_price_total from order,
+    and records a DeliveryLedger entry exactly once using dedup_hash.
+
+    Returns: (order, ledger_entry, is_new, status_code)
+    """
+    code_clean = profit_code.strip().upper()
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(Order)
+            .options(joinedload(Order.images), joinedload(Order.items))
+            .where(Order.id == order_id)
+        )
+        res = await session.execute(stmt)
+        order = res.unique().scalar_one_or_none()
+
+        if not order:
+            return None, None, False, "ORDER_NOT_FOUND"
+
+        if order.status in ("Cancelled", "CANCELLED", "Expired", "EXPIRED"):
+            return order, None, False, f"ORDER_IS_{order.status.upper()}"
+
+        # Deduplication Check: If order is ALREADY completed with this secret profit code
+        if order.secret_profit_code == code_clean and order.status in ("Completed", "COMPLETED", "Delivered"):
+            stmt_l = select(DeliveryLedger).where(DeliveryLedger.order_id == order_id).order_by(DeliveryLedger.id.desc())
+            existing_ledger = (await session.execute(stmt_l)).scalars().first()
+            return order, existing_ledger, False, "ALREADY_COMPLETED"
+
+        # Ensure order has client_price_total saved from creation time
+        if order.client_price_total is None or order.client_price_total <= 0:
+            from pricing_calculator import calculate_order_pricing
+            calc_res = await calculate_order_pricing(order.package or order.raw_text or "")
+            if calc_res.get("client_price_total") is not None:
+                order.client_price_total = float(calc_res["client_price_total"])
+                order.price = f"${float(calc_res['client_price_total']):g}"
+
+        order.secret_profit_code = code_clean
+        order.status = "Completed"
+        if not order.delivered_at:
+            order.delivered_at = datetime.now(timezone.utc)
+
+        await session.commit()
+        await session.refresh(order)
+
+    # Record Delivery Ledger Entry & Update Running Total exactly once
+    now_val = float(order.client_price_total) if order.client_price_total else 0.0
+    dedup_hash = f"catb_complete_{order.id}_{code_clean}"
+    chat_id = order.loader_group_id or order.client_chat_id or BOT_SETTINGS.get("delivery_group_id")
+
+    entry, is_new = await record_delivery_ledger_entry(
+        order_id=order.id,
+        package=order.package or "Category B Package",
+        now_value=now_val,
+        loader_name="Admin",
+        dedup_hash=dedup_hash,
+        is_manual=False,
+        chat_id=chat_id,
+        secret_profit_code=code_clean
+    )
+
+    return order, entry, is_new, "SUCCESS"
 
 

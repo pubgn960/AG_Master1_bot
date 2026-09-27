@@ -120,12 +120,25 @@ from handlers import (
     cancelledorders_command_handler,
     failedorders_command_handler,
     retryorder_command_handler,
-    operational_pagination_callback_handler
+    operational_pagination_callback_handler,
+    admin_profit_code_completion_handler,
+    parse_admin_profit_code_input
 )
 
 # Initialize application logging
 setup_logging()
 logger = logging.getLogger("main")
+
+
+class ProfitCodeInputFilter(filters.MessageFilter):
+    """Filter to detect admin profit code submission inputs like 'test@example.com\\nV' or '#46 V'."""
+    def filter(self, message) -> bool:
+        if not message:
+            return False
+        text = message.text or message.caption or ""
+        if not text:
+            return False
+        return parse_admin_profit_code_input(text) is not None
 
 
 def validate_bot_command(cmd: BotCommand) -> bool:
@@ -347,6 +360,15 @@ def build_application() -> Application:
         MessageHandler(
             filters.Regex(r"^[\+\-]\d+(\.\d+)?$") & (~filters.COMMAND),
             manual_running_total_text_handler
+        ),
+        group=0
+    )
+
+    # Register admin_profit_code_completion_handler for post-delivery profit code submissions
+    application.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ProfitCodeInputFilter() & (~filters.COMMAND),
+            admin_profit_code_completion_handler
         ),
         group=0
     )
