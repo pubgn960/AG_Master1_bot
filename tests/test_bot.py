@@ -9970,6 +9970,143 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(parse_admin_profit_code_input(order_creation_text))
 
+    async def test_category_b_delivery_automatically_calculates_and_saves_secret_code_in_caption(self):
+        from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_order_by_id, add_loader, set_loader_price, execute_pay_reset, get_running_total_current, DeliveryLedger, AsyncSessionLocal
+        from delivery import deliver_order_by_id
+        from models import Image
+        from unittest.mock import AsyncMock, MagicMock
+        from sqlalchemy import select
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+
+        loader_group_id = -100987654321
+        loader = await add_loader(loader_group_id, "TestLoader")
+        await set_loader_price(loader.id, "cp_2400", 15.0)
+
+        order = await create_order(
+            email="catb_auto_delivery@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Pending Approval"
+        )
+        order = await save_order_pricing(order.id)
+        self.assertEqual(float(order.client_price_total), 16.0)
+        self.assertIsNone(order.secret_profit_code)
+
+        await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400",
+            now_value=float(order.client_price_total),
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=chat_id
+        )
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 16.0)
+
+        async with AsyncSessionLocal() as session:
+            img = Image(order_id=order.id, telegram_file_id="img_file_123", file_type="photo", position=0)
+            session.add(img)
+            await session.commit()
+
+        mock_bot = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 9999
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        success = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            target_delivery_chat_id=chat_id
+        )
+        self.assertTrue(success)
+
+        updated_order = await get_order_by_id(order.id)
+        self.assertEqual(updated_order.secret_profit_code, "V")
+        self.assertEqual(float(updated_order.loader_cost_total), 15.0)
+        self.assertEqual(float(updated_order.profit_amount), 1.0)
+
+        mock_bot.send_media_group.assert_called_once()
+        media_group_sent = mock_bot.send_media_group.call_args[1]["media"]
+        first_media_caption = media_group_sent[0].caption
+
+        expected_caption = (
+            "catb_auto_delivery@example.com\n"
+            "V\n\n"
+            "📦 Delivered Package\n\n"
+            "✅ 2400 CP"
+        )
+        self.assertEqual(first_media_caption, expected_caption)
+
+        self.assertEqual(await get_running_total_current(chat_id=chat_id), 16.0)
+        async with AsyncSessionLocal() as session:
+            stmt = select(DeliveryLedger).where(DeliveryLedger.order_id == order.id)
+            ledgers = (await session.execute(stmt)).scalars().all()
+            self.assertEqual(len(ledgers), 1, "Only 1 creation-time ledger entry must exist for Category B!")
+
+    async def test_category_b_reprocessing_retry_does_not_duplicate_accounting_or_code(self):
+        from database import create_order, save_order_pricing, record_delivery_ledger_entry, get_order_by_id, add_loader, set_loader_price, execute_pay_reset, get_running_total_current, DeliveryLedger, AsyncSessionLocal
+        from delivery import deliver_order_by_id
+        from models import Image
+        from unittest.mock import AsyncMock, MagicMock
+        from sqlalchemy import select
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+
+        loader_group_id = -100987654321
+        loader = await add_loader(loader_group_id, "TestLoader2")
+        await set_loader_price(loader.id, "cp_2400", 15.0)
+
+        order = await create_order(
+            email="catb_retry@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Pending Approval"
+        )
+        order = await save_order_pricing(order.id)
+
+        await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400",
+            now_value=float(order.client_price_total),
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=chat_id
+        )
+
+        async with AsyncSessionLocal() as session:
+            img = Image(order_id=order.id, telegram_file_id="img_file_456", file_type="photo", position=0)
+            session.add(img)
+            await session.commit()
+
+        mock_bot = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 9999
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock()
+
+        await deliver_order_by_id(bot=mock_bot, order_id=order.id, loader_chat_id=loader_group_id, target_delivery_chat_id=chat_id)
+        rt1 = await get_running_total_current(chat_id=chat_id)
+        o1 = await get_order_by_id(order.id)
+        self.assertEqual(o1.secret_profit_code, "V")
+
+        await deliver_order_by_id(bot=mock_bot, order_id=order.id, loader_chat_id=loader_group_id, target_delivery_chat_id=chat_id, allow_completed=True)
+        rt2 = await get_running_total_current(chat_id=chat_id)
+        o2 = await get_order_by_id(order.id)
+
+        self.assertEqual(rt2, rt1, "Retrying delivery MUST NOT duplicate accounting!")
+        self.assertEqual(o2.secret_profit_code, "V", "Secret profit code must remain consistent on retry!")
+
 
 if __name__ == "__main__":
     unittest.main()

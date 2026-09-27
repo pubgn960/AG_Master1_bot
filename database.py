@@ -971,18 +971,23 @@ async def save_order_pricing(
         )
 
         c_total = calc_res["client_price_total"]
-        if order.client_price_total is not None and client_price_map is None and c_total is not None:
+        if order.client_price_total is not None and client_price_map is None:
             c_total = Decimal(str(order.client_price_total))
 
         l_total = calc_res["loader_cost_total"]
         p_amount = calc_res["profit_amount"]
         code = calc_res["secret_profit_code"]
 
+        if c_total is not None and l_total is not None:
+            from profit_code_engine import encode_profit_code
+            p_amount = c_total - l_total
+            code = encode_profit_code(p_amount)
+
         order.client_price_total = float(c_total) if c_total is not None else order.client_price_total
         order.loader_cost_total = float(l_total) if l_total is not None else order.loader_cost_total
         if p_amount is not None:
             order.profit_amount = float(p_amount)
-        if code and order.category != "B":
+        if code:
             order.secret_profit_code = code
 
         if c_total is not None:

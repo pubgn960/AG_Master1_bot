@@ -20,6 +20,7 @@ from email_parser import extract_last_email
 from database import (
     BOT_SETTINGS,
     CLIENT_GROUPS_CACHE,
+    LOADERS_CACHE,
     get_order_by_id,
     get_all_orders_by_email,
     get_current_settings,
@@ -30,7 +31,8 @@ from database import (
     update_order_package_progress,
     get_delivery_session_by_msg_id,
     close_delivery_session,
-    update_order_client_delivered_msg_id
+    update_order_client_delivered_msg_id,
+    save_order_pricing
 )
 from models import Order, Image
 from utils import (
@@ -187,16 +189,7 @@ async def deliver_order_by_id(
 
     total_images = len(all_images)
 
-    # Determine Email / Caption for First Image: display email & secret profit code if available
-    if caption_text and "\n" in caption_text:
-        email_for_caption = caption_text
-    elif order.secret_profit_code:
-        email_for_caption = f"{order.email}\n{order.secret_profit_code}"
-    else:
-        caption_email = extract_last_email(caption_text)
-        email_for_caption = caption_email if caption_email else order.email
-
-    # Fetch active delivery session to determine packages selected for THIS session
+    # Fetch active delivery session to determine packages & loader selected for THIS session
     active_ds = None
     selected_delivery_items: List[Dict[str, Any]] = []
     if loader_reply_msg_id:
@@ -206,6 +199,32 @@ async def deliver_order_by_id(
                 selected_delivery_items = json.loads(active_ds.selected_packages)
             except Exception:
                 selected_delivery_items = []
+
+    # Automated Category B Secret Profit Code Calculation at Delivery Time
+    if order.category == "B" and not order.secret_profit_code:
+        resolved_loader_id = None
+        if active_ds and active_ds.loader_id:
+            resolved_loader_id = active_ds.loader_id
+
+        if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
+            target_grp = loader_chat_id or order.loader_group_id
+            for l_id, l_data in LOADERS_CACHE.items():
+                if l_data.get("group_id") == target_grp or l_id == target_grp:
+                    resolved_loader_id = l_id
+                    break
+
+        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
+        if priced_order and priced_order.secret_profit_code:
+            order = priced_order
+
+    # Determine Email / Caption for First Image: display email & secret profit code if available
+    if caption_text and "\n" in caption_text:
+        email_for_caption = caption_text
+    elif order.secret_profit_code:
+        email_for_caption = f"{order.email}\n{order.secret_profit_code}"
+    else:
+        caption_email = extract_last_email(caption_text)
+        email_for_caption = caption_email if caption_email else order.email
 
     # Get current package progress items from DB or initialize from raw_text
     if order.package_progress:
