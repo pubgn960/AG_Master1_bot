@@ -9180,6 +9180,189 @@ class TestAdminPaymentVerificationSetting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(priced.client_price_total, 16.0)
 
 
+class TestAdminWalletVerificationSetting(unittest.IsolatedAsyncioTestCase):
+    """Regression test suite for Admin Wallet Verification (Enforcement) ON/OFF setting."""
+
+    async def asyncSetUp(self):
+        from database import init_db, set_wallet_verification_status, AsyncSessionLocal
+        from models import Order
+        from sqlalchemy import delete
+        await init_db()
+        await set_wallet_verification_status(True)
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(Order).where(Order.email.in_(["test_catb_off@gmail.com", "test_catb_on@gmail.com"])))
+            await session.commit()
+
+    async def test_a_default_setting_is_on_fresh_db(self):
+        from database import get_wallet_verification_status, BOT_SETTINGS
+        status = await get_wallet_verification_status()
+        self.assertTrue(status, "Default wallet verification status MUST be True on fresh DB")
+        self.assertTrue(BOT_SETTINGS.get("wallet_verification_enabled"), "BOT_SETTINGS cache MUST have wallet_verification_enabled=True")
+
+    async def test_b_c_admin_can_turn_off_and_status(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import walletverification_command_handler
+        from database import get_wallet_verification_status
+
+        admin_update = MagicMock()
+        admin_update.effective_user.id = 1573531032
+        admin_update.effective_message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.args = ["off"]
+
+        await walletverification_command_handler(admin_update, ctx)
+        admin_update.effective_message.reply_text.assert_called_once()
+        reply = admin_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Wallet Verification Disabled", reply)
+        self.assertIn("Wallet balance enforcement is now OFF.", reply)
+
+        status = await get_wallet_verification_status()
+        self.assertFalse(status, "Status must be False after turning OFF")
+
+        # Test status command
+        status_update = MagicMock()
+        status_update.effective_user.id = 1573531032
+        status_update.effective_message.reply_text = AsyncMock()
+        status_ctx = MagicMock()
+        status_ctx.args = ["status"]
+
+        await walletverification_command_handler(status_update, status_ctx)
+        status_reply = status_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Status: 🔴 OFF", status_reply)
+
+    async def test_d_category_b_order_when_off_skips_wallet_deduction(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import source_group_handler
+        from database import set_wallet_verification_status, set_client_group_category, AsyncSessionLocal, BOT_SETTINGS, get_wallet_balance
+        from models import Order
+        from sqlalchemy import select
+
+        await set_wallet_verification_status(False)
+        chat_id = -100987654321
+        BOT_SETTINGS["source_group_id"] = chat_id
+        await set_client_group_category(chat_id, "Cat B Client Group", "B")
+
+        user_id = 9988776611
+        bal = await get_wallet_balance(chat_id, user_id)
+        self.assertEqual(bal, 0.0, "User balance starts at $0")
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot.copy_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.bot = mock_bot
+
+        order_update = MagicMock()
+        order_update.effective_chat.id = chat_id
+        order_update.effective_chat.title = "Cat B Client Group"
+        order_update.effective_user.id = user_id
+        order_update.effective_user.is_bot = False
+        order_update.effective_message.message_id = 801
+        order_update.effective_message.text = "Activision\nEmail: test_catb_off@gmail.com\nPassword: secret\n2400 CP"
+        order_update.effective_message.photo = []
+        order_update.effective_message.document = None
+        order_update.effective_message.reply_to_message = None
+        order_update.effective_message.reply_text = AsyncMock()
+
+        await source_group_handler(order_update, ctx)
+
+        # 1. Reply text should NOT be called with insufficient balance notice
+        for call_arg in order_update.effective_message.reply_text.call_args_list:
+            arg0 = call_arg[0][0] if call_arg[0] else ""
+            self.assertNotIn("Insufficient Wallet Balance", arg0)
+
+        # 2. Order created with Pending Approval (not Pending Payment)
+        async with AsyncSessionLocal() as session:
+            stmt = select(Order).where(Order.email == "test_catb_off@gmail.com").order_by(Order.id.desc())
+            ord_res = (await session.execute(stmt)).scalars().first()
+            self.assertIsNotNone(ord_res)
+            self.assertEqual(ord_res.status, "Pending Approval")
+
+        # 3. Card forwarded to Payment Review Group
+        mock_bot.send_message.assert_called_once()
+        sent_card = mock_bot.send_message.call_args[1].get("text", "")
+        self.assertIn("NEW ORDER", sent_card)
+
+        # 4. Balance remains unchanged
+        bal_after = await get_wallet_balance(chat_id, user_id)
+        self.assertEqual(bal_after, 0.0)
+
+    async def test_e_category_b_order_when_on_enforces_wallet(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import source_group_handler
+        from database import set_wallet_verification_status, set_client_group_category, BOT_SETTINGS, get_wallet_balance
+        from models import Order
+        from sqlalchemy import select
+
+        await set_wallet_verification_status(True)
+        chat_id = -100987654322
+        BOT_SETTINGS["source_group_id"] = chat_id
+        await set_client_group_category(chat_id, "Cat B Client Group", "B")
+
+        user_id = 9988776622
+
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+        mock_bot.copy_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.bot = mock_bot
+
+        order_update = MagicMock()
+        order_update.effective_chat.id = chat_id
+        order_update.effective_chat.title = "Cat B Client Group"
+        order_update.effective_user.id = user_id
+        order_update.effective_user.is_bot = False
+        order_update.effective_message.message_id = 802
+        order_update.effective_message.text = "Activision\nEmail: test_catb_on@gmail.com\nPassword: secret\n2400 CP"
+        order_update.effective_message.photo = []
+        order_update.effective_message.document = None
+        order_update.effective_message.reply_to_message = None
+        order_update.effective_message.reply_text = AsyncMock()
+
+        await source_group_handler(order_update, ctx)
+
+        # Insufficient balance prompt MUST be sent to user
+        order_update.effective_message.reply_text.assert_called_once()
+        reply = order_update.effective_message.reply_text.call_args[0][0]
+        self.assertIn("Insufficient Wallet Balance", reply)
+
+    async def test_f_setting_survives_db_reload(self):
+        from database import set_wallet_verification_status, reload_bot_settings_cache, get_wallet_verification_status, BOT_SETTINGS
+
+        await set_wallet_verification_status(False)
+        BOT_SETTINGS.clear()
+
+        await reload_bot_settings_cache()
+        status = await get_wallet_verification_status()
+        self.assertFalse(status, "Setting MUST remain OFF after database reload/restart")
+
+        await set_wallet_verification_status(True)
+
+    async def test_g_unauthorized_user_blocked(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from handlers import walletverification_command_handler
+        from database import set_wallet_verification_status, get_wallet_verification_status
+
+        await set_wallet_verification_status(True)
+
+        unauth_update = MagicMock()
+        unauth_update.effective_user.id = 999000222  # Non-admin user
+        unauth_update.effective_message.reply_text = AsyncMock()
+        ctx = MagicMock()
+        ctx.args = ["off"]
+
+        await walletverification_command_handler(unauth_update, ctx)
+        unauth_update.effective_message.reply_text.assert_called_with("⛔ You are not authorized to use this command.")
+
+        status = await get_wallet_verification_status()
+        self.assertTrue(status, "Setting MUST NOT change when unauthorized user invokes command")
+
+
 class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase):
     """Regression test suite for Manual Running Total Adjustments (+200, -200, -12.5, group ID safety, authorization)."""
 

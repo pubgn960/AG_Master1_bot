@@ -91,7 +91,9 @@ from database import (
     get_user_by_binance_uid,
     get_all_group_binance_identities,
     get_payment_verification_status,
-    set_payment_verification_status
+    set_payment_verification_status,
+    get_wallet_verification_status,
+    set_wallet_verification_status
 )
 from models import Order
 from utils import (
@@ -463,6 +465,8 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.warning("Reaction not supported.")
 
     if category == "B":
+        wv_enabled = BOT_SETTINGS.get("wallet_verification_enabled", True)
+
         # Parse Category B order and calculate price using Category B Price List
         parsed_catb = parse_order_v2(text_content, category="B")
         prices_catb = get_dynamic_package_prices(category="B")
@@ -478,42 +482,95 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             client_chat_id=chat.id,
             original_message_id=message.message_id,
             package=package_desc,
-            status="Pending Payment" if catb_total_price > 0 else "Pending Approval",
+            status="Pending Payment" if (catb_total_price > 0 and wv_enabled) else "Pending Approval",
             category="B",
             raw_text=text_content
         )
 
-        wallet_deducted = False
-        wallet_obj = None
-        if catb_total_price > 0 and user_id:
-            wallet_obj, wallet_deducted, reason = await deduct_wallet_balance_for_order(
-                client_group_id=chat.id,
-                telegram_user_id=user_id,
-                order_id=order.id,
-                amount=catb_total_price
-            )
-
-        if wallet_deducted:
-            async with AsyncSessionLocal() as session:
-                stmt_u = select(Order).where(Order.id == order.id)
-                ord_to_up = (await session.execute(stmt_u)).scalar_one_or_none()
-                if ord_to_up:
-                    ord_to_up.status = "Pending Approval"
-                    await session.commit()
-
-            try:
-                bal_val = wallet_obj.balance if wallet_obj else 0.0
-                client_pay_msg = (
-                    f"✅ <b>Order #{order.id} Paid via Category B Wallet!</b>\n\n"
-                    f"<b>Deducted:</b> ${format_wallet_amount(catb_total_price)}\n"
-                    f"<b>Remaining Balance:</b> ${format_wallet_amount(bal_val)}\n\n"
-                    f"Order is now being processed."
+        if wv_enabled:
+            wallet_deducted = False
+            wallet_obj = None
+            if catb_total_price > 0 and user_id:
+                wallet_obj, wallet_deducted, reason = await deduct_wallet_balance_for_order(
+                    client_group_id=chat.id,
+                    telegram_user_id=user_id,
+                    order_id=order.id,
+                    amount=catb_total_price
                 )
-                await message.reply_text(client_pay_msg, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"[WALLET] Failed to send payment confirmation to customer: {e}")
 
-            # Forward paid Category B order to Payment Review Group / Loader Group
+            if wallet_deducted:
+                async with AsyncSessionLocal() as session:
+                    stmt_u = select(Order).where(Order.id == order.id)
+                    ord_to_up = (await session.execute(stmt_u)).scalar_one_or_none()
+                    if ord_to_up:
+                        ord_to_up.status = "Pending Approval"
+                        await session.commit()
+
+                try:
+                    bal_val = wallet_obj.balance if wallet_obj else 0.0
+                    client_pay_msg = (
+                        f"✅ <b>Order #{order.id} Paid via Category B Wallet!</b>\n\n"
+                        f"<b>Deducted:</b> ${format_wallet_amount(catb_total_price)}\n"
+                        f"<b>Remaining Balance:</b> ${format_wallet_amount(bal_val)}\n\n"
+                        f"Order is now being processed."
+                    )
+                    await message.reply_text(client_pay_msg, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"[WALLET] Failed to send payment confirmation to customer: {e}")
+
+                # Forward paid Category B order to Payment Review Group / Loader Group
+                payment_group_id = BOT_SETTINGS["payment_review_group_id"] or Config.PAYMENT_REVIEW_GROUP_ID
+                if payment_group_id:
+                    try:
+                        try:
+                            await context.bot.copy_message(
+                                chat_id=payment_group_id,
+                                from_chat_id=chat.id,
+                                message_id=message.message_id
+                            )
+                        except Exception as e_copy:
+                            logger.exception(f"[PAYMENT] copy_message failed: {e_copy}")
+
+                        group_title = chat.title or "Client Group"
+                        card_msg = (
+                            f"🟨 <b>NEW ORDER (Paid via Wallet)</b>\n\n"
+                            f"<b>Order ID:</b> #{order.id}\n\n"
+                            f"<b>Email:</b>\n{html.escape(order.email)}\n\n"
+                            f"<b>Group:</b>\n{html.escape(group_title)}\n\n"
+                            f"Choose an action."
+                        )
+                        keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton("✅ Accept", callback_data=f"catb_accept:{order.id}"),
+                                InlineKeyboardButton("❌ Reject", callback_data=f"catb_reject:{order.id}")
+                            ]
+                        ])
+                        await context.bot.send_message(
+                            chat_id=payment_group_id,
+                            text=card_msg,
+                            reply_markup=keyboard,
+                            parse_mode="HTML"
+                        )
+                        logger.info(f"[PAYMENT] Order #{order.id} routed to Payment Review Group (-1004441603990).")
+                    except Exception as e:
+                        logger.exception(f"[PAYMENT] Failed to route Order #{order.id} to Payment Review Group: {e}")
+            else:
+                # Insufficient balance: Order remains Pending Payment
+                bal_val = wallet_obj.balance if wallet_obj else 0.0
+                needed = max(0.0, catb_total_price - bal_val)
+                try:
+                    insufficient_msg = (
+                        f"⚠️ <b>Insufficient Wallet Balance for Order #{order.id}</b>\n\n"
+                        f"<b>Required Amount:</b> ${format_wallet_amount(catb_total_price)}\n"
+                        f"<b>Your Current Balance:</b> ${format_wallet_amount(bal_val)}\n"
+                        f"<b>Remaining Needed:</b> ${format_wallet_amount(needed)}\n\n"
+                        f"Please top up your wallet in this group to process your order."
+                    )
+                    await message.reply_text(insufficient_msg, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"[WALLET] Failed to send insufficient balance notice to customer: {e}")
+        else:
+            # Wallet Verification is OFF: Skip wallet deduction/enforcement, route order directly to Payment Review Group
             payment_group_id = BOT_SETTINGS["payment_review_group_id"] or Config.PAYMENT_REVIEW_GROUP_ID
             if payment_group_id:
                 try:
@@ -528,7 +585,7 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
                     group_title = chat.title or "Client Group"
                     card_msg = (
-                        f"🟨 <b>NEW ORDER (Paid via Wallet)</b>\n\n"
+                        f"🟨 <b>NEW ORDER</b>\n\n"
                         f"<b>Order ID:</b> #{order.id}\n\n"
                         f"<b>Email:</b>\n{html.escape(order.email)}\n\n"
                         f"<b>Group:</b>\n{html.escape(group_title)}\n\n"
@@ -546,24 +603,9 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                         reply_markup=keyboard,
                         parse_mode="HTML"
                     )
-                    logger.info(f"[PAYMENT] Order #{order.id} routed to Payment Review Group (-1004441603990).")
+                    logger.info(f"[PAYMENT] Order #{order.id} routed to Payment Review Group (wallet verification disabled).")
                 except Exception as e:
                     logger.exception(f"[PAYMENT] Failed to route Order #{order.id} to Payment Review Group: {e}")
-        else:
-            # Insufficient balance: Order remains Pending Payment
-            bal_val = wallet_obj.balance if wallet_obj else 0.0
-            needed = max(0.0, catb_total_price - bal_val)
-            try:
-                insufficient_msg = (
-                    f"⚠️ <b>Insufficient Wallet Balance for Order #{order.id}</b>\n\n"
-                    f"<b>Required Amount:</b> ${format_wallet_amount(catb_total_price)}\n"
-                    f"<b>Your Current Balance:</b> ${format_wallet_amount(bal_val)}\n"
-                    f"<b>Remaining Needed:</b> ${format_wallet_amount(needed)}\n\n"
-                    f"Please top up your wallet in this group to process your order."
-                )
-                await message.reply_text(insufficient_msg, parse_mode="HTML")
-            except Exception as e:
-                logger.error(f"[WALLET] Failed to send insufficient balance notice to customer: {e}")
 
     else:
         # Parse initial package progress
@@ -4222,7 +4264,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Payment Review Workflow:</b>\n"
         "• <code>/approve &lt;id&gt;</code> - Approve Category B order & forward to Loader\n"
         "• <code>/reject &lt;id&gt;</code> - Reject Category B order\n"
-        "• <code>/paymentverification [on|off|status]</code> - Toggle Payment Verification\n\n"
+        "• <code>/paymentverification [on|off|status]</code> - Toggle Payment Verification\n"
+        "• <code>/walletverification [on|off|status]</code> - Toggle Wallet Verification\n\n"
         "<b>User Management:</b>\n"
         "• <code>/user delivery add &lt;id&gt;</code> - Add Delivery User\n"
         "• <code>/user delivery remove &lt;id&gt;</code> - Remove Delivery User\n"
@@ -4309,6 +4352,59 @@ async def paymentverification_command_handler(update: Update, context: ContextTy
             "• <code>/paymentverification on</code>\n"
             "• <code>/paymentverification off</code>\n"
             "• <code>/paymentverification status</code>"
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="HTML")
+
+
+async def walletverification_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /walletverification [on|off|status] command for Super Admins.
+    Toggles wallet verification (balance enforcement) feature persistently in database and RAM cache.
+    """
+    if not await check_admin_permission(update):
+        return
+
+    args = context.args or []
+    if not args:
+        prompt = (
+            "⚠️ <b>Usage:</b>\n"
+            "• <code>/walletverification on</code>\n"
+            "• <code>/walletverification off</code>\n"
+            "• <code>/walletverification status</code>"
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="HTML")
+        return
+
+    sub = args[0].lower()
+
+    if sub == "on":
+        await set_wallet_verification_status(True)
+        resp = (
+            "✅ <b>Wallet Verification Enabled</b>\n\n"
+            "Wallet balance enforcement is now ON."
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    elif sub == "off":
+        await set_wallet_verification_status(False)
+        resp = (
+            "🔴 <b>Wallet Verification Disabled</b>\n\n"
+            "Wallet balance enforcement is now OFF."
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    elif sub == "status":
+        is_on = await get_wallet_verification_status()
+        status_str = "🟢 ON" if is_on else "🔴 OFF"
+        resp = (
+            f"👛 <b>Wallet Verification</b>\n"
+            f"Status: {status_str}"
+        )
+        await update.effective_message.reply_text(resp, parse_mode="HTML")
+    else:
+        prompt = (
+            "⚠️ <b>Usage:</b>\n"
+            "• <code>/walletverification on</code>\n"
+            "• <code>/walletverification off</code>\n"
+            "• <code>/walletverification status</code>"
         )
         await update.effective_message.reply_text(prompt, parse_mode="HTML")
 

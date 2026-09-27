@@ -47,7 +47,8 @@ BOT_SETTINGS: Dict[str, Any] = {
     "source_group_title": None,
     "delivery_group_title": None,
     "payment_review_group_title": "Payment Review Group",
-    "payment_verification_enabled": True
+    "payment_verification_enabled": True,
+    "wallet_verification_enabled": True
 }
 
 # Global in-memory user permission cache: telegram_user_id -> role ('admin' or 'delivery')
@@ -196,6 +197,17 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
             except Exception as e:
                 logger.error(f"Failed to add column payment_verification_enabled to settings: {e}")
 
+        if "wallet_verification_enabled" not in existing_columns:
+            logger.info("Adding missing column wallet_verification_enabled to settings...")
+            try:
+                if is_postgres:
+                    sync_conn.execute(text("ALTER TABLE settings ADD COLUMN IF NOT EXISTS wallet_verification_enabled BOOLEAN DEFAULT TRUE;"))
+                else:
+                    sync_conn.execute(text("ALTER TABLE settings ADD COLUMN wallet_verification_enabled BOOLEAN DEFAULT TRUE;"))
+                logger.info("Successfully added column wallet_verification_enabled to settings.")
+            except Exception as e:
+                logger.error(f"Failed to add column wallet_verification_enabled to settings: {e}")
+
 
 async def init_db() -> None:
     """Initializes database schema and performs idempotent column migrations."""
@@ -240,6 +252,7 @@ async def get_or_create_settings() -> Settings:
                 payment_review_group_id=Config.PAYMENT_REVIEW_GROUP_ID,
                 payment_review_group_title="Payment Review Group",
                 payment_verification_enabled=True,
+                wallet_verification_enabled=True,
                 updated_at=datetime.now(timezone.utc)
             )
             session.add(settings)
@@ -269,6 +282,8 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
     BOT_SETTINGS["payment_review_group_title"] = getattr(settings, "payment_review_group_title", None) or "Payment Review Group"
     pv_enabled = getattr(settings, "payment_verification_enabled", None)
     BOT_SETTINGS["payment_verification_enabled"] = bool(pv_enabled if pv_enabled is not None else True)
+    wv_enabled = getattr(settings, "wallet_verification_enabled", None)
+    BOT_SETTINGS["wallet_verification_enabled"] = bool(wv_enabled if wv_enabled is not None else True)
 
     # Pre-load Client Groups into CLIENT_GROUPS_CACHE in RAM
     async with AsyncSessionLocal() as session:
@@ -287,6 +302,7 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
     del_id = BOT_SETTINGS["delivery_group_id"]
     pay_id = BOT_SETTINGS["payment_review_group_id"]
     pv_st = "ON" if BOT_SETTINGS["payment_verification_enabled"] else "OFF"
+    wv_st = "ON" if BOT_SETTINGS["wallet_verification_enabled"] else "OFF"
 
     logger.info("[CACHE]")
     if src_id:
@@ -296,6 +312,7 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
     if pay_id:
         logger.info(f"[CACHE] Payment Review Group Loaded: {pay_id}")
     logger.info(f"[CACHE] Payment Verification Status Loaded: {pv_st}")
+    logger.info(f"[CACHE] Wallet Verification Status Loaded: {wv_st}")
     logger.info(f"[CACHE] Loaded {len(CLIENT_GROUPS_CACHE)} Client Group Category mapping(s) into memory.")
 
     return BOT_SETTINGS
@@ -325,6 +342,33 @@ async def set_payment_verification_status(enabled: bool) -> bool:
 
     BOT_SETTINGS["payment_verification_enabled"] = enabled
     logger.info(f"[PAYMENT_VERIFICATION] Setting updated in DB & Cache: enabled={enabled}")
+    return enabled
+
+
+async def get_wallet_verification_status() -> bool:
+    """Returns current Wallet Verification ON/OFF status from cache or DB."""
+    if "wallet_verification_enabled" in BOT_SETTINGS:
+        return bool(BOT_SETTINGS["wallet_verification_enabled"])
+    settings = await get_or_create_settings()
+    wv = getattr(settings, "wallet_verification_enabled", True)
+    return bool(wv if wv is not None else True)
+
+
+async def set_wallet_verification_status(enabled: bool) -> bool:
+    """Updates Wallet Verification ON/OFF status in DB and updates BOT_SETTINGS RAM cache."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Settings).where(Settings.id == 1)
+        res = await session.execute(stmt)
+        settings = res.scalar_one_or_none()
+        if not settings:
+            settings = Settings(id=1, wallet_verification_enabled=enabled)
+            session.add(settings)
+        else:
+            settings.wallet_verification_enabled = enabled
+        await session.commit()
+
+    BOT_SETTINGS["wallet_verification_enabled"] = enabled
+    logger.info(f"[WALLET_VERIFICATION] Setting updated in DB & Cache: enabled={enabled}")
     return enabled
 
 
@@ -1951,9 +1995,11 @@ async def seed_and_load_global_client_prices() -> Dict[str, Dict[str, Any]]:
         res = await session.execute(stmt)
         existing_prices = list(res.scalars().all())
 
-        if not existing_prices:
-            now = datetime.now(timezone.utc)
-            for pkey, item in PRODUCT_CATALOG.items():
+        existing_keys = {p.product_key for p in existing_prices}
+        now = datetime.now(timezone.utc)
+        added_count = 0
+        for pkey, item in PRODUCT_CATALOG.items():
+            if pkey not in existing_keys:
                 ref_p = item.get("reference_price")
                 if ref_p is not None:
                     session.add(GlobalClientPrice(
@@ -1965,8 +2011,10 @@ async def seed_and_load_global_client_prices() -> Dict[str, Dict[str, Any]]:
                         active=True,
                         updated_at=now
                     ))
+                    added_count += 1
+        if added_count > 0:
             await session.commit()
-            logger.info(f"[GLOBAL_PRICE_DB] Seeded {len(PRODUCT_CATALOG)} default global client prices into database.")
+            logger.info(f"[GLOBAL_PRICE_DB] Seeded {added_count} default global client prices into database.")
 
     return await reload_global_client_prices_cache()
 
