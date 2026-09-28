@@ -150,6 +150,7 @@ from database import (
     update_order_package_progress,
     create_delivery_session,
     get_delivery_session_by_msg_id,
+    get_active_delivery_session,
     close_delivery_session,
     get_all_package_prices_from_db,
     bulk_update_package_prices_in_db,
@@ -1517,6 +1518,18 @@ async def loader_pkg_toggle_callback_handler(update: Update, context: ContextTyp
     new_json = json.dumps(updated_items)
     await update_order_package_progress(order.id, new_json)
     order.package_progress = new_json
+
+    selected_items = get_loader_selected_packages(new_json, user.id)
+    if selected_items:
+        try:
+            await create_delivery_session(
+                order_id=order.id,
+                loader_id=user.id,
+                session_msg_id=query.message.message_id,
+                selected_packages=json.dumps(selected_items)
+            )
+        except Exception as e_ds:
+            logger.warning(f"[LOADER_SELECTION] Failed to auto-create delivery session: {e_ds}")
 
     card_text = format_full_loader_order_card(order)
     new_kb = build_loader_package_keyboard(order.id, updated_items, user.id)
@@ -3108,6 +3121,43 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
         logger.info("[LOADER] Ignored reply that does not match any valid order.")
         return
 
+    if order and user_id:
+        if not active_delivery_session:
+            active_delivery_session = await get_active_delivery_session(order.id, loader_id=user_id, session_msg_id=reply_to.message_id)
+
+        if not active_delivery_session and order.package_progress:
+            sel_pkgs = get_loader_selected_packages(order.package_progress, user_id)
+            if sel_pkgs:
+                try:
+                    active_delivery_session = await create_delivery_session(
+                        order_id=order.id,
+                        loader_id=user_id,
+                        session_msg_id=reply_to.message_id,
+                        selected_packages=json.dumps(sel_pkgs)
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    p_items = json.loads(order.package_progress)
+                    for p_idx, p_it in enumerate(p_items):
+                        if isinstance(p_it, dict) and p_it.get("status") == "Pending":
+                            updated_items, _ = toggle_package_selection(order.package_progress, p_idx, user_id)
+                            new_json = json.dumps(updated_items)
+                            await update_order_package_progress(order.id, new_json)
+                            order.package_progress = new_json
+                            sel_auto = get_loader_selected_packages(new_json, user_id)
+                            if sel_auto:
+                                active_delivery_session = await create_delivery_session(
+                                    order_id=order.id,
+                                    loader_id=user_id,
+                                    session_msg_id=reply_to.message_id,
+                                    selected_packages=json.dumps(sel_auto)
+                                )
+                            break
+                except Exception:
+                    pass
+
     # Extra Guard: Verify candidate order belongs to this loader group chat
     if order.loader_group_id and order.loader_group_id != chat.id:
         logger.warning(f"[LOADER] Order #{order.id} loader_group_id ({order.loader_group_id}) does not match current chat {chat.id}. Ignored.")
@@ -3237,20 +3287,6 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     if not is_media:
         return
-
-    # For multi-package orders (> 1 packages), require active DeliverySession (Confirm Delivery) for actual delivery screenshots
-    if order and order.package_progress and not active_delivery_session:
-        try:
-            p_items = json.loads(order.package_progress)
-            if len(p_items) > 1:
-                logger.warning(f"[LOADER] No active delivery session found for multi-package delivery on Order #{order.id}.")
-                try:
-                    await message.reply_text("⚠️ No active delivery session found.\nPlease press Confirm Delivery first.")
-                except Exception as e:
-                    logger.exception(f"[LOADER] Failed to send missing session notice: {e}")
-                return
-        except Exception:
-            pass
 
     # Rule 3: Check Order Status (Repeated Delivery Workflow - Part 1 Requirement)
     if order.status == "Delivered":

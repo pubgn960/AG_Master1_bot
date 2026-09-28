@@ -1817,8 +1817,16 @@ async def get_order_waiting_for_customer_update(client_chat_id: int) -> Optional
 async def create_delivery_session(order_id: int, loader_id: int, session_msg_id: int, selected_packages: Optional[str] = None) -> DeliverySession:
     """
     Creates and persists a Delivery Session linked to prompt message session_msg_id.
+    Closes any existing active sessions for the same order and loader first.
     """
     async with AsyncSessionLocal() as session:
+        await session.execute(
+            delete(DeliverySession).where(
+                (DeliverySession.order_id == order_id) &
+                (DeliverySession.loader_id == loader_id) &
+                (DeliverySession.status == "waiting_images")
+            )
+        )
         ds = DeliverySession(
             order_id=order_id,
             loader_id=loader_id,
@@ -1845,6 +1853,32 @@ async def get_delivery_session_by_msg_id(session_msg_id: int) -> Optional[Delive
         res = await session.execute(stmt)
         ds = res.scalar_one_or_none()
         return ds
+
+
+async def get_active_delivery_session(order_id: int, loader_id: Optional[int] = None, session_msg_id: Optional[int] = None) -> Optional[DeliverySession]:
+    """
+    Looks up an active waiting_images DeliverySession by session_msg_id, or by (order_id, loader_id).
+    """
+    async with AsyncSessionLocal() as session:
+        if session_msg_id:
+            stmt = select(DeliverySession).where(
+                (DeliverySession.delivery_session_message_id == session_msg_id) &
+                (DeliverySession.status == "waiting_images")
+            )
+            ds = (await session.execute(stmt)).scalar_one_or_none()
+            if ds:
+                return ds
+
+        stmt = select(DeliverySession).where(
+            (DeliverySession.order_id == order_id) &
+            (DeliverySession.status == "waiting_images")
+        )
+        if loader_id:
+            stmt = stmt.where(DeliverySession.loader_id == loader_id)
+
+        stmt = stmt.order_by(DeliverySession.id.desc())
+        res = await session.execute(stmt)
+        return res.scalars().first()
 
 
 async def close_delivery_session(session_id: int) -> None:

@@ -30,6 +30,7 @@ from database import (
     update_order_price,
     update_order_package_progress,
     get_delivery_session_by_msg_id,
+    get_active_delivery_session,
     close_delivery_session,
     update_order_client_delivered_msg_id,
     save_order_pricing
@@ -194,11 +195,13 @@ async def deliver_order_by_id(
     selected_delivery_items: List[Dict[str, Any]] = []
     if loader_reply_msg_id:
         active_ds = await get_delivery_session_by_msg_id(loader_reply_msg_id)
-        if active_ds and active_ds.selected_packages:
-            try:
-                selected_delivery_items = json.loads(active_ds.selected_packages)
-            except Exception:
-                selected_delivery_items = []
+    if not active_ds and order_id:
+        active_ds = await get_active_delivery_session(order_id, session_msg_id=loader_reply_msg_id)
+    if active_ds and active_ds.selected_packages:
+        try:
+            selected_delivery_items = json.loads(active_ds.selected_packages)
+        except Exception:
+            selected_delivery_items = []
 
     # Automated Category B & Package-Level Secret Profit Code Calculation at Delivery Time
     resolved_loader_id = None
@@ -452,7 +455,12 @@ async def deliver_order_by_id(
             logger.warning(f"Failed to edit Loader Group progress card: {e_l}")
 
     # Close active Delivery Session in DB if present
-    if loader_reply_msg_id:
+    if active_ds:
+        try:
+            await close_delivery_session(active_ds.id)
+        except Exception:
+            pass
+    elif loader_reply_msg_id:
         try:
             ds = await get_delivery_session_by_msg_id(loader_reply_msg_id)
             if ds:

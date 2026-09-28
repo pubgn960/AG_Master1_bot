@@ -10725,6 +10725,161 @@ class TestMultiPackageOrderPackageLevelDeliveryAndAccounting(unittest.IsolatedAs
         self.assertEqual(caption, expected_caption, "Single-package delivery caption MUST remain 100% backward compatible!")
 
 
+class TestPackageActiveDeliverySessionBugFix(unittest.IsolatedAsyncioTestCase):
+    """
+    Unit tests for Package-Level Active Delivery Session Bug Fix:
+    1. Selecting first package creates active package session.
+    2. Selecting second package creates independent package session.
+    3. Partial delivery: First package delivery does not affect second package.
+    4. Second package remains selectable after first package delivery.
+    5. Package-level duplicate protection (Double-selecting an already-delivered package is blocked).
+    6. Single-package safety (Existing single-package delivery still passes).
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal
+        from models import Order, DeliverySession
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(DeliverySession))
+            await session.execute(delete(Order))
+            await session.commit()
+
+    async def test_1_selecting_first_package_creates_active_package_session(self):
+        from database import create_order, update_order_package_progress, create_delivery_session, get_active_delivery_session
+        from utils import toggle_package_selection, get_loader_selected_packages
+        import json
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Pending"},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(email="testreal47@gmail.com", package="20K (19200cp+880cp)", package_progress=pkgs_json)
+
+        updated_items, status = toggle_package_selection(order.package_progress, 0, loader_id=100)
+        self.assertEqual(status, "Selected")
+        await update_order_package_progress(order.id, json.dumps(updated_items))
+
+        sel = get_loader_selected_packages(json.dumps(updated_items), loader_id=100)
+        ds = await create_delivery_session(order.id, loader_id=100, session_msg_id=7001, selected_packages=json.dumps(sel))
+        self.assertIsNotNone(ds)
+        self.assertEqual(ds.order_id, order.id)
+
+        active_ds = await get_active_delivery_session(order.id, loader_id=100)
+        self.assertIsNotNone(active_ds)
+        active_pkgs = json.loads(active_ds.selected_packages)
+        self.assertEqual(len(active_pkgs), 1)
+        self.assertEqual(active_pkgs[0]["package"], "19200")
+
+    async def test_2_selecting_second_package_creates_independent_package_session(self):
+        from database import create_order, update_order_package_progress, create_delivery_session, get_active_delivery_session
+        from utils import toggle_package_selection, get_loader_selected_packages
+        import json
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Delivered", "delivered_by": 100},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(email="testreal47@gmail.com", package="20K (19200cp+880cp)", package_progress=pkgs_json)
+
+        updated_items, status = toggle_package_selection(order.package_progress, 1, loader_id=100)
+        self.assertEqual(status, "Selected")
+        await update_order_package_progress(order.id, json.dumps(updated_items))
+
+        sel = get_loader_selected_packages(json.dumps(updated_items), loader_id=100)
+        await create_delivery_session(order.id, loader_id=100, session_msg_id=7002, selected_packages=json.dumps(sel))
+
+        active_ds = await get_active_delivery_session(order.id, loader_id=100)
+        self.assertIsNotNone(active_ds)
+        active_pkgs = json.loads(active_ds.selected_packages)
+        self.assertEqual(len(active_pkgs), 1)
+        self.assertEqual(active_pkgs[0]["package"], "880")
+
+    async def test_3_partial_delivery_first_package_does_not_affect_second_package(self):
+        from database import create_order, get_order_by_id, create_delivery_session, add_images_to_order, set_order_loader_message_id
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+        import json
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Pending"},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(email="testreal47@gmail.com", package="20K (19200cp+880cp)", package_progress=pkgs_json, client_chat_id=-100111)
+        await set_order_loader_message_id(order.id, 8001, loader_group_id=-100222)
+        await add_images_to_order(order.id, [("file_id_1", "photo")])
+
+        sel = [{"package": "19200", "qty": 1, "status": "Selected"}]
+        await create_delivery_session(order.id, loader_id=100, session_msg_id=9001, selected_packages=json.dumps(sel))
+
+        mock_bot = MagicMock()
+        mock_bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=9999)])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        res = await deliver_order_by_id(bot=mock_bot, order_id=order.id, loader_chat_id=-100222, loader_reply_msg_id=9001, target_delivery_chat_id=-100111)
+        self.assertTrue(res)
+
+        updated = await get_order_by_id(order.id)
+        self.assertEqual(updated.status, "Partially Delivered")
+        pkgs = json.loads(updated.package_progress)
+        self.assertEqual(pkgs[0]["status"], "Delivered")
+        self.assertEqual(pkgs[1]["status"], "Pending")
+
+    async def test_4_second_package_remains_selectable_after_first_package_delivery(self):
+        from database import create_order
+        from utils import toggle_package_selection
+        import json
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Delivered", "delivered_by": 100},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(email="testreal47@gmail.com", package="20K (19200cp+880cp)", package_progress=pkgs_json)
+
+        updated_items, status = toggle_package_selection(order.package_progress, 1, loader_id=100)
+        self.assertEqual(status, "Selected")
+        self.assertEqual(updated_items[1]["status"], "Selected")
+
+    async def test_5_package_level_duplicate_protection(self):
+        from database import create_order
+        from utils import toggle_package_selection
+        import json
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Delivered", "delivered_by": 100},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(email="testreal47@gmail.com", package="20K (19200cp+880cp)", package_progress=pkgs_json)
+
+        updated_items, status = toggle_package_selection(order.package_progress, 0, loader_id=100)
+        self.assertEqual(status, "Delivered")
+        self.assertEqual(updated_items[0]["status"], "Delivered")
+
+    async def test_6_single_package_safety_existing_delivery_passes(self):
+        from database import create_order, get_order_by_id, add_images_to_order, set_order_loader_message_id
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+
+        order = await create_order(email="single_safety@example.com", package="2400", client_chat_id=-100111)
+        await set_order_loader_message_id(order.id, 8002, loader_group_id=-100222)
+        await add_images_to_order(order.id, [("file_id_single", "photo")])
+
+        mock_bot = MagicMock()
+        mock_bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=8888)])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        res = await deliver_order_by_id(bot=mock_bot, order_id=order.id, loader_chat_id=-100222, target_delivery_chat_id=-100111)
+        self.assertTrue(res)
+
+        updated = await get_order_by_id(order.id)
+        self.assertEqual(updated.status, "Delivered")
+
+
 if __name__ == "__main__":
     unittest.main()
 
