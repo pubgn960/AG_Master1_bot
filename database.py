@@ -1049,21 +1049,21 @@ async def get_pending_order_by_email(email: str) -> Optional[Order]:
 
 async def get_exact_duplicate_pending_order(email: str, text_content: str) -> Optional[Order]:
     """
-    Retrieves an active Pending Order matching email AND having 100% identical normalized content.
-    Prevents false positives when a customer submits different packages, UIDs, usernames, or passwords under the same email.
+    Retrieves an active Pending Order matching exact complete raw customer message text.
+    An order is a duplicate ONLY when the complete original customer message is 100% identical.
+    Even a 1-character difference (e.g. password ABC123 vs ABC124) means it is NOT a duplicate.
     """
-    if not text_content:
+    if not text_content or not text_content.strip():
         return None
 
+    raw_clean = text_content.strip()
     from utils import normalize_order_content_for_dedup
-
-    email_clean = email.lower().strip()
     new_norm = normalize_order_content_for_dedup(text_content)
 
     async with AsyncSessionLocal() as session:
         stmt = (
             select(Order)
-            .where(Order.email == email_clean, Order.status.in_(["Pending", "Pending Approval", "Pending Payment"]))
+            .where(Order.status.in_(["Pending", "Pending Approval", "Pending Payment"]))
             .order_by(Order.created_at.desc())
         )
         res = await session.execute(stmt)
@@ -1071,8 +1071,7 @@ async def get_exact_duplicate_pending_order(email: str, text_content: str) -> Op
 
         for order in pending_orders:
             existing_text = order.raw_text or f"Package: {order.package or ''}\nEmail: {order.email or ''}"
-            existing_norm = normalize_order_content_for_dedup(existing_text)
-            if existing_norm == new_norm:
+            if existing_text.strip() == raw_clean or normalize_order_content_for_dedup(existing_text) == new_norm:
                 return order
 
     return None

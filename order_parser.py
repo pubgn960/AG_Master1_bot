@@ -1,8 +1,9 @@
 """
 Production Order Parser v2 — Real Customer Pattern Support.
 Parses complex, multilingual customer order messages, extracts structured fields,
-handles package multipliers and aliases, ignores customer reference prefixes (e.g. 991#, Order #:54),
-gives explicit priority to CP PACK fields, isolates recovery codes, and classifies orders
+handles package multipliers, explicit package breakdowns, Spanish and English field labels,
+isolates recovery codes, extracts customer reference prefixes (e.g. G49, 252#, #63, Orden #70, 4WA48LUGWKH),
+strips prices in parentheses e.g. 24000 (137), and classifies orders accurately
 while enforcing security logging (no passwords/credentials logged).
 """
 
@@ -14,74 +15,101 @@ logger = logging.getLogger(__name__)
 
 # Default Alias Mapping (Configurable)
 DEFAULT_PACKAGE_ALIASES: Dict[str, str] = {
-    "5k": "5040",
-    "5000": "5040",
-    "5040": "5040",
-    "10k": "10800",
-    "10000": "10800",
-    "10800": "10800",
-    "2.4k": "2400",
-    "2,4k": "2400",
-    "2400": "2400",
-    "4.8k": "4800",
-    "4,8k": "4800",
-    "4800": "4800",
-    "9.6k": "9600",
-    "9,6k": "9600",
-    "9600": "9600",
-    "12k": "12000",
-    "12000": "12000",
-    "24k": "24000",
-    "24000": "24000",
     "10.8k": "10800",
     "10,8k": "10800",
+    "10.800": "10800",
+    "10,800": "10800",
+    "7.4k": "7400",
+    "7,4k": "7400",
+    "7.400": "7400",
+    "7,400": "7400",
+    "2.4k": "2400",
+    "2,4k": "2400",
+    "2.400": "2400",
+    "2,400": "2400",
+    "4.8k": "4800",
+    "4,8k": "4800",
+    "4.800": "4800",
+    "4,800": "4800",
+    "9.6k": "9600",
+    "9,6k": "9600",
+    "9.600": "9600",
+    "9,600": "9600",
+    "12k": "12000",
+    "12,000": "12000",
+    "12.000": "12000",
+    "24k": "24000",
+    "24,000": "24000",
+    "24.000": "24000",
     "5.04k": "5040",
     "5,04k": "5040",
+    "5040": "5040",
+    "5000": "5040",
+    "5k": "5040",
+    "5,0k": "5040",
+    "5.0k": "5040",
+    "10k": "10800",
+    "20k": "19200",
 }
-
-# Supported Platforms (case-insensitive)
-SUPPORTED_PLATFORMS: List[str] = [
-    "facebook",
-    "fb",
-    "meta",
-    "activision",
-    "activacion",
-    "activación",
-    "activision id"
-]
 
 # Standard Email Regex (Supports .es, .com, .me, etc.)
 EMAIL_REGEX = re.compile(
-    r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+    r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',
     re.IGNORECASE
 )
 
-# International Phone Regex (e.g. +584249290951)
+# International Phone Regex (e.g. +573053657865)
 PHONE_REGEX = re.compile(
     r'(?:\+|\b00)\d{1,3}[\s.-]?\d{6,14}\b'
 )
 
-# Customer Reference / Order ID Prefix Regex (e.g. "Order #:54", "Order #54", "Order: #54", "991#", "#54", "#105", "635*Activision*")
+# Customer Reference / Order ID Prefix Regex (e.g. G49, G47, 252#, #63, Order #4, Orden #70, Recarga #122, 4WA48LUGWKH)
 CUSTOMER_REF_REGEX = re.compile(
-    r'\border\s*#?\s*[:=\-]?\s*#?\s*(\d+)\b|^\s*#(\d+)\b|^\s*#?(\d+)#|^\s*(\d{2,4})\s*(?:#|[\-_\s*]+(?:activision|facebook|fb|meta)\b)',
+    r'^\s*(?:recarga|orden|order)\s*#?\s*[:=\-]?\s*#?\s*\d+(?:\s*\([^)]+\))?|'
+    r'^\s*#[0-9]{1,5}\b|'
+    r'^\s*[0-9]{1,5}#|'
+    r'^\s*[0-9]{1,5}\b(?:\s*[*_]?(?:fb|facebook|meta|activision|activacion|safe|codm))|'
+    r'^\s*[a-zA-Z]\d{1,5}\b|'
+    r'^\s*(?-i:[A-Z0-9]{8,12})\b',
     re.IGNORECASE | re.MULTILINE
 )
 
-# Explicit CP PACK Header Regex (e.g. "CP PACK: 12.000", "CP PACK : 4.800")
-CP_PACK_REGEX = re.compile(
-    r'\b(?:cp\s*pack|cp\s*package|pack\s*cp)\s*[:=\.\-]?\s*(?P<val>[^\n\r]+)',
+
+# Field Header Patterns
+EMAIL_HEADER_REGEX = re.compile(
+    r'^\s*[^\w\s]*\s*(?:login|email|e-mail|emai|mail|correo[\w\ufffd\s]*|user|cuenta)\s*[:=\.\-]?\s*(.*)$',
     re.IGNORECASE
 )
 
-# Recovery Codes Header Regex (e.g. "Codes:", "Codes: (solo FB)", "Códigos:", "Recovery Codes:", "OTP:", "2FA:")
+PASSWORD_HEADER_REGEX = re.compile(
+    r'^\s*[^\w\s]*\s*(?:password|pasword|pass|pw|pwd|contrase[\w\ufffd]*a\s*de\s*fb|contrase[\w\ufffd]*a|contrasena|clave)\s*[:=\.\-]?\s*(.*)$',
+    re.IGNORECASE
+)
+
+NICK_HEADER_REGEX = re.compile(
+    r'^\s*[^\w\s]*\s*(?:nickname|nick\s*name|nick/nombre\s*codm|nick/nombre|nick|nombre[\w\ufffd\s]*|apodo[\w\ufffd\s]*|username|user\s*name|usuario|ign|id)\s*[:=\.\-]?\s*(.*)$',
+    re.IGNORECASE
+)
+
+GAME_HEADER_REGEX = re.compile(
+    r'^\s*[^\w\s]*\s*(?:juego\s*y\s*login|juego|game|login)\s*[:=\.\-]?\s*(.*)$',
+    re.IGNORECASE
+)
+
+CP_HEADER_REGEX = re.compile(
+    r'^\s*[^\w\s]*\s*(?:cp\s*pack|cp\s*package|pack\s*cp|codp\'?s|codpoints|codp|package|pack|cp)\s*[:=\.\-]?\s*(.*)$',
+    re.IGNORECASE
+)
+
+# Recovery Codes Header Regex
 RECOVERY_HEADER_REGEX = re.compile(
-    r'^\s*(?:codes?|código|códigos|codigo|codigos|recovery\s*codes?|backup\s*codes?|otp|2fa|authenticator)\b',
+    r'^\s*[^\w\s]*\s*(?:codes?|c[óo\ufffd.]digos?|recovery\s*codes?|backup\s*codes?|otp|2fa|authenticator)\b',
     re.IGNORECASE
 )
 
-# Recovery Code Pattern (8 digits or 4+4 digits)
+# Recovery Code Line Pattern (8-digit or 4+4 digit e.g. "8515 0451", "0023 3561", "0674 5886", "12345678")
 RECOVERY_CODE_PATTERN = re.compile(
-    r'^\s*(\d{6,12}|\d{4}\s*\d{4})\s*$'
+    r'^\s*(\d{8}|\d{4}[\s\-]\d{4})\s*$'
 )
 
 
@@ -89,10 +117,10 @@ def get_dynamic_package_prices(category: str = "A") -> Dict[str, float]:
     """Dynamically loads package prices from utils for specified category ('A' or 'B') with fallback."""
     cat = (category or "A").upper()
     fallback = {
-        "108000": 563.0, "96000": 503.0, "72000": 375.0, "55200": 291.0,
-        "48000": 254.0, "43200": 229.0, "38400": 211.0, "24000": 132.0,
+        "108000": 563.0, "100800": 573.0, "96000": 503.0, "72000": 375.0, "55200": 291.0,
+        "48000": 254.0, "43200": 229.0, "38400": 211.0, "31200": 179.0, "24000": 132.0,
         "21600": 119.0, "19200": 109.0, "16800": 95.0, "14400": 82.0,
-        "12000": 69.0, "10800": 64.0, "9600": 55.0, "7200": 42.0,
+        "12000": 69.0, "10800": 64.0, "9600": 55.0, "7400": 43.0, "7200": 42.0,
         "5040": 33.0, "4800": 29.0, "2400": 16.5, "880": 8.0,
         "420": 4.5, "80": 1.0
     }
@@ -113,14 +141,7 @@ def get_dynamic_package_prices(category: str = "A") -> Dict[str, float]:
 
 
 def normalize_package_alias(pkg_name: Optional[str], alias_map: Optional[Dict[str, str]] = None) -> str:
-    """
-    Normalizes package alias to canonical package string.
-    Case-insensitive, e.g.:
-    "5k" -> "5040"
-    "5000" -> "5040"
-    "12.000" -> "12000"
-    "4.800" -> "4800"
-    """
+    """Normalizes package alias to canonical package string."""
     if not pkg_name:
         return ""
     pkg_str = str(pkg_name).strip()
@@ -138,12 +159,28 @@ def normalize_package_alias(pkg_name: Optional[str], alias_map: Optional[Dict[st
 
 
 def extract_customer_ref_id(text: Optional[str]) -> Optional[str]:
-    """Extracts customer reference ID prefix like '54', '991', '105', etc."""
+    """Extracts customer reference ID prefix like 'G49', '252#', 'Orden #70', '#63', '4WA48LUGWKH', etc."""
     if not text:
         return None
-    match = CUSTOMER_REF_REGEX.search(text)
-    if match:
-        return match.group(1) or match.group(2) or match.group(3) or match.group(4)
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines[:3]:
+        if "@" in line:
+            continue
+        m = CUSTOMER_REF_REGEX.search(line)
+        if m:
+            ref_str = m.group(0).strip()
+            m_num_platform = re.match(r'^(\d{1,5})\s*[*_]?(?:fb|facebook|meta|activision|activacion|safe|codm)', ref_str, re.IGNORECASE)
+            if m_num_platform:
+                return m_num_platform.group(1)
+            m_order_num = re.match(r'^order\s*#?\s*[:=\-]?\s*#?\s*(\d+)$', ref_str, re.IGNORECASE)
+            if m_order_num:
+                return m_order_num.group(1)
+            clean_hash = ref_str.strip("#").strip()
+            if clean_hash.isdigit():
+                return clean_hash
+            return ref_str
+
     return None
 
 
@@ -153,7 +190,7 @@ def parse_order_v2(
     category: str = "A"
 ) -> Dict[str, Any]:
     """
-    Production Order Parser v2 - Real Customer Pattern Support.
+    Production Order Parser v2 — Real Customer Pattern Support.
 
     Returns structured dictionary:
     {
@@ -167,10 +204,11 @@ def parse_order_v2(
         "recovery_codes": List[str],
         "packages": List[Dict[str, Any]],
         "unknown_packages": List[str],
+        "unclassified_data": List[str],
         "total_price": Optional[float]
     }
     """
-    if not text:
+    if not text or not text.strip():
         return {
             "order_detected": False,
             "customer_ref_id": None,
@@ -182,6 +220,7 @@ def parse_order_v2(
             "recovery_codes": [],
             "packages": [],
             "unknown_packages": [],
+            "unclassified_data": [],
             "total_price": None
         }
 
@@ -190,9 +229,9 @@ def parse_order_v2(
     if alias_map:
         aliases.update(alias_map)
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
 
-    # 1. Customer Ref ID (e.g. "Order #:54", "991#", "#54")
+    # 1. Customer Ref ID
     customer_ref_id = extract_customer_ref_id(text)
 
     # 2. Email & Phone Extraction
@@ -202,21 +241,28 @@ def parse_order_v2(
     phone_match = PHONE_REGEX.search(text)
     phone = phone_match.group(0).strip() if phone_match else None
 
-    # 3. Login Method Detection
-    login_method = None
+    # 3. Login Method & Game Detection
+    login_methods: List[str] = []
     text_lower = text.lower()
 
+    if "safe ios" in text_lower or "ios" in text_lower:
+        login_methods.append("Safe iOS")
+    if "safe google" in text_lower:
+        login_methods.append("Safe Google")
     if any(k in text_lower for k in ("activision", "activación", "activacion")):
-        login_method = "Activision"
-    elif any(k in text_lower for k in ("facebook", "fb", "meta")):
-        login_method = "Facebook"
+        login_methods.append("Activision")
+    if any(k in text_lower for k in ("facebook", "fb", "meta")):
+        login_methods.append("Facebook")
 
-    # 4. Line-by-line Classification (Username, Password, Recovery Codes, CP PACK, Package Candidate Lines)
+    login_method = " / ".join(login_methods) if login_methods else None
+
+    # 4. Line-by-line Classification
     username = None
     password = None
     recovery_codes: List[str] = []
     explicit_cp_pack_candidates: List[str] = []
     package_candidate_lines: List[str] = []
+    unclassified_data: List[str] = []
     ignored_lines: Set[int] = set()
 
     in_recovery_sec = False
@@ -225,43 +271,31 @@ def parse_order_v2(
     next_line_is_email = False
     has_explicit_cp_pack = False
 
-    for idx, line in enumerate(lines):
+    for idx, line in enumerate(raw_lines):
         l_strip = line.strip()
         l_lower = l_strip.lower()
 
-        # Ignore Customer Ref Line like "Order #:54", "991#", "#54"
-        if re.search(r'\border\s*#?\s*[:=\-]?\s*#?\s*\d+\b', l_lower, re.IGNORECASE) or CUSTOMER_REF_REGEX.match(l_strip):
+        # Ignore Customer Ref Line on top line (skip if line contains email @ symbol)
+        if idx < 3 and "@" not in l_strip and CUSTOMER_REF_REGEX.search(l_strip):
             ignored_lines.add(idx)
             continue
 
-        # Ignore standalone platform headers like "*facebook*", "*Activision*", "Activación"
-        l_clean = re.sub(r'^[*_\s]+|[*_\s]+$', '', l_strip)
-        if l_clean.lower() in ("facebook", "fb", "meta", "activision", "activacion", "activación", "activision id"):
-            ignored_lines.add(idx)
-            continue
-
-        # Check Explicit CP PACK Header (Highest Priority for Package Extraction)
-        cp_match = CP_PACK_REGEX.search(l_strip)
-        if cp_match:
-            cp_val = cp_match.group("val").strip()
-            # Clean trailing details if present on line (e.g. "12.000 Mode: Safe")
-            if "mode:" in cp_val.lower():
-                cp_val = cp_val.lower().split("mode:", 1)[0].strip()
-            explicit_cp_pack_candidates.append(cp_val)
-            has_explicit_cp_pack = True
+        # Ignore standalone platform headers like "*facebook*", "*Activision*", "Activación", "Safe iOS"
+        l_clean = re.sub(r'^[*_\s•]+|[*_\s•]+$', '', l_strip).strip()
+        if l_clean.lower() in ("facebook", "fb", "meta", "activision", "activacion", "activación", "activision id", "safe ios", "safe google", "codm"):
             ignored_lines.add(idx)
             continue
 
         # Multiline Header state consumption
         if next_line_is_username:
             if not username:
-                username = l_strip
+                username = re.sub(r'^[•\-*\s\ufffd:]+', '', l_strip).strip()
             next_line_is_username = False
             ignored_lines.add(idx)
             continue
         if next_line_is_password:
             if not password:
-                password = l_strip
+                password = re.sub(r'^[•\-*\s\ufffd:]+', '', l_strip).strip()
             next_line_is_password = False
             ignored_lines.add(idx)
             continue
@@ -270,177 +304,149 @@ def parse_order_v2(
             ignored_lines.add(idx)
             continue
 
-        # Check Direct Recovery Code Line (e.g. "0674 5886", "0796 5268", "1726 2601", "1234-5678", "06745886", "0674")
-        clean_code_line = re.sub(r'^[*\s•\-]+', '', l_strip).strip()
-        is_direct_rec_code = (
-            bool(re.match(r'^\d{4}[\s\-]\d{4}$', clean_code_line))
-            or bool(re.match(r'^\d{4}[\s\-]\d{4}$', l_strip))
-            or (bool(re.match(r'^\d{8}$', clean_code_line)) and clean_code_line not in price_db and clean_code_line not in aliases)
-            or (clean_code_line.startswith("0") and len(clean_code_line) >= 4 and clean_code_line not in aliases and clean_code_line not in price_db)
-        )
-        if is_direct_rec_code:
-            recovery_codes.append(clean_code_line if clean_code_line else l_strip)
-            ignored_lines.add(idx)
-            continue
-
         # Check Recovery Code Section Header
-        if RECOVERY_HEADER_REGEX.search(l_strip) or l_lower.startswith("codes") or l_lower.startswith("código") or l_lower.startswith("codigo") or l_lower.startswith("codigos"):
+        if RECOVERY_HEADER_REGEX.search(l_strip):
             in_recovery_sec = True
             ignored_lines.add(idx)
             continue
 
+        clean_code_line = re.sub(r'^[*\s•\-]+', '', l_strip).strip()
+        is_rec_code = bool(RECOVERY_CODE_PATTERN.match(l_strip)) or bool(RECOVERY_CODE_PATTERN.match(clean_code_line))
+
+        if is_rec_code:
+            recovery_codes.append(clean_code_line if clean_code_line else l_strip)
+            ignored_lines.add(idx)
+            continue
+
         if in_recovery_sec:
-            clean_code_line = re.sub(r'^[*\s•\-]+', '', l_strip).strip()
-
-            is_rec_code = (
-                bool(RECOVERY_CODE_PATTERN.match(l_strip))
-                or bool(RECOVERY_CODE_PATTERN.match(clean_code_line))
-                or bool(re.match(r'^\d{4,6}[\s\-]?\d{4,6}$', clean_code_line))
-                or bool(re.match(r'^\d{6,12}$', clean_code_line))
-            )
-
             is_field_header = any(
-                h in l_lower for h in ("order", "pedido", "paquete", "cp pack", "cp", "mode", "time", "email", "correo", "password", "contraseña", "clave", "ign", "nick", "login")
-            ) or (
-                clean_code_line.lower() in aliases or l_lower in aliases or clean_code_line in price_db or l_lower in price_db
+                h in l_lower for h in ("order", "orden", "pedido", "paquete", "cp pack", "cp", "package", "pack", "email", "emai", "mail", "correo", "password", "pasword", "pass", "pw", "pwd", "contraseña", "clave", "nick", "nombre")
+            )
+            has_pkg_match = (
+                clean_code_line in price_db
+                or clean_code_line.lower() in aliases
+                or bool(re.search(r'\d+\s*[*xX×]\s*\d+|\b\d+(?:[\.,]\d{3})*\s*(?:cp|k)\b', clean_code_line, re.IGNORECASE))
             )
 
-            if is_field_header and not is_rec_code:
+            if is_field_header or has_pkg_match:
                 in_recovery_sec = False
-            elif is_rec_code or (not is_field_header and bool(re.search(r'\d', clean_code_line))):
+            elif bool(re.search(r'\d{5,12}|\d{4}[\s\-]\d{4}', clean_code_line)):
                 recovery_codes.append(clean_code_line if clean_code_line else l_strip)
                 ignored_lines.add(idx)
                 continue
 
-        # Email Headers or Email address line
-        if EMAIL_REGEX.search(l_strip):
+        # Check Explicit CP PACK Header
+        cp_match = CP_HEADER_REGEX.match(l_strip)
+        if cp_match:
+            cp_val = cp_match.group(1).strip()
+            cp_val = re.sub(r'^[•\-*\s\ufffd:]+', '', cp_val).strip()
+            if cp_val:
+                explicit_cp_pack_candidates.append(cp_val)
+                has_explicit_cp_pack = True
             ignored_lines.add(idx)
-            continue
-        if re.match(r'^(?:login|email|e-mail|mail|correo\s*o\s*número\s*fb|correo\s*o\s*numero\s*fb|correo\s*o\s*número|correo\s*o\s*numero|correo\s*electrónico|correo\s*electronico|correo)\s*[:=\.\-]?$', l_lower) or any(l_lower.startswith(h) for h in ("login:", "email:", "e-mail:", "correo:", "mail:")):
-            ignored_lines.add(idx)
-            val = line.split(":", 1)[-1].strip() if ":" in line else ""
-            if val and EMAIL_REGEX.search(val):
-                email = EMAIL_REGEX.search(val).group(0).lower().rstrip(".,;!")
-            elif not val or val.lower() in ("login", "email", "e-mail", "mail", "correo"):
-                next_line_is_email = True
             continue
 
-        # Phone line (e.g. +584249290951)
+        # Email Header
+        em_match = EMAIL_HEADER_REGEX.match(l_strip)
+        if em_match or EMAIL_REGEX.search(l_strip):
+            ignored_lines.add(idx)
+            if em_match:
+                val = em_match.group(1).strip()
+                if val and EMAIL_REGEX.search(val):
+                    email = EMAIL_REGEX.search(val).group(0).lower().rstrip(".,;!")
+                elif not val:
+                    next_line_is_email = True
+            continue
+
+        # Phone line
         if PHONE_REGEX.search(l_strip):
             ignored_lines.add(idx)
             continue
 
-        # UID / Account ID Headers
-        if re.match(r'^(?:uid|account\s*id|id)\s*[:=\.\-]?$', l_lower):
+        # Nickname / Username Header
+        nick_match = NICK_HEADER_REGEX.match(l_strip)
+        if nick_match:
             ignored_lines.add(idx)
-            val = line.split(":", 1)[-1].strip() if ":" in line else ""
-            if not val:
-                next_line_is_email = True
-            continue
-
-        # Username Headers
-        if re.match(r'^(?:nickname|nick\s*name|nick|apodo\s*en\s*el\s*juego|apodo|username|user\s*name|usuario|ign|nombre|ign\s*"nick")\s*[:=\.\-]?$', l_lower) or "ign" in l_lower or any(l_lower.startswith(h) for h in ("nickname:", "nick:", "nick name:", "ign:", "username:", "apodo:", "nombre:", "usuario:", "nickname ", "nick ")):
-            ignored_lines.add(idx)
-            val = line.split(":", 1)[-1].strip() if ":" in line else line
-            if "ign" in l_lower and ":" in line:
-                val = line.split(":", 1)[-1].strip()
-            elif l_lower.startswith("nick ") and ":" not in line:
-                val = line[5:].strip()
-            elif l_lower.startswith("nickname ") and ":" not in line:
-                val = line[9:].strip()
-
-            header_kw = (
-                "nickname", "nick", "nick name", "apodo", "apodo en el juego", "username", "user name",
-                "usuario", "ign", "nombre", "ign \"nick\"", "nickname:", "nick:", "apodo:", "username:", "ign:"
-            )
-
-            if val and val.lower() not in header_kw:
-                if "apodo en el juego:" in val.lower():
-                    val = val.split(":", 1)[-1].strip()
-                if val:
-                    username = val
+            val = nick_match.group(1).strip()
+            val = re.sub(r'^[•\-*\s\ufffd:]+', '', val).strip()
+            if val:
+                username = val
             else:
                 next_line_is_username = True
             continue
 
-        # Password Headers
-        if re.match(r'^(?:password|pass|pwd|contraseña\s*de\s*fb|contrasena\s*de\s*fb|contraseña|contrasena|clave)\s*[:=\.\-]?$', l_lower) or any(l_lower.startswith(h) for h in ("password:", "pass:", "pwd:", "contraseña:", "contrasena:", "clave:")):
+        # Password Header
+        pass_match = PASSWORD_HEADER_REGEX.match(l_strip)
+        if pass_match:
             ignored_lines.add(idx)
-            val = line.split(":", 1)[-1].strip() if ":" in line else line
-            header_pass_kw = (
-                "password", "pass", "pwd", "contraseña", "contrasena", "clave",
-                "password:", "pass:", "pwd:", "contraseña:", "contrasena:", "clave:",
-                "contraseña de fb", "contrasena de fb"
-            )
-            if val and val.lower() not in header_pass_kw:
+            val = pass_match.group(1).strip()
+            val = re.sub(r'^[•\-*\s\ufffd:]+', '', val).strip()
+            if val:
                 password = val
             else:
                 next_line_is_password = True
             continue
 
-        # Check if line is a package candidate line
-        has_pkg_token = False
-
-        if re.search(r'\bcp\s*[:=\-]?\s*\d+', l_lower, re.IGNORECASE):
-            has_pkg_token = True
-        elif re.search(r'\b\d+(?:[.,]\d{3})*\s*(?:cp)?\b', l_lower, re.IGNORECASE):
-            nums = re.findall(r'\b(?:\d{1,3}(?:[.,]\d{3})+|\d+)\b', l_lower)
-            for n in nums:
-                n_clean = re.sub(r'[.,]', '', n)
-                n_norm = normalize_package_alias(n_clean, aliases)
-                if n_norm in price_db or n_clean in price_db or n_norm in aliases or n_clean in aliases or (n_clean.isdigit() and 400 <= int(n_clean) < 10000000):
-                    has_pkg_token = True
-                    break
-
-        if not has_pkg_token:
-            for alias in aliases.keys():
-                if re.search(r'\b' + re.escape(alias) + r'\b', l_lower, re.IGNORECASE):
-                    has_pkg_token = True
-                    break
-
-        if not has_pkg_token:
-            if re.search(r'\b\d+(?:cp)?[*xX×]\d+', l_lower) or re.search(r'^\d+\s*[\+\,\&\/]\s*\d+', l_lower):
-                has_pkg_token = True
-
-        if has_pkg_token:
-            package_candidate_lines.append(l_strip)
+        # Game Header
+        game_match = GAME_HEADER_REGEX.match(l_strip)
+        if game_match:
+            ignored_lines.add(idx)
+            val = game_match.group(1).strip()
+            val = re.sub(r'^[•\-*\s\ufffd:]+', '', val).strip()
+            if val and not login_method:
+                login_method = val
             continue
 
-    # Unlabeled Credential Inference (when email is present but password/username have no explicit labels)
-    if email:
-        email_line_idx = -1
-        for idx, line in enumerate(lines):
-            if EMAIL_REGEX.search(line):
-                email_line_idx = idx
+        # Package line check
+        has_pkg_token = False
+        l_no_bullet = re.sub(r'^[•\-*\s]+', '', l_strip).strip()
+
+        # Check if line contains a package number or explicit breakdown/multiplier
+        if re.search(r'\d+\s*[*xX×]\s*\d+|\b\d+(?:[\.,]\d{3})*\s*(?:cp|k)?', l_no_bullet, re.IGNORECASE):
+            has_pkg_token = True
+        elif any(alias in l_no_bullet.lower() for alias in aliases.keys()):
+            has_pkg_token = True
+
+        if has_pkg_token:
+            package_candidate_lines.append(l_no_bullet)
+            ignored_lines.add(idx)
+            continue
+
+    # Unlabeled Credential Inference (when email/phone is present but password/username have no explicit labels)
+    if email or phone:
+        id_line_idx = -1
+        for idx, line in enumerate(raw_lines):
+            if (email and EMAIL_REGEX.search(line)) or (phone and PHONE_REGEX.search(line)):
+                id_line_idx = idx
                 break
 
-        if email_line_idx != -1:
-            # Unlabeled password: line after email if not ignored and not package/2FA
+        if id_line_idx != -1:
+            # Unlabeled password: first non-ignored line after email/phone
             if not password:
-                for idx in range(email_line_idx + 1, len(lines)):
-                    l_str = lines[idx].strip()
-                    if idx not in ignored_lines and l_str and not l_str.startswith("0"):
-                        password = l_str
+                for idx in range(id_line_idx + 1, len(raw_lines)):
+                    l_str = raw_lines[idx].strip()
+                    if idx not in ignored_lines and l_str and not l_str.startswith("0") and not RECOVERY_CODE_PATTERN.match(l_str):
+                        password = re.sub(r'^[•\-*\s\ufffd:]+', '', l_str).strip()
                         ignored_lines.add(idx)
                         break
 
-            # Unlabeled username: line before email if not ignored and not customer_ref
+            # Unlabeled username: line before email/phone if unlabelled
             if not username:
-                for idx in range(email_line_idx - 1, -1, -1):
-                    l_str = lines[idx].strip()
-                    if idx not in ignored_lines and l_str and not CUSTOMER_REF_REGEX.match(l_str) and not l_str.endswith("#"):
-                        username = l_str
+                for idx in range(id_line_idx - 1, -1, -1):
+                    l_str = raw_lines[idx].strip()
+                    if idx not in ignored_lines and l_str and not CUSTOMER_REF_REGEX.search(l_str) and not l_str.endswith("#"):
+                        username = re.sub(r'^[•\-*\s\ufffd:]+', '', l_str).strip()
                         ignored_lines.add(idx)
                         break
 
-    # Priority 1: Explicit CP PACK field takes absolute priority
+    # Collect any remaining unclassified non-ignored lines
+    for idx, line in enumerate(raw_lines):
+        if idx not in ignored_lines and line.strip():
+            unclassified_data.append(line.strip())
+
+    # Priority 1: Explicit CP PACK candidates take priority
     if has_explicit_cp_pack and explicit_cp_pack_candidates:
         package_candidate_lines = explicit_cp_pack_candidates
-    elif not package_candidate_lines:
-        # Priority 3: Fallback to non-ignored lines
-        for idx, line in enumerate(lines):
-            if idx not in ignored_lines and line.strip():
-                package_candidate_lines.append(line.strip())
 
     # 5. Package Segment Extraction & Multiplier Expansion Engine
     packages: List[Dict[str, Any]] = []
@@ -450,11 +456,20 @@ def parse_order_v2(
 
     raw_pkg_text = "\n".join(package_candidate_lines)
 
-    # Clean CP prefixes and suffixes e.g. "CP: 7200" -> "7200", "7200cp." -> "7200"
+    # Process Parentheses Details (e.g. "20K (19200cp+880cp)" vs "24000 (137)")
+    # If parens contain explicit breakdown (with + or cp), extract inner breakdown
+    inner_breakdowns = re.findall(r'\(([^)]*(?:cp|\+)[^)]*)\)', raw_pkg_text, re.IGNORECASE)
+    if inner_breakdowns:
+        raw_pkg_text = "+".join(inner_breakdowns)
+    else:
+        # Strip price / metadata in parentheses e.g. "(137)", "(43.5)", "(270)", "(57)", "(PE-25/09)"
+        raw_pkg_text = re.sub(r'\([^\)]*\)', '', raw_pkg_text)
+
+    # Clean CP prefixes and suffixes e.g. "CP: 7200" -> "7200", "7200cp" -> "7200"
     raw_pkg_text = re.sub(r'\bcp\s*[:=\-]?\s*', '', raw_pkg_text, flags=re.IGNORECASE)
     raw_pkg_text = re.sub(r'(\d+)\s*cp\.?\b', r'\1', raw_pkg_text, flags=re.IGNORECASE)
 
-    # Normalize thousands separators (12.000 -> 12000, 4.800 -> 4800, 7.200 -> 7200, 7,200 -> 7200)
+    # Normalize thousands separators e.g. 12.000 -> 12000, 48,000 -> 48000, 100,800 -> 100800
     raw_pkg_text = re.sub(r'\b(\d{1,3})[.,](\d{3})\b', r'\1\2', raw_pkg_text)
 
     # Normalize aliases first in pkg text (case-insensitive)
@@ -479,7 +494,7 @@ def parse_order_v2(
     )
 
     for seg in segments:
-        if CUSTOMER_REF_REGEX.match(seg) or seg.endswith("#"):
+        if CUSTOMER_REF_REGEX.search(seg) or seg.endswith("#"):
             continue
 
         match = segment_regex.match(seg)
@@ -517,16 +532,14 @@ def parse_order_v2(
         if not pkg:
             continue
 
-        # Always normalize pkg to its canonical package name
         pkg = normalize_package_alias(pkg, aliases)
-
         pkg_int = int(pkg) if pkg.isdigit() else 0
         has_cp = bool(re.search(r'cp', seg, re.IGNORECASE))
 
         unit_price = price_db.get(pkg)
         is_known = (unit_price is not None)
 
-        # Ignore 2FA code fragments (starting with 0 or matching 4+4 digits) or non-CP numbers (<400 or >=10M) from unknown packages
+        # Ignore 2FA code fragments or non-CP numbers (<400 or >=10M) from unknown packages
         if not is_known:
             if pkg.startswith("0") or re.match(r'^\d{4}\s*\d{4}$', pkg) or ((pkg_int < 400 or pkg_int >= 10000000) and not has_cp and not has_explicit_cp_pack):
                 continue
@@ -561,12 +574,24 @@ def parse_order_v2(
     has_pkg = len(packages) > 0
 
     order_detected = False
-    if has_identifier and has_pkg:
-        order_detected = True
-    elif login_method and has_creds and has_pkg:
-        order_detected = True
-    elif has_pkg and (has_identifier or has_creds):
-        order_detected = True
+
+    # Check non-order status phrases (e.g. "Pending 2 hours", "Waiting 24h")
+    is_pure_status_msg = (
+        not has_identifier
+        and not password
+        and not has_pkg
+        and bool(re.search(r'\b(?:pending|waiting|esperando|procesando)\b', text_lower))
+    )
+
+    if not is_pure_status_msg:
+        if has_identifier and has_pkg:
+            order_detected = True
+        elif login_method and has_creds and has_pkg:
+            order_detected = True
+        elif has_pkg and (has_identifier or has_creds):
+            order_detected = True
+        elif customer_ref_id and has_pkg and (has_identifier or has_creds or login_method):
+            order_detected = True
 
     total_price = round(known_total, 2) if (packages and not has_unknown) else (round(known_total, 2) if known_total > 0 else None)
 
@@ -589,5 +614,6 @@ def parse_order_v2(
         "recovery_codes": recovery_codes,
         "packages": packages,
         "unknown_packages": unknown_packages,
+        "unclassified_data": unclassified_data,
         "total_price": total_price
     }

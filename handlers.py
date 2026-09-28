@@ -418,11 +418,17 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     logger.info(f"[DETECTOR] Keyword matched: {keyword}")
 
-    email = extract_email(text_content) or f"order_{message.message_id}@customer.com"
-    package_desc = extract_package(text_content)
-
     # Determine Group Category ('A' or 'B')
     category = CLIENT_GROUPS_CACHE.get(chat.id, "A")
+
+    parsed_order = parse_order_v2(text_content, category=category)
+    email = parsed_order.get("email") or extract_email(text_content) or f"order_{message.message_id}@customer.com"
+
+    pkg_list = [p["package"] for p in parsed_order.get("packages", [])]
+    if pkg_list:
+        package_desc = " + ".join(pkg_list)
+    else:
+        package_desc = extract_package(text_content)
 
     # Check Duplicate Pending Order - Strict Content Deduplication (No False Positives)
     # Only triggers when all important fields (Package, UID, Email, Username, Password, etc.) are 100% identical
@@ -4475,8 +4481,12 @@ def parse_admin_profit_code_input(text: str) -> Optional[Dict[str, Any]]:
     if re.match(r'^\s*[\+\-]?\d+(\.\d+)?\s*$', raw):
         return None
 
-    # Guard: Do not match multi-line order creation text containing passwords, platforms, etc.
-    if re.search(r'\b(password|pass|pwd|contrase[nñ]a|platform|facebook|meta|activision)\b', raw, re.IGNORECASE):
+    # Guard: Do not match multi-line order creation text, order references, or messages detected as customer orders
+    if re.search(r'\b(password|pasword|pass|pwd|contrase[nñ]a|clave|platform|facebook|fb|meta|activision|juego|nombre|nick|nickname|package|pack|cp|codp|codpoints|códigos|codigo|codes)\b', raw, re.IGNORECASE):
+        return None
+
+    from order_parser import parse_order_v2
+    if parse_order_v2(raw).get("order_detected"):
         return None
 
     # Check Format 2: Order ID + Profit Code (e.g. "#46 V", "46 V", "#46\nV")

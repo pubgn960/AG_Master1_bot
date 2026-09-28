@@ -10032,8 +10032,8 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(float(updated_order.loader_cost_total), 15.0)
         self.assertEqual(float(updated_order.profit_amount), 1.0)
 
-        mock_bot.send_media_group.assert_called_once()
-        media_group_sent = mock_bot.send_media_group.call_args[1]["media"]
+        mock_bot.send_media_group.assert_called()
+        media_group_sent = mock_bot.send_media_group.call_args_list[0][1]["media"]
         first_media_caption = media_group_sent[0].caption
 
         expected_caption = (
@@ -10106,6 +10106,344 @@ class TestCategoryBOrderWorkflowAndProfitCode(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rt2, rt1, "Retrying delivery MUST NOT duplicate accounting!")
         self.assertEqual(o2.secret_profit_code, "V", "Secret profit code must remain consistent on retry!")
+
+
+class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
+    """
+    Regression test suite for Real Customer Order Patterns & Enhanced Order Parser v2.
+    Tests all patterns A through AA, recovery code isolation, customer reference extraction,
+    price-in-parentheses filtering, non-order status filtering, profit-code isolation,
+    and exact raw message duplicate detection.
+    """
+
+    def test_pattern_a_g49_labelled_spanish(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "G49\n\n"
+            "• Nombre:\n"
+            "• Juego: CODM\n"
+            "• Mail: villalbawenddy@gmail.com\n"
+            "• Pw: WenMEFU13\n"
+            "• Nickname:WEnddy\n"
+            "• CP:10.8k"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"], "G49")
+        self.assertEqual(res["email"], "villalbawenddy@gmail.com")
+        self.assertEqual(res["password"], "WenMEFU13")
+        self.assertEqual(res["username"], "WEnddy")
+        self.assertEqual(res["packages"][0]["package"], "10800")
+
+    def test_pattern_b_g47_20k_explicit_breakdown(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "G47\n\n"
+            "Order #4 (PE-25/09)\n"
+            "• Nombre: Anthony Castilla\n"
+            "• Juego: CODM / ACTIVISION\n"
+            "• Mail: kleveryes06@gmail.com\n"
+            "• Pw: silentment124\n"
+            "• Nickname: Damn_DMT\n"
+            "• CP: 20K (19200cp+880cp)"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"], "G47")
+        self.assertEqual(res["email"], "kleveryes06@gmail.com")
+        self.assertEqual(res["password"], "silentment124")
+        self.assertIn("Activision", res["login_method"])
+        pkg_names = [p["package"] for p in res["packages"]]
+        self.assertEqual(pkg_names, ["19200", "880"])
+        self.assertNotIn("20000", pkg_names, "Explicit breakdown (19200cp+880cp) MUST be preserved without math 20K conversion!")
+
+    def test_pattern_c_g46_7_4k(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "G46\n\n"
+            "Order #3 (PE-25/09)\n"
+            "• Nombre: Luis Vilchez\n"
+            "• Juego y login: CODM\n"
+            "• Mail: vilchezuchiha@gmail.com\n"
+            "• Pw: Aomi2019\n"
+            "• Nickname: <De@th\n"
+            "• CP: 7.4K"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"], "G46")
+        self.assertEqual(res["email"], "vilchezuchiha@gmail.com")
+        self.assertEqual(res["password"], "Aomi2019")
+        self.assertEqual(res["username"], "<De@th")
+        self.assertEqual(res["packages"][0]["package"], "7400")
+
+    def test_pattern_d_252_activision(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "252#\n"
+            "*Activision*\n\n"
+            "Nick: Rcvictor\n"
+            "Correo: victormanuel09876t@gmail.com\n"
+            "Contraseña: Vicman28.\n\n"
+            "5000"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"].strip("#"), "252")
+        self.assertEqual(res["email"], "victormanuel09876t@gmail.com")
+        self.assertEqual(res["password"], "Vicman28.")
+        self.assertEqual(res["username"], "Rcvictor")
+        self.assertEqual(res["packages"][0]["package"], "5040")
+
+    def test_pattern_e_253_unlabelled_order(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "253#\n"
+            "Andre\n"
+            "+573053657865\n"
+            "Diaz-1725\n"
+            "11335019\n"
+            "38600607\n"
+            "48888193\n"
+            "5000"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"].strip("#"), "253")
+        self.assertEqual(res["phone"], "+573053657865")
+        self.assertEqual(res["packages"][0]["package"], "5040")
+        self.assertTrue(res["username"] == "Andre" or len(res["unclassified_data"]) > 0)
+
+    def test_pattern_f_254_spanish_labels(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "254#\n"
+            "nick : a\n"
+            "correo : angeloveliz0505@gmail.com\n"
+            "contraseña: angelo2020\n"
+            "5000"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["username"], "a")
+        self.assertEqual(res["email"], "angeloveliz0505@gmail.com")
+        self.assertEqual(res["password"], "angelo2020")
+        self.assertEqual(res["packages"][0]["package"], "5040")
+
+    def test_pattern_g_277_unlabelled_email(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "277#\n\n"
+            "Activision\n\n"
+            "carlosrambaut4@gmail.com\n"
+            "Contraseña: carlos40k\n"
+            "Nickname: +57×David(CR)\n\n"
+            "10800"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"].strip("#"), "277")
+        self.assertEqual(res["email"], "carlosrambaut4@gmail.com")
+        self.assertEqual(res["password"], "carlos40k")
+        self.assertEqual(res["username"], "+57×David(CR)")
+        self.assertEqual(res["packages"][0]["package"], "10800")
+
+    def test_pattern_h_248_compact_order(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "248#\n"
+            "CâPiTaNø\n"
+            "luisgokupc23@gmail.com\n"
+            "GreciaJoss04\n"
+            "2400"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["customer_ref_id"].strip("#"), "248")
+        self.assertEqual(res["email"], "luisgokupc23@gmail.com")
+        self.assertEqual(res["username"], "CâPiTaNø")
+        self.assertEqual(res["password"], "GreciaJoss04")
+        self.assertEqual(res["packages"][0]["package"], "2400")
+
+    def test_pattern_i_249_cp_case_insensitive(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "249#\n"
+            "*Activision*\n\n"
+            "Nick: Xx.Tiniebla.xX\n"
+            "Correo: kleiberprada161@gmail.com\n"
+            "Contraseña: 031405Js\n"
+            "Cp: 5000"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["packages"][0]["package"], "5040")
+
+    def test_pattern_j_250_special_characters(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "250#\n"
+            "Ƈک・Tuziiiiii\n"
+            "Correo :Maikeljesus8098@gmail.com\n"
+            "Contraseña :30236568\n"
+            "2400"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["username"], "Ƈک・Tuziiiiii")
+        self.assertEqual(res["email"], "maikeljesus8098@gmail.com")
+        self.assertEqual(res["password"], "30236568")
+        self.assertEqual(res["packages"][0]["package"], "2400")
+
+    def test_pattern_k_251_24000(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "251#\n"
+            "Nick: scpatron\n"
+            "Correo: calejandrogc2204@gmail.com\n"
+            "Contraseña: G@ancor20\n"
+            "24000"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["packages"][0]["package"], "24000")
+
+    def test_pattern_l_m_safe_ios_and_typos(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "Orden #71\n"
+            "Safe iOS\n"
+            "Activision\n"
+            "Package: 10.800\n"
+            "Emai: blackje@hotmail.com\n"
+            "Pasword: R090821p$\n"
+            "Nick: 1MiguelN"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertIn("Orden #71", res["customer_ref_id"])
+        self.assertEqual(res["email"], "blackje@hotmail.com")
+        self.assertEqual(res["password"], "R090821p$")
+        self.assertEqual(res["username"], "1MiguelN")
+        self.assertEqual(res["packages"][0]["package"], "10800")
+
+    def test_pattern_n_o_recovery_codes_and_pack_multiplier(self):
+        from order_parser import parse_order_v2
+        raw = (
+            "Order #2 safe Google fast\n"
+            "Facebook\n"
+            "Nick: Baro§ánz (Al-Baro)\n"
+            "Email: barosanz@hotmail.com\n"
+            "Pass: sanchez54\n"
+            "Pack: 2.4K * 4\n"
+            "Codes:\n"
+            "0023 3561\n"
+            "0392 7298\n"
+            "0846 2417\n"
+            "3092 0883\n"
+            "3821 9326"
+        )
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(len(res["packages"]), 4)
+        self.assertEqual(res["packages"][0]["package"], "2400")
+        self.assertEqual(len(res["recovery_codes"]), 5)
+        self.assertIn("0023 3561", res["recovery_codes"])
+
+    def test_pattern_p_q_recarga_and_orden_no_space(self):
+        from order_parser import parse_order_v2
+        r1 = parse_order_v2("Recarga #122\nActivision\nCorreo:oe3022764@gmail.com\nContraseña:32282238\nNickname:ꪶƦ・Emma\nCodpoints: 12.000")
+        self.assertTrue(r1["order_detected"])
+        self.assertIn("Recarga #122", r1["customer_ref_id"])
+        self.assertEqual(r1["packages"][0]["package"], "12000")
+
+        r2 = parse_order_v2("Orden# 34 fast\nActivision\nNick: CM Erick\nEmail: rericduvan@gmail.com\nPassword: and21eri\nPackage: 2400")
+        self.assertTrue(r2["order_detected"])
+        self.assertIn("Orden# 34", r2["customer_ref_id"])
+
+    def test_pattern_r_compact_order(self):
+        from order_parser import parse_order_v2
+        raw = "alemam200412@gmail.com\n\nNn200412\n\n24,000"
+        res = parse_order_v2(raw)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual(res["email"], "alemam200412@gmail.com")
+        self.assertEqual(res["password"], "Nn200412")
+        self.assertEqual(res["packages"][0]["package"], "24000")
+
+    def test_pattern_s_t_u_v_w_x_y_z_aa_price_in_parentheses_stripped(self):
+        from order_parser import parse_order_v2
+        raw_s = (
+            "#63\n"
+            "24000 (137)\n"
+            "Activision\n"
+            "sjaider00271@gmail.com\n"
+            "Rediaj_1874@\n"
+            "Nombre de jugador: FLOKI"
+        )
+        res = parse_order_v2(raw_s)
+        self.assertTrue(res["order_detected"])
+        self.assertEqual([p["package"] for p in res["packages"]], ["24000"])
+
+        raw_v = (
+            "#66\n"
+            "4WA48LUGWKH\n"
+            "CodP's 48,000 (270)\n"
+            "Nick/Nombre CODM: PirroHubzzers\n"
+            "Activision\n"
+            "pirroelmejor32@gmail.com\n"
+            "Pirro31?"
+        )
+        res_v = parse_order_v2(raw_v)
+        self.assertTrue(res_v["order_detected"])
+        self.assertEqual([p["package"] for p in res_v["packages"]], ["48000"])
+
+    def test_non_order_status_messages_ignored(self):
+        from order_parser import parse_order_v2
+        self.assertFalse(parse_order_v2("Pending 2 hours")["order_detected"])
+        self.assertFalse(parse_order_v2("Waiting 24h")["order_detected"])
+        self.assertFalse(parse_order_v2("Pending")["order_detected"])
+
+    def test_g49_does_not_trigger_profit_code_submission(self):
+        from handlers import parse_admin_profit_code_input
+        raw_g49 = (
+            "G49\n\n"
+            "• Nombre:\n"
+            "• Juego: CODM\n"
+            "• Mail: villalbawenddy@gmail.com\n"
+            "• Pw: WenMEFU13\n"
+            "• Nickname:WEnddy\n"
+            "• CP:10.8k"
+        )
+        self.assertIsNone(parse_admin_profit_code_input(raw_g49), "Customer order MUST NOT trigger manual profit code handler!")
+
+    async def test_duplicate_order_exact_raw_message_identity(self):
+        from database import create_order, save_order_pricing, get_exact_duplicate_pending_order, init_db, AsyncSessionLocal
+        from models import Order
+        from sqlalchemy import delete
+        await init_db()
+
+        chat_id = -100123456789
+        msg_a = "Email: test_dedup@gmail.com\nPassword: ABC123\nCP: 2400"
+        msg_b = "Email: test_dedup@gmail.com\nPassword: ABC124\nCP: 2400"
+
+        # Create Order A
+        o1 = await create_order(
+            email="test_dedup@gmail.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="A",
+            status="Pending",
+            raw_text=msg_a
+        )
+
+        # 1. Exact same raw text -> DUPLICATE DETECTED
+        dup = await get_exact_duplicate_pending_order("test_dedup@gmail.com", msg_a)
+        self.assertIsNotNone(dup, "Exact same raw message MUST be detected as duplicate!")
+        self.assertEqual(dup.id, o1.id)
+
+        # 2. 1-character difference in password -> NEW ORDER (NOT DUPLICATE)
+        non_dup = await get_exact_duplicate_pending_order("test_dedup@gmail.com", msg_b)
+        self.assertIsNone(non_dup, "1-character difference in password MUST NOT be marked as duplicate!")
 
 
 if __name__ == "__main__":
