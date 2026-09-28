@@ -467,6 +467,7 @@ class OrderItem(Base):
     """
     Represents an individual line item / package within a multi-package order.
     Calculates client line total, loader line total, and line profit.
+    Tracks package-level delivery status, secret profit codes, delivered message ID, and delivery timestamp.
     """
 
     __tablename__ = "order_items"
@@ -482,6 +483,11 @@ class OrderItem(Base):
     loader_unit_cost: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     loader_line_total: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     profit_amount: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    secret_profit_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="Pending")  # Pending, Selected, Delivered
+    client_delivered_msg_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_by_loader_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

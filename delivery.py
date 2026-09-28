@@ -200,31 +200,17 @@ async def deliver_order_by_id(
             except Exception:
                 selected_delivery_items = []
 
-    # Automated Category B Secret Profit Code Calculation at Delivery Time
-    if order.category == "B" and not order.secret_profit_code:
-        resolved_loader_id = None
-        if active_ds and active_ds.loader_id:
-            resolved_loader_id = active_ds.loader_id
+    # Automated Category B & Package-Level Secret Profit Code Calculation at Delivery Time
+    resolved_loader_id = None
+    if active_ds and active_ds.loader_id:
+        resolved_loader_id = active_ds.loader_id
 
-        if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
-            target_grp = loader_chat_id or order.loader_group_id
-            for l_id, l_data in LOADERS_CACHE.items():
-                if l_data.get("group_id") == target_grp or l_id == target_grp:
-                    resolved_loader_id = l_id
-                    break
-
-        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
-        if priced_order and priced_order.secret_profit_code:
-            order = priced_order
-
-    # Determine Email / Caption for First Image: display email & secret profit code if available
-    if caption_text and "\n" in caption_text:
-        email_for_caption = caption_text
-    elif order.secret_profit_code:
-        email_for_caption = f"{order.email}\n{order.secret_profit_code}"
-    else:
-        caption_email = extract_last_email(caption_text)
-        email_for_caption = caption_email if caption_email else order.email
+    if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
+        target_grp = loader_chat_id or order.loader_group_id
+        for l_id, l_data in LOADERS_CACHE.items():
+            if l_data.get("group_id") == target_grp or l_id == target_grp:
+                resolved_loader_id = l_id
+                break
 
     # Get current package progress items from DB or initialize from raw_text
     if order.package_progress:
@@ -252,11 +238,73 @@ async def deliver_order_by_id(
                     selected_delivery_items = [it]
                     break
 
+    # Ensure order pricing and items are saved and updated with resolved loader pricing first
+    if order.category == "B" or not order.secret_profit_code:
+        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
+        if priced_order:
+            order = priced_order
+
+    # Build stored client prices lookup from existing order.items or order.client_price_total
+    order_client_prices: Dict[str, Any] = {}
+    if order.items:
+        for oi in order.items:
+            if oi.product_key and (oi.client_unit_price is not None or oi.client_line_total is not None):
+                c_val = oi.client_unit_price if oi.client_unit_price is not None else oi.client_line_total
+                order_client_prices[oi.product_key.strip().lower()] = c_val
+                alias = oi.product_key.replace("cp_", "").strip().lower()
+                order_client_prices[alias] = c_val
+
+    if not order_client_prices and order.client_price_total is not None and selected_delivery_items:
+        if len(selected_delivery_items) == 1:
+            single_item = selected_delivery_items[0]
+            pkg_alias = str(single_item.get("package", "")).strip().lower()
+            pkey = f"cp_{pkg_alias}" if pkg_alias.isdigit() else pkg_alias
+            order_client_prices[pkey] = Decimal(str(order.client_price_total))
+            order_client_prices[pkg_alias] = Decimal(str(order.client_price_total))
+
+    # Augment selected_delivery_items with stored client_price
+    for sel_it in selected_delivery_items:
+        pkg_alias = str(sel_it.get("package", "")).strip().lower()
+        pkey = f"cp_{pkg_alias}" if pkg_alias.isdigit() else pkg_alias
+        if pkey in order_client_prices:
+            sel_it["client_price"] = order_client_prices[pkey]
+        elif pkg_alias in order_client_prices:
+            sel_it["client_price"] = order_client_prices[pkg_alias]
+
+    # Calculate package-level pricing & secret codes for selected delivery items
+    from pricing_calculator import calculate_order_pricing
+    session_calc = await calculate_order_pricing(
+        order_items_or_text=selected_delivery_items,
+        loader_id=resolved_loader_id,
+        client_price_map=order_client_prices
+    )
+
+    session_secret_code = session_calc.get("secret_profit_code")
+    item_codes_map: Dict[str, str] = {}
+    for calc_it in session_calc.get("items", []):
+        pkg_alias = calc_it["product_key"].replace("cp_", "") if calc_it["product_key"].startswith("cp_") else calc_it["product_key"]
+        if calc_it.get("secret_profit_code"):
+            item_codes_map[pkg_alias] = calc_it["secret_profit_code"]
+            item_codes_map[calc_it["product_key"]] = calc_it["secret_profit_code"]
+
+    # Determine Email / Caption for First Image: display email & secret profit code if available
+    if caption_text and "\n" in caption_text:
+        email_header = caption_text
+    elif session_secret_code:
+        email_header = f"{order.email}\n{session_secret_code}"
+    elif order.secret_profit_code:
+        email_header = f"{order.email}\n{order.secret_profit_code}"
+    else:
+        caption_email = extract_last_email(caption_text)
+        email_header = caption_email if caption_email else order.email
+
     # Build screenshot caption containing ONLY packages delivered in this session
-    include_price_in_caption = (order.category != "B" and not order.secret_profit_code)
+    include_price_in_caption = (order.category != "B" and not session_secret_code and not order.secret_profit_code)
     delivered_caption_block = format_delivered_packages_caption(selected_delivery_items, include_price=include_price_in_caption)
-    if delivered_caption_block and "📦 Delivered Package" not in email_for_caption:
-        email_for_caption = f"{email_for_caption}\n\n{delivered_caption_block}"
+    if delivered_caption_block and "📦 Delivered Package" not in email_header:
+        email_for_caption = f"{email_header}\n\n{delivered_caption_block}"
+    else:
+        email_for_caption = email_header
 
     # Auto-save price if missing
     if not order.price:
@@ -333,7 +381,9 @@ async def deliver_order_by_id(
     updated_items, is_all_completed, delivered_cnt = mark_selected_packages_delivered(
         progress_items,
         loader_id=loader_user_id,
-        selected_items=selected_items_list
+        selected_items=selected_items_list,
+        item_codes=item_codes_map,
+        client_delivered_msg_id=last_sent_customer_msg_id
     )
     updated_progress_json = json.dumps(updated_items)
     await update_order_package_progress(order.id, updated_progress_json)

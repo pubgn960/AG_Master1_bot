@@ -135,6 +135,27 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
                 except Exception as e:
                     logger.error(f"Failed to add column {col_name} to orders: {e}")
 
+    if "order_items" in tables:
+        existing_columns = {col["name"].lower() for col in inspector.get_columns("order_items")}
+        item_columns_to_add = [
+            ("secret_profit_code", "VARCHAR(100)"),
+            ("status", "VARCHAR(50) DEFAULT 'Pending'"),
+            ("client_delivered_msg_id", bigint_type),
+            ("delivered_at", "TIMESTAMP WITH TIME ZONE" if is_postgres else "DATETIME"),
+            ("delivered_by_loader_id", bigint_type)
+        ]
+        for col_name, col_type in item_columns_to_add:
+            if col_name.lower() not in existing_columns:
+                logger.info(f"Adding missing column {col_name} to order_items...")
+                try:
+                    if is_postgres:
+                        sync_conn.execute(text(f"ALTER TABLE order_items ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                    else:
+                        sync_conn.execute(text(f"ALTER TABLE order_items ADD COLUMN {col_name} {col_type};"))
+                    logger.info(f"Successfully added column {col_name} to order_items.")
+                except Exception as e:
+                    logger.error(f"Failed to add column {col_name} to order_items: {e}")
+
     if "delivery_ledger" in tables:
         existing_columns = {col["name"].lower() for col in inspector.get_columns("delivery_ledger")}
         ledger_columns_to_add = [
@@ -993,14 +1014,35 @@ async def save_order_pricing(
         if c_total is not None:
             order.price = f"${float(c_total):g}"
 
+        existing_items = list(order.items) if order.items else []
+        existing_items_map = {it.product_key: it for it in existing_items}
+
         await session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
 
+        synced_progress_items = []
+        is_single_item_override = (len(calc_res["items"]) == 1 and c_total is not None)
+
         for it in calc_res["items"]:
-            c_u = float(it["client_unit_price"]) if it["client_unit_price"] is not None else 0.0
-            c_lt = float(it["client_line_total"]) if it["client_line_total"] is not None else 0.0
+            c_u = float(c_total) if is_single_item_override else (float(it["client_unit_price"]) if it["client_unit_price"] is not None else 0.0)
+            c_lt = float(c_total) if is_single_item_override else (float(it["client_line_total"]) if it["client_line_total"] is not None else 0.0)
             l_u = float(it["loader_unit_cost"]) if it["loader_unit_cost"] is not None else 0.0
             l_lt = float(it["loader_line_total"]) if it["loader_line_total"] is not None else 0.0
-            p_a = float(it["profit_amount"]) if it["profit_amount"] is not None else 0.0
+
+            if is_single_item_override and l_lt is not None:
+                from profit_code_engine import encode_profit_code
+                p_a = c_lt - l_lt
+                s_code = encode_profit_code(p_a)
+            else:
+                p_a = float(it["profit_amount"]) if it["profit_amount"] is not None else 0.0
+                s_code = it.get("secret_profit_code")
+
+            existing_it = existing_items_map.get(it["product_key"])
+            item_status = existing_it.status if (existing_it and existing_it.status) else "Pending"
+            item_msg_id = existing_it.client_delivered_msg_id if existing_it else None
+            item_del_at = existing_it.delivered_at if existing_it else None
+            item_loader_id = existing_it.delivered_by_loader_id if existing_it else None
+            if not s_code and existing_it:
+                s_code = existing_it.secret_profit_code
 
             db_item = OrderItem(
                 order_id=order_id,
@@ -1012,13 +1054,40 @@ async def save_order_pricing(
                 client_line_total=c_lt,
                 loader_unit_cost=l_u,
                 loader_line_total=l_lt,
-                profit_amount=p_a
+                profit_amount=p_a,
+                secret_profit_code=s_code,
+                status=item_status,
+                client_delivered_msg_id=item_msg_id,
+                delivered_at=item_del_at,
+                delivered_by_loader_id=item_loader_id
             )
             session.add(db_item)
 
+            pkg_alias = it["product_key"].replace("cp_", "") if it["product_key"].startswith("cp_") else it["product_key"]
+            synced_progress_items.append({
+                "package": pkg_alias,
+                "qty": it["quantity"],
+                "product_key": it["product_key"],
+                "client_price": c_lt,
+                "loader_cost": l_lt,
+                "profit_amount": p_a,
+                "secret_profit_code": s_code,
+                "status": item_status,
+                "client_delivered_msg_id": item_msg_id,
+                "delivery_time": item_del_at.isoformat() if item_del_at else None
+            })
+
+        import json
+        if synced_progress_items:
+            order.package_progress = json.dumps(synced_progress_items)
+
         await session.commit()
-        await session.refresh(order)
-        return order
+        res = await session.execute(
+            select(Order)
+            .options(joinedload(Order.images), joinedload(Order.items))
+            .where(Order.id == order_id)
+        )
+        return res.unique().scalar_one_or_none()
 
 
 async def get_order_by_id(order_id: int) -> Optional[Order]:

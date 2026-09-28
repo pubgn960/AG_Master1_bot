@@ -10446,6 +10446,285 @@ class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(non_dup, "1-character difference in password MUST NOT be marked as duplicate!")
 
 
+class TestMultiPackageOrderPackageLevelDeliveryAndAccounting(unittest.IsolatedAsyncioTestCase):
+    """
+    Comprehensive integration & regression test suite for package-level multi-package order delivery,
+    independent loader cost calculations, package-level secret profit code generation, partial delivery status tracking,
+    duplicate retry protection, and single-package regression safety.
+    """
+
+    async def test_multi_package_order_creation_and_item_breakdown(self):
+        from database import create_order, save_order_pricing, get_order_by_id, init_db
+        from order_parser import parse_order_v2
+        import json
+        await init_db()
+
+        raw_order = (
+            "G47\n"
+            "Order #4\n"
+            "20K (19200cp+880cp)\n"
+            "Activision\n"
+            "Email: testreal47@gmail.com\n"
+            "Password: TestPass47\n"
+            "Nickname: TestPlayer47"
+        )
+        parsed = parse_order_v2(raw_order)
+        self.assertTrue(parsed["order_detected"])
+        pkg_names = [p["package"] for p in parsed["packages"]]
+        self.assertEqual(pkg_names, ["19200", "880"])
+
+        order = await create_order(
+            email=parsed["email"],
+            client_chat_id=-100123456789,
+            package="19200+880",
+            category="B",
+            status="Pending",
+            raw_text=raw_order
+        )
+
+        order = await save_order_pricing(order.id)
+        saved = await get_order_by_id(order.id)
+
+        self.assertEqual(len(saved.items), 2)
+        item_keys = [it.product_key for it in saved.items]
+        self.assertIn("cp_19200", item_keys)
+        self.assertIn("cp_880", item_keys)
+
+        it_19200 = next(it for it in saved.items if it.product_key == "cp_19200")
+        it_880 = next(it for it in saved.items if it.product_key == "cp_880")
+
+        self.assertEqual(float(it_19200.client_line_total), 110.0)
+        self.assertEqual(float(it_880.client_line_total), 8.0)
+        self.assertEqual(float(saved.client_price_total), 118.0)
+
+        progress = json.loads(saved.package_progress)
+        self.assertEqual(len(progress), 2)
+        self.assertEqual(progress[0]["package"], "19200")
+        self.assertEqual(progress[1]["package"], "880")
+        self.assertEqual(progress[0]["status"], "Pending")
+
+    async def test_loader_card_keyboard_renders_separate_package_buttons(self):
+        from database import create_order, save_order_pricing
+        from utils import build_loader_package_keyboard
+        import json
+
+        order = await create_order(
+            email="testreal47_kb@gmail.com",
+            client_chat_id=-100123456789,
+            package="19200+880",
+            category="B",
+            status="Pending"
+        )
+        order = await save_order_pricing(order.id)
+
+        kb = build_loader_package_keyboard(order.id, order.package_progress)
+        self.assertIsNotNone(kb)
+        buttons = [btn for row in kb.inline_keyboard for btn in row]
+        button_texts = [b.text for b in buttons]
+
+        self.assertTrue(any("19200" in t for t in button_texts))
+        self.assertTrue(any("880" in t for t in button_texts))
+
+    async def test_package_level_delivery_and_independent_profit_codes(self):
+        from database import create_order, save_order_pricing, get_order_by_id, add_loader, set_loader_price, execute_pay_reset, update_order_package_progress, init_db, AsyncSessionLocal
+        from delivery import deliver_order_by_id
+        from models import Image
+        from utils import toggle_package_selection
+        from unittest.mock import AsyncMock, MagicMock
+        import json
+
+        await init_db()
+        chat_id = -100123456789
+        admin_id = 1573531032
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+
+        loader_group_id = -100987654321
+        loader = await add_loader(loader_group_id, "TestLoaderMulti")
+        await set_loader_price(loader.id, "cp_19200", 15.0)
+        await set_loader_price(loader.id, "cp_880", 5.0)
+
+        order = await create_order(
+            email="testreal47@gmail.com",
+            client_chat_id=chat_id,
+            package="19200+880",
+            category="B",
+            status="Pending Approval"
+        )
+        order = await save_order_pricing(order.id, loader_id=loader.id)
+
+        async with AsyncSessionLocal() as session:
+            img1 = Image(order_id=order.id, telegram_file_id="img_19200", file_type="photo", position=0)
+            img2 = Image(order_id=order.id, telegram_file_id="img_880", file_type="photo", position=1)
+            session.add_all([img1, img2])
+            await session.commit()
+
+        # Step A: Loader selects 19200 CP (idx 0)
+        updated_items, status_code = toggle_package_selection(order.package_progress, 0, loader.id)
+        new_json1 = json.dumps(updated_items)
+        await update_order_package_progress(order.id, new_json1)
+        order.package_progress = new_json1
+
+        mock_bot = MagicMock()
+        mock_msg1 = MagicMock()
+        mock_msg1.message_id = 8001
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg1])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        # Deliver 19200 CP
+        success1 = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            target_delivery_chat_id=chat_id,
+            session_images=[img1]
+        )
+        self.assertTrue(success1)
+
+        order_step1 = await get_order_by_id(order.id)
+        self.assertEqual(order_step1.status, "Partially Delivered")
+
+        media_sent1 = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        caption1 = media_sent1[0].caption
+
+        expected_caption1 = (
+            "testreal47@gmail.com\n"
+            "J+J+J+J+J+J+G\n\n"
+            "📦 Delivered Package\n\n"
+            "✅ 19200 CP"
+        )
+        self.assertEqual(caption1, expected_caption1, "19200 CP delivery MUST attach independent profit code J+J+J+J+J+J+G ($110 - $15 = $95 -> J+J+J+J+J+J+G)!")
+
+        # Step B: Loader selects remaining 880 CP (idx 1)
+        progress_items = json.loads(order_step1.package_progress)
+        self.assertEqual(progress_items[0]["status"], "Delivered")
+        self.assertEqual(progress_items[0]["secret_profit_code"], "J+J+J+J+J+J+G")
+        self.assertEqual(progress_items[1]["status"], "Pending")
+
+        updated_items2, _ = toggle_package_selection(order_step1.package_progress, 1, loader.id)
+        new_json2 = json.dumps(updated_items2)
+        await update_order_package_progress(order.id, new_json2)
+        order_step1.package_progress = new_json2
+
+        mock_bot.reset_mock()
+        mock_msg2 = MagicMock()
+        mock_msg2.message_id = 8002
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg2])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        # Deliver 880 CP
+        success2 = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            target_delivery_chat_id=chat_id,
+            session_images=[img2]
+        )
+        self.assertTrue(success2)
+
+        order_step2 = await get_order_by_id(order.id)
+        self.assertEqual(order_step2.status, "Delivered", "Order status MUST become Delivered after all packages are delivered!")
+
+        media_sent2 = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        caption2 = media_sent2[0].caption
+
+        expected_caption2 = (
+            "testreal47@gmail.com\n"
+            "Y\n\n"
+            "📦 Delivered Package\n\n"
+            "✅ 880 CP"
+        )
+        self.assertEqual(caption2, expected_caption2, "880 CP delivery MUST attach independent profit code Y ($8 - $5 = $3 -> Y)!")
+
+        final_progress = json.loads(order_step2.package_progress)
+        self.assertTrue(all(it["status"] == "Delivered" for it in final_progress))
+
+    async def test_duplicate_package_delivery_protection(self):
+        from database import create_order, save_order_pricing
+        from utils import toggle_package_selection, mark_selected_packages_delivered
+        import json
+
+        order = await create_order(
+            email="test_dup_pkg@gmail.com",
+            client_chat_id=-100123456789,
+            package="19200+880",
+            category="B",
+            status="Pending"
+        )
+        order = await save_order_pricing(order.id)
+
+        items1, is_all1, cnt1 = mark_selected_packages_delivered(order.package_progress, loader_id=1, selected_items=[{"package": "19200"}])
+        self.assertEqual(cnt1, 1)
+        self.assertFalse(is_all1)
+        self.assertEqual(items1[0]["status"], "Delivered")
+        self.assertEqual(items1[1]["status"], "Pending")
+
+        items2, status_code = toggle_package_selection(json.dumps(items1), 0, loader_id=1)
+        self.assertEqual(status_code, "Delivered", "Already delivered package MUST NOT be selectable!")
+
+    async def test_single_package_order_regression_safety(self):
+        from database import create_order, save_order_pricing, get_order_by_id, add_loader, set_loader_price, execute_pay_reset, AsyncSessionLocal
+        from delivery import deliver_order_by_id
+        from models import Image
+        from unittest.mock import AsyncMock, MagicMock
+
+        chat_id = -100123456789
+        admin_id = 1573531032
+        await execute_pay_reset(admin_id=admin_id, chat_id=chat_id)
+
+        loader_group_id = -100987654321
+        loader = await add_loader(loader_group_id, "TestLoaderSingle")
+        await set_loader_price(loader.id, "cp_2400", 15.0)
+
+        order = await create_order(
+            email="single_pkg@example.com",
+            client_chat_id=chat_id,
+            package="2400",
+            category="B",
+            status="Pending Approval"
+        )
+        order = await save_order_pricing(order.id, loader_id=loader.id)
+
+        async with AsyncSessionLocal() as session:
+            img = Image(order_id=order.id, telegram_file_id="img_single", file_type="photo", position=0)
+            session.add(img)
+            await session.commit()
+
+        mock_bot = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 9001
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.edit_message_caption = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        success = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            target_delivery_chat_id=chat_id
+        )
+        self.assertTrue(success)
+
+        updated = await get_order_by_id(order.id)
+        self.assertEqual(updated.status, "Delivered")
+        self.assertEqual(updated.secret_profit_code, "V")
+
+        media_sent = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        caption = media_sent[0].caption
+
+        expected_caption = (
+            "single_pkg@example.com\n"
+            "V\n\n"
+            "📦 Delivered Package\n\n"
+            "✅ 2400 CP"
+        )
+        self.assertEqual(caption, expected_caption, "Single-package delivery caption MUST remain 100% backward compatible!")
+
+
 if __name__ == "__main__":
     unittest.main()
 

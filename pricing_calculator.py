@@ -187,15 +187,26 @@ async def calculate_order_pricing(
 
     for item in parsed_items:
         pkey = item.get("product_key", "").strip().lower()
-        qty = Decimal(str(item.get("quantity", 1)))
+        if not pkey and item.get("package"):
+            raw_p = str(item.get("package")).strip().lower()
+            from order_parser import normalize_package_alias
+            norm_p = normalize_package_alias(raw_p)
+            pkey = f"cp_{norm_p}" if norm_p.isdigit() else raw_p
+        qty = Decimal(str(item.get("quantity", item.get("qty", 1))))
         catalog_info = PRODUCT_CATALOG.get(pkey, {})
         dname = item.get("display_name") or catalog_info.get("display_name") or pkey.replace("_", " ").upper()
         ptype = item.get("product_type") or catalog_info.get("package_type") or "normal_cp"
 
         # 1. Resolve client unit price
         c_unit: Optional[Decimal] = None
-        if pkey in c_override_map:
+        if "client_price" in item and item["client_price"] is not None:
+            c_unit = to_decimal(item["client_price"])
+        elif pkey in c_override_map:
             c_unit = c_override_map[pkey]
+        elif "client_unit_price" in item and item["client_unit_price"] is not None:
+            c_unit = to_decimal(item["client_unit_price"])
+        elif "unit_price" in item and item["unit_price"] is not None:
+            c_unit = to_decimal(item["unit_price"])
         else:
             global_p = await get_global_client_price(pkey)
             if global_p is not None:
@@ -211,14 +222,19 @@ async def calculate_order_pricing(
             loader_p = await get_loader_price(loader_id, pkey)
             if loader_p is not None:
                 l_unit = to_decimal(loader_p)
+
+        if l_unit is None:
+            if "loader_cost" in item and item["loader_cost"] is not None and to_decimal(item["loader_cost"]) > 0:
+                l_unit = to_decimal(item["loader_cost"])
+            elif "loader_unit_cost" in item and item["loader_unit_cost"] is not None and to_decimal(item["loader_unit_cost"]) > 0:
+                l_unit = to_decimal(item["loader_unit_cost"])
             else:
                 missing_loader_keys.append(pkey)
-        else:
-            missing_loader_keys.append(pkey)
 
         c_line_total = (c_unit * qty) if c_unit is not None else None
         l_line_total = (l_unit * qty) if l_unit is not None else None
         item_profit = (c_line_total - l_line_total) if (c_line_total is not None and l_line_total is not None) else None
+        item_code = encode_profit_code(item_profit) if item_profit is not None else None
 
         calculated_items.append({
             "product_key": pkey,
@@ -229,7 +245,8 @@ async def calculate_order_pricing(
             "client_line_total": c_line_total,
             "loader_unit_cost": l_unit,
             "loader_line_total": l_line_total,
-            "profit_amount": item_profit
+            "profit_amount": item_profit,
+            "secret_profit_code": item_code
         })
 
     is_client_complete = (len(calculated_items) > 0) and (len(missing_client_keys) == 0)

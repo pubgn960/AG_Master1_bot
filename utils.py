@@ -1674,7 +1674,13 @@ def get_loader_selected_packages(progress_data: Any, loader_id: int) -> List[Dic
     return [it for it in items if it.get("status") == "Selected" and it.get("selected_by_loader") == loader_id]
 
 
-def mark_selected_packages_delivered(progress_data: Any, loader_id: int = 0, selected_items: Optional[List[Dict[str, Any]]] = None) -> Tuple[List[Dict[str, Any]], bool, int]:
+def mark_selected_packages_delivered(
+    progress_data: Any,
+    loader_id: int = 0,
+    selected_items: Optional[List[Dict[str, Any]]] = None,
+    item_codes: Optional[Dict[str, str]] = None,
+    client_delivered_msg_id: Optional[int] = None
+) -> Tuple[List[Dict[str, Any]], bool, int]:
     """
     Marks selected packages as 'Delivered'.
     If selected_items is provided, matches items by package name/qty.
@@ -1710,22 +1716,36 @@ def mark_selected_packages_delivered(progress_data: Any, loader_id: int = 0, sel
             if pkg_name in target_pkg_names and item.get("status") != "Delivered":
                 item["status"] = "Delivered"
                 item["delivery_time"] = now_iso
+                if item_codes and pkg_name in item_codes:
+                    item["secret_profit_code"] = item_codes[pkg_name]
+                if client_delivered_msg_id:
+                    item["client_delivered_msg_id"] = client_delivered_msg_id
                 delivered_count += 1
                 target_pkg_names.remove(pkg_name)
     else:
         for item in items:
             if item.get("status") == "Selected" and (loader_id == 0 or item.get("selected_by_loader") == loader_id or item.get("selected_by_loader") is None):
+                pkg_name = str(item.get("package", ""))
                 item["status"] = "Delivered"
                 item["delivery_time"] = now_iso
+                if item_codes and pkg_name in item_codes:
+                    item["secret_profit_code"] = item_codes[pkg_name]
+                if client_delivered_msg_id:
+                    item["client_delivered_msg_id"] = client_delivered_msg_id
                 delivered_count += 1
 
     # Fallback: if loader hadn't clicked toggle buttons before replying with screenshot, mark next pending package
     if delivered_count == 0:
         for item in items:
             if item.get("status") != "Delivered":
+                pkg_name = str(item.get("package", ""))
                 item["status"] = "Delivered"
                 item["selected_by_loader"] = loader_id
                 item["delivery_time"] = now_iso
+                if item_codes and pkg_name in item_codes:
+                    item["secret_profit_code"] = item_codes[pkg_name]
+                if client_delivered_msg_id:
+                    item["client_delivered_msg_id"] = client_delivered_msg_id
                 delivered_count += 1
                 break
 
