@@ -985,8 +985,17 @@ async def save_order_pricing(
             loader_info = LOADERS_CACHE.get(resolved_loader_id)
             order.loader_group_id = loader_info["group_id"] if (loader_info and loader_info.get("group_id")) else resolved_loader_id
 
+        order_input: Any = order.package or order.raw_text or ""
+        if order.package_progress:
+            try:
+                parsed_p = json.loads(order.package_progress)
+                if parsed_p and isinstance(parsed_p, list) and len(parsed_p) > 0:
+                    order_input = parsed_p
+            except Exception:
+                pass
+
         calc_res = await calculate_order_pricing(
-            order_items_or_text=order.package or order.raw_text or "",
+            order_items_or_text=order_input,
             loader_id=resolved_loader_id,
             client_price_map=client_price_map,
             loader_price_map=loader_price_map
@@ -1050,8 +1059,15 @@ async def save_order_pricing(
         is_single_item_override = (len(calc_res["items"]) == 1 and c_total is not None)
 
         for it in calc_res["items"]:
-            c_u = float(c_total) if is_single_item_override else (float(it["client_unit_price"]) if it["client_unit_price"] is not None else 0.0)
-            c_lt = float(c_total) if is_single_item_override else (float(it["client_line_total"]) if it["client_line_total"] is not None else 0.0)
+            if it["client_line_total"] is not None and float(it["client_line_total"]) > 0:
+                c_lt = float(it["client_line_total"])
+                c_u = float(it["client_unit_price"]) if it["client_unit_price"] is not None else (c_lt / max(1, it["quantity"]))
+            elif is_single_item_override:
+                c_u = float(c_total)
+                c_lt = float(c_total)
+            else:
+                c_u = float(it["client_unit_price"]) if it["client_unit_price"] is not None else 0.0
+                c_lt = float(it["client_line_total"]) if it["client_line_total"] is not None else 0.0
             l_u = float(it["loader_unit_cost"]) if it["loader_unit_cost"] is not None else 0.0
             l_lt = float(it["loader_line_total"]) if it["loader_line_total"] is not None else 0.0
 
@@ -1126,6 +1142,7 @@ async def save_order_pricing(
             order.package_progress = json.dumps(synced_progress_items)
 
         await session.commit()
+        session.expire_all()
         res = await session.execute(
             select(Order)
             .options(joinedload(Order.images), joinedload(Order.items))
@@ -1912,16 +1929,14 @@ async def create_delivery_session(order_id: int, loader_id: int, session_msg_id:
 
 async def get_delivery_session_by_msg_id(session_msg_id: int) -> Optional[DeliverySession]:
     """
-    Looks up an active Delivery Session by the prompt message ID.
+    Looks up a Delivery Session by the prompt message ID.
     """
     async with AsyncSessionLocal() as session:
         stmt = select(DeliverySession).where(
-            (DeliverySession.delivery_session_message_id == session_msg_id) &
-            (DeliverySession.status == "waiting_images")
-        )
+            DeliverySession.delivery_session_message_id == session_msg_id
+        ).order_by(DeliverySession.id.desc())
         res = await session.execute(stmt)
-        ds = res.scalar_one_or_none()
-        return ds
+        return res.scalars().first()
 
 
 async def get_active_delivery_session(order_id: int, loader_id: Optional[int] = None, session_msg_id: Optional[int] = None) -> Optional[DeliverySession]:

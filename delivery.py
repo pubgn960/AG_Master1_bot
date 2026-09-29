@@ -10,6 +10,7 @@ import html
 import json
 import asyncio
 import logging
+from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from telegram import Bot, Message, InputMediaPhoto, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
@@ -253,8 +254,8 @@ async def deliver_order_by_id(
         else:
             progress_items = []
 
-    # If no selected items from active session, fallback to currently 'Selected' items or next pending
-    if not selected_delivery_items:
+    # If no selected items from active session, fallback to currently 'Selected' items or next pending (only if no specific loader_reply_msg_id was provided)
+    if not selected_delivery_items and not loader_reply_msg_id:
         selected_delivery_items = [it for it in progress_items if it.get("status") == "Selected"]
         if not selected_delivery_items:
             for it in progress_items:
@@ -262,18 +263,32 @@ async def deliver_order_by_id(
                     selected_delivery_items = [it]
                     break
 
-    # Build stored client prices lookup from existing order.items or order.client_price_total
+    # Build stored client prices lookup from existing order.items or order.package_progress
     order_client_prices: Dict[str, Any] = {}
     if order.items:
         for oi in order.items:
-            if oi.product_key and (oi.client_unit_price is not None or oi.client_line_total is not None):
-                c_val = oi.client_unit_price if oi.client_unit_price is not None else oi.client_line_total
+            if oi.product_key and (oi.client_line_total is not None or oi.client_unit_price is not None):
+                c_val = Decimal(str(oi.client_line_total if oi.client_line_total is not None else oi.client_unit_price))
                 order_client_prices[oi.product_key.strip().lower()] = c_val
                 alias = oi.product_key.replace("cp_", "").strip().lower()
                 order_client_prices[alias] = c_val
 
+    if not order_client_prices and order.package_progress:
+        try:
+            prog_list = json.loads(order.package_progress)
+            for pit in prog_list:
+                if isinstance(pit, dict) and pit.get("client_price") is not None:
+                    c_val = Decimal(str(pit["client_price"]))
+                    pkg_alias = str(pit.get("package")).strip().lower()
+                    pkey = f"cp_{pkg_alias}" if pkg_alias.isdigit() else pkg_alias
+                    order_client_prices[pkey] = c_val
+                    order_client_prices[pkg_alias] = c_val
+        except Exception:
+            pass
+
+    total_order_pkgs_count = len(progress_items) if progress_items else 0
     if not order_client_prices and order.client_price_total is not None and selected_delivery_items:
-        if len(selected_delivery_items) == 1:
+        if total_order_pkgs_count == 1 and len(selected_delivery_items) == 1:
             single_item = selected_delivery_items[0]
             pkg_alias = str(single_item.get("package", "")).strip().lower()
             pkey = f"cp_{pkg_alias}" if pkg_alias.isdigit() else pkg_alias
@@ -284,10 +299,10 @@ async def deliver_order_by_id(
     for sel_it in selected_delivery_items:
         pkg_alias = str(sel_it.get("package", "")).strip().lower()
         pkey = f"cp_{pkg_alias}" if pkg_alias.isdigit() else pkg_alias
-        if pkey in order_client_prices:
-            sel_it["client_price"] = order_client_prices[pkey]
-        elif pkg_alias in order_client_prices:
-            sel_it["client_price"] = order_client_prices[pkg_alias]
+        if pkey in order_client_prices and order_client_prices[pkey] is not None:
+            sel_it["client_price"] = float(order_client_prices[pkey])
+        elif pkg_alias in order_client_prices and order_client_prices[pkg_alias] is not None:
+            sel_it["client_price"] = float(order_client_prices[pkg_alias])
 
     # Calculate package-level pricing & secret codes for selected delivery items
     from pricing_calculator import calculate_order_pricing
@@ -409,11 +424,6 @@ async def deliver_order_by_id(
     if not selected_items_list:
         selected_items_list = selected_delivery_items
 
-    print("DEBUG delivery.py BEFORE mark_selected_packages_delivered:")
-    print("  progress_items:", progress_items)
-    print("  selected_items_list:", selected_items_list)
-    print("  item_codes_map:", item_codes_map)
-
     updated_items, is_all_completed, delivered_cnt = mark_selected_packages_delivered(
         progress_items,
         loader_id=loader_user_id,
@@ -421,10 +431,6 @@ async def deliver_order_by_id(
         item_codes=item_codes_map,
         client_delivered_msg_id=last_sent_customer_msg_id
     )
-
-    print("DEBUG delivery.py AFTER mark_selected_packages_delivered:")
-    print("  updated_items:", updated_items)
-    print("  is_all_completed:", is_all_completed)
 
     updated_progress_json = json.dumps(updated_items)
     await update_order_package_progress(order.id, updated_progress_json)

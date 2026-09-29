@@ -10959,6 +10959,224 @@ class TestPackageActiveDeliverySessionBugFix(unittest.IsolatedAsyncioTestCase):
 
         await delivery_group_handler(delivery_update, context)
 
+    async def test_category_b_multi_package_and_single_package_comprehensive_rules(self):
+        """
+        Comprehensive Category B rules verification:
+        TEST 1: 2400 + 880 multi-package order creation: client prices 2400 = 15, 880 = 8, order total = 23. Creation adds +23 ONCE.
+        TEST 2: 2400 delivery does NOT add another client ledger entry.
+        TEST 3: 880 delivery does NOT add another client ledger entry.
+        TEST 4: 2400 uses its own client_line_total = 15.
+        TEST 5: 880 uses its own client_line_total = 8.
+        TEST 6: 2400 loader cost $14 -> profit $1 -> secret code V.
+        TEST 7: 880 loader cost $5 -> profit $3 -> secret code Y.
+        TEST 8: 2400 and 880 have independent secret codes.
+        TEST 9: After 2400 delivery, 880 remains Pending.
+        TEST 10: After both deliveries, order becomes Delivered/Completed.
+        TEST 11: Retrying 2400 does not duplicate anything.
+        TEST 12: Category B single-package behavior remains correct.
+        """
+        from database import (
+            create_order, save_order_pricing, get_order_by_id,
+            record_delivery_ledger_entry, get_running_total_current,
+            set_loader_price, create_delivery_session
+        )
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+        import json
+
+        client_chat_id = -100888999
+        loader_group_id = -100999888
+        loader_id = 777
+
+        await set_loader_price(loader_id, "cp_2400", 14.0)
+        await set_loader_price(loader_id, "cp_880", 5.0)
+
+        # TEST 1: Order Creation
+        pkgs_json = json.dumps([
+            {"package": "2400", "qty": 1, "unit_price": 15.0, "client_price": 15.0, "status": "Pending"},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "client_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(
+            email="catb_unique_9999@gmail.com",
+            package="2400 CP + 880 CP",
+            category="B",
+            client_chat_id=client_chat_id,
+            status="Pending Approval",
+            raw_text="catb_unique_9999@gmail.com\n2400 CP + 880 CP",
+            package_progress=pkgs_json
+        )
+        order = await save_order_pricing(order.id, loader_id=loader_id)
+
+        await record_delivery_ledger_entry(
+            order_id=order.id,
+            package="2400 CP + 880 CP",
+            now_value=23.0,
+            loader_name="System",
+            dedup_hash=f"catb_create_{order.id}",
+            chat_id=client_chat_id
+        )
+        creation_total = await get_running_total_current(chat_id=client_chat_id)
+        self.assertEqual(creation_total, 23.0)
+
+        items = order.items
+        self.assertEqual(len(items), 2)
+        it_2400 = next(i for i in items if "2400" in str(i.product_key).lower())
+        it_880 = next(i for i in items if "880" in str(i.product_key).lower())
+
+        # TEST 4 & TEST 5
+        self.assertEqual(float(it_2400.client_line_total), 15.0)
+        self.assertEqual(float(it_880.client_line_total), 8.0)
+
+        bot = MagicMock()
+        bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=1001)])
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=1002))
+        bot.set_message_reaction = AsyncMock(return_value=True)
+
+        from models import Image
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as session:
+            img = Image(order_id=order.id, telegram_file_id="img_1", file_type="photo")
+            session.add(img)
+            await session.commit()
+
+        # TEST 6 & TEST 9: Delivery of 2400 CP
+        ds_msg_id = 9001
+        await create_delivery_session(
+            order_id=order.id,
+            loader_id=loader_id,
+            session_msg_id=ds_msg_id,
+            selected_packages=json.dumps([{"package": "2400", "qty": 1}])
+        )
+
+        res1 = await deliver_order_by_id(
+            bot=bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            loader_reply_msg_id=ds_msg_id,
+            target_delivery_chat_id=client_chat_id
+        )
+        self.assertTrue(res1)
+
+        # TEST 2: Running total unchanged after 2400 CP delivery
+        post_2400_total = await get_running_total_current(chat_id=client_chat_id)
+        self.assertEqual(post_2400_total, 23.0)
+
+        order_p1 = await get_order_by_id(order.id)
+        p1_items = json.loads(order_p1.package_progress)
+
+        # TEST 9: 880 remains Pending
+        p1_2400 = next(i for i in p1_items if i["package"] == "2400")
+        p1_880 = next(i for i in p1_items if i["package"] == "880")
+        self.assertEqual(p1_2400["status"], "Delivered")
+        self.assertEqual(p1_880["status"], "Pending")
+
+        # TEST 6: 2400 loader cost $14 -> profit $1 -> code V
+        self.assertEqual(p1_2400["secret_profit_code"], "V")
+
+        # TEST 11: Retrying 2400 CP delivery
+        res_retry = await deliver_order_by_id(
+            bot=bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            loader_reply_msg_id=ds_msg_id,
+            target_delivery_chat_id=client_chat_id
+        )
+        chk_after_retry = await get_order_by_id(order.id)
+        post_retry_total = await get_running_total_current(chat_id=client_chat_id)
+        self.assertEqual(post_retry_total, 23.0)
+
+        # TEST 7, TEST 8, TEST 10: Delivery of 880 CP
+        ds_msg_id2 = 9002
+        await create_delivery_session(
+            order_id=order.id,
+            loader_id=loader_id,
+            session_msg_id=ds_msg_id2,
+            selected_packages=json.dumps([{"package": "880", "qty": 1}])
+        )
+
+        chk_order = await get_order_by_id(order.id)
+
+        res2 = await deliver_order_by_id(
+            bot=bot,
+            order_id=order.id,
+            loader_chat_id=loader_group_id,
+            loader_reply_msg_id=ds_msg_id2,
+            target_delivery_chat_id=client_chat_id
+        )
+        self.assertTrue(res2)
+
+        # TEST 3: Running total unchanged after 880 CP delivery
+        post_880_total = await get_running_total_current(chat_id=client_chat_id)
+        self.assertEqual(post_880_total, 23.0)
+
+        order_p2 = await get_order_by_id(order.id)
+        p2_items = json.loads(order_p2.package_progress)
+
+        # TEST 7 & TEST 8
+        p2_880 = next(i for i in p2_items if i["package"] == "880")
+        self.assertEqual(p2_880["status"], "Delivered")
+        self.assertEqual(p2_880["secret_profit_code"], "Y")
+        self.assertNotEqual(p1_2400["secret_profit_code"], p2_880["secret_profit_code"])
+
+        # TEST 10: Order status becomes Delivered / Completed
+        self.assertEqual(order_p2.status, "Delivered")
+
+        # TEST 12: Category B Single-Package Behavior
+        single_chat_id = -100777666
+        single_pkgs_json = json.dumps([
+            {"package": "2400", "qty": 1, "unit_price": 15.0, "client_price": 15.0, "status": "Pending"}
+        ])
+        s_order = await create_order(
+            email="single_catb@gmail.com",
+            package="2400 CP",
+            category="B",
+            client_chat_id=single_chat_id,
+            status="Pending Approval",
+            raw_text="single_catb@gmail.com\n2400 CP",
+            package_progress=single_pkgs_json
+        )
+        s_order = await save_order_pricing(s_order.id, loader_id=loader_id)
+
+        await record_delivery_ledger_entry(
+            order_id=s_order.id,
+            package="2400 CP",
+            now_value=15.0,
+            loader_name="System",
+            dedup_hash=f"catb_create_{s_order.id}",
+            chat_id=single_chat_id
+        )
+        s_creation_total = await get_running_total_current(chat_id=single_chat_id)
+        self.assertEqual(s_creation_total, 15.0)
+
+        async with AsyncSessionLocal() as session:
+            session.add(Image(order_id=s_order.id, telegram_file_id="img_s1", file_type="photo"))
+            await session.commit()
+
+        s_ds_msg_id = 9003
+        await create_delivery_session(
+            order_id=s_order.id,
+            loader_id=loader_id,
+            session_msg_id=s_ds_msg_id,
+            selected_packages=json.dumps([{"package": "2400", "qty": 1}])
+        )
+
+        res_s = await deliver_order_by_id(
+            bot=bot,
+            order_id=s_order.id,
+            loader_chat_id=loader_group_id,
+            loader_reply_msg_id=s_ds_msg_id,
+            target_delivery_chat_id=single_chat_id
+        )
+        self.assertTrue(res_s)
+
+        s_post_total = await get_running_total_current(chat_id=single_chat_id)
+        self.assertEqual(s_post_total, 15.0)
+
+        s_order_final = await get_order_by_id(s_order.id)
+        self.assertEqual(s_order_final.status, "Delivered")
+        s_items = json.loads(s_order_final.package_progress)
+        self.assertEqual(s_items[0]["secret_profit_code"], "V")
+
 
 if __name__ == "__main__":
     unittest.main()

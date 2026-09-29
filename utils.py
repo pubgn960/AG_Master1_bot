@@ -1735,7 +1735,7 @@ def mark_selected_packages_delivered(
                 delivered_count += 1
 
     # Fallback: if loader hadn't clicked toggle buttons before replying with screenshot, mark next pending package
-    if delivered_count == 0:
+    if delivered_count == 0 and selected_items is None:
         for item in items:
             if item.get("status") != "Delivered":
                 pkg_name = str(item.get("package", ""))
