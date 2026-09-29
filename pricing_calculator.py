@@ -212,7 +212,13 @@ async def calculate_order_pricing(
             if global_p is not None:
                 c_unit = to_decimal(global_p)
             else:
-                missing_client_keys.append(pkey)
+                pkg_alias = pkey.replace("cp_", "") if pkey.startswith("cp_") else pkey
+                from utils import _get_global_client_price_for_package
+                cat_p = _get_global_client_price_for_package(pkg_alias, category="B") or _get_global_client_price_for_package(pkg_alias, category="A")
+                if cat_p is not None:
+                    c_unit = to_decimal(cat_p)
+                else:
+                    missing_client_keys.append(pkey)
 
         # 2. Resolve loader unit cost
         l_unit: Optional[Decimal] = None

@@ -10879,6 +10879,86 @@ class TestPackageActiveDeliverySessionBugFix(unittest.IsolatedAsyncioTestCase):
         updated = await get_order_by_id(order.id)
         self.assertEqual(updated.status, "Delivered")
 
+    async def test_7_real_telegram_callback_and_delivery_flow(self):
+        from database import create_order, set_order_loader_message_id, get_active_delivery_session, BOT_SETTINGS, add_authorized_user
+        from handlers import loader_pkg_toggle_callback_handler, delivery_group_handler
+        from unittest.mock import MagicMock, AsyncMock
+        import json
+
+        BOT_SETTINGS["delivery_group_id"] = -100222
+        await add_authorized_user(12345, role="delivery")
+
+        pkgs_json = json.dumps([
+            {"package": "19200", "qty": 1, "unit_price": 110.0, "status": "Pending"},
+            {"package": "880", "qty": 1, "unit_price": 8.0, "status": "Pending"}
+        ])
+        order = await create_order(
+            email="testreal47@gmail.com",
+            package="20K (19200cp+880cp)",
+            package_progress=pkgs_json,
+            client_chat_id=-100111
+        )
+        await set_order_loader_message_id(order.id, 5000, loader_group_id=-100222)
+
+        # 1. Loader 12345 clicks Package 0 (19200 CP) on Order Card (message ID 5000)
+        query = MagicMock()
+        query.data = f"pkg_toggle:{order.id}:0"
+        query.message.chat.id = -100222
+        query.message.message_id = 5000
+        query.message.caption = "Order Card Text"
+        query.message.text = None
+        query.answer = AsyncMock()
+        query.edit_message_caption = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        user = MagicMock()
+        user.id = 12345
+
+        toggle_update = MagicMock()
+        toggle_update.callback_query = query
+        toggle_update.effective_user = user
+
+        context = MagicMock()
+        context.bot.id = 99999
+        context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=5001))
+        context.bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=9999)])
+        context.bot.edit_message_caption = AsyncMock()
+        context.bot.set_message_reaction = AsyncMock(return_value=True)
+
+        await loader_pkg_toggle_callback_handler(toggle_update, context)
+
+        active_ds = await get_active_delivery_session(order.id, loader_id=12345)
+        self.assertIsNotNone(active_ds, "Active delivery session MUST exist after package selection toggle!")
+        self.assertEqual(active_ds.delivery_session_message_id, 5000)
+
+        # 2. Loader replies with photo (message ID 6000) replying to Order Card (message ID 5000)
+        reply_to_msg = MagicMock()
+        reply_to_msg.message_id = 5000
+        reply_to_msg.from_user.id = 99999
+        reply_to_msg.from_user.is_bot = True
+        reply_to_msg.text = "Order Card Text"
+        reply_to_msg.caption = None
+
+        photo_msg = MagicMock()
+        photo_msg.message_id = 6000
+        photo_msg.chat.id = -100222
+        photo_msg.from_user.id = 12345
+        photo_msg.from_user.is_bot = False
+        photo_msg.reply_to_message = reply_to_msg
+        photo_msg.text = None
+        photo_msg.caption = None
+        photo_msg.photo = [MagicMock(file_id="photo_12345")]
+        photo_msg.document = None
+        photo_msg.reply_text = AsyncMock()
+
+        delivery_update = MagicMock()
+        delivery_update.effective_chat.id = -100222
+        delivery_update.effective_user = user
+        delivery_update.effective_message = photo_msg
+        delivery_update.message = photo_msg
+
+        await delivery_group_handler(delivery_update, context)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1460,6 +1460,47 @@ async def unknown_package_price_callback_handler(update: Update, context: Contex
         logger.exception(f"[UNKNOWN_PKG] Failed to prompt for unknown package price: {e}")
 
 
+async def is_authorized_loader(user_id: int, chat_id: Optional[int] = None) -> bool:
+    """
+    Verifies whether a Telegram user (or chat group) is an authorized loader.
+    Checks Super Admin status, delivery role in AUTH_USERS_CACHE, LOADERS_CACHE,
+    and fallback DB lookups to prevent false authorization rejections due to stale RAM cache.
+    """
+    if is_admin(user_id) or is_delivery_user(user_id):
+        return True
+
+    from database import reload_auth_users_cache, reload_loaders_cache, LOADERS_CACHE, AUTH_USERS_CACHE
+    auth_cache = await reload_auth_users_cache()
+    if auth_cache.get(user_id) in ("admin", "delivery"):
+        return True
+
+    if user_id in LOADERS_CACHE:
+        return True
+
+    if chat_id:
+        if chat_id == BOT_SETTINGS.get("delivery_group_id"):
+            return True
+        if any(isinstance(l, dict) and l.get("group_id") == chat_id for l in LOADERS_CACHE.values()):
+            return True
+
+        loaders_cache = await reload_loaders_cache()
+        if any(isinstance(l, dict) and l.get("group_id") == chat_id for l in loaders_cache.values()) or user_id in loaders_cache:
+            return True
+
+        try:
+            from database import AsyncSessionLocal
+            from models import Loader
+            from sqlalchemy import select, or_
+            async with AsyncSessionLocal() as session:
+                stmt = select(Loader).where(or_(Loader.group_id == chat_id, Loader.id == user_id))
+                if (await session.execute(stmt)).scalar_one_or_none():
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 async def loader_pkg_toggle_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles package selection toggle buttons in Loader Group.
@@ -1470,7 +1511,11 @@ async def loader_pkg_toggle_callback_handler(update: Update, context: ContextTyp
         return
 
     user = update.effective_user
-    if not user or not (is_admin(user.id) or is_delivery_user(user.id)):
+    chat = update.effective_chat
+    if not user:
+        return
+
+    if not await is_authorized_loader(user.id, chat_id=chat.id if chat else None):
         try:
             await query.answer("⛔ Only authorized loaders can select packages.", show_alert=True)
         except Exception:
@@ -1519,6 +1564,9 @@ async def loader_pkg_toggle_callback_handler(update: Update, context: ContextTyp
     await update_order_package_progress(order.id, new_json)
     order.package_progress = new_json
 
+    session_before = await get_active_delivery_session(order.id, loader_id=user.id)
+    session_id_before = session_before.id if session_before else None
+
     selected_items = get_loader_selected_packages(new_json, user.id)
     if selected_items:
         try:
@@ -1530,6 +1578,21 @@ async def loader_pkg_toggle_callback_handler(update: Update, context: ContextTyp
             )
         except Exception as e_ds:
             logger.warning(f"[LOADER_SELECTION] Failed to auto-create delivery session: {e_ds}")
+
+    session_after = await get_active_delivery_session(order.id, loader_id=user.id)
+    session_id_after = session_after.id if session_after else None
+
+    logger.info(
+        f"[PKG_SESSION_DEBUG]\n"
+        f"order_id={order.id}\n"
+        f"loader_id={user.id}\n"
+        f"callback_message_id={query.message.message_id}\n"
+        f"loader_message_id={order.loader_message_id}\n"
+        f"selected_package={item_idx}\n"
+        f"selected_packages={json.dumps(selected_items)}\n"
+        f"session_id_before={session_id_before}\n"
+        f"session_id_after={session_id_after}"
+    )
 
     card_text = format_full_loader_order_card(order)
     new_kb = build_loader_package_keyboard(order.id, updated_items, user.id)
@@ -2245,7 +2308,7 @@ async def process_delivery_ledger_event(
         logger.info(f"[LEDGER] Category B Order #{order_id} accounting was recorded at order creation. Skipping delivery ledger event.")
         return
 
-    if order and (order.client_price_total is None or order.secret_profit_code is None):
+    if order and order.client_price_total is None:
         try:
             order = await save_order_pricing(order_id)
         except Exception as e:
@@ -3076,7 +3139,7 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     # Role-Based Permission Check for Delivery Users
     user_id = user.id if user else None
-    if not is_delivery_user(user_id):
+    if not await is_authorized_loader(user_id, chat_id=chat.id if chat else None):
         logger.warning(f"[LOADER] Unauthorized user {user_id} attempted to deliver order in Loader Group {chat.id}.")
         try:
             await message.reply_text("⛔ You are not authorized to deliver orders.")
@@ -3120,6 +3183,15 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
     if not order:
         logger.info("[LOADER] Ignored reply that does not match any valid order.")
         return
+
+    logger.info(
+        f"[PKG_SESSION_DEBUG]\n"
+        f"DELIVERY REPLY\n"
+        f"reply_to_message_id={reply_to.message_id if reply_to else None}\n"
+        f"current_message_id={message.message_id}\n"
+        f"order_id={order.id if order else None}\n"
+        f"loader_id={user_id}"
+    )
 
     if order and user_id:
         if not active_delivery_session:

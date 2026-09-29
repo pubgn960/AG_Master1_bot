@@ -9,6 +9,7 @@ import os
 import io
 import re
 import csv
+import json
 import shutil
 import hashlib
 import logging
@@ -996,6 +997,11 @@ async def save_order_pricing(
             c_total = Decimal(str(order.client_price_total))
 
         l_total = calc_res["loader_cost_total"]
+        if l_total is None and calc_res.get("items"):
+            loader_totals = [it["loader_line_total"] for it in calc_res["items"] if it.get("loader_line_total") is not None]
+            if len(loader_totals) == len(calc_res["items"]) and len(loader_totals) > 0:
+                l_total = sum(loader_totals)
+
         p_amount = calc_res["profit_amount"]
         code = calc_res["secret_profit_code"]
 
@@ -1004,18 +1010,39 @@ async def save_order_pricing(
             p_amount = c_total - l_total
             code = encode_profit_code(p_amount)
 
-        order.client_price_total = float(c_total) if c_total is not None else order.client_price_total
-        order.loader_cost_total = float(l_total) if l_total is not None else order.loader_cost_total
+        values_to_update: Dict[str, Any] = {}
+        if c_total is not None:
+            values_to_update["client_price_total"] = float(c_total)
+            values_to_update["price"] = f"${float(c_total):g}"
+            order.client_price_total = float(c_total)
+            order.price = f"${float(c_total):g}"
+        if l_total is not None:
+            values_to_update["loader_cost_total"] = float(l_total)
+            order.loader_cost_total = float(l_total)
         if p_amount is not None:
+            values_to_update["profit_amount"] = float(p_amount)
             order.profit_amount = float(p_amount)
         if code:
+            values_to_update["secret_profit_code"] = code
             order.secret_profit_code = code
 
-        if c_total is not None:
-            order.price = f"${float(c_total):g}"
+        if values_to_update:
+            await session.execute(update(Order).where(Order.id == order_id).values(**values_to_update))
 
         existing_items = list(order.items) if order.items else []
         existing_items_map = {it.product_key: it for it in existing_items}
+
+        existing_progress_map: Dict[str, Any] = {}
+        if order.package_progress:
+            try:
+                prog_list = json.loads(order.package_progress)
+                for pit in prog_list:
+                    if isinstance(pit, dict):
+                        pkey = pit.get("product_key") or f"cp_{pit.get('package')}"
+                        existing_progress_map[pkey.lower()] = pit
+                        existing_progress_map[str(pit.get("package")).lower()] = pit
+            except Exception:
+                pass
 
         await session.execute(delete(OrderItem).where(OrderItem.order_id == order_id))
 
@@ -1036,12 +1063,22 @@ async def save_order_pricing(
                 p_a = float(it["profit_amount"]) if it["profit_amount"] is not None else 0.0
                 s_code = it.get("secret_profit_code")
 
+            pkg_alias = it["product_key"].replace("cp_", "") if it["product_key"].startswith("cp_") else it["product_key"]
+            existing_prog = existing_progress_map.get(it["product_key"].lower()) or existing_progress_map.get(pkg_alias.lower())
+
             existing_it = existing_items_map.get(it["product_key"])
-            item_status = existing_it.status if (existing_it and existing_it.status) else "Pending"
+            item_status = "Pending"
+            if existing_prog and existing_prog.get("status"):
+                item_status = existing_prog["status"]
+            elif existing_it and existing_it.status:
+                item_status = existing_it.status
+
             item_msg_id = existing_it.client_delivered_msg_id if existing_it else None
             item_del_at = existing_it.delivered_at if existing_it else None
             item_loader_id = existing_it.delivered_by_loader_id if existing_it else None
-            if not s_code and existing_it:
+            if not s_code and existing_prog and existing_prog.get("secret_profit_code"):
+                s_code = existing_prog["secret_profit_code"]
+            elif not s_code and existing_it:
                 s_code = existing_it.secret_profit_code
 
             db_item = OrderItem(
@@ -1064,7 +1101,10 @@ async def save_order_pricing(
             session.add(db_item)
 
             pkg_alias = it["product_key"].replace("cp_", "") if it["product_key"].startswith("cp_") else it["product_key"]
-            synced_progress_items.append({
+            sel_by = existing_prog.get("selected_by_loader") if existing_prog else None
+            sel_time = existing_prog.get("selected_time") if existing_prog else None
+
+            prog_item = {
                 "package": pkg_alias,
                 "qty": it["quantity"],
                 "product_key": it["product_key"],
@@ -1075,9 +1115,13 @@ async def save_order_pricing(
                 "status": item_status,
                 "client_delivered_msg_id": item_msg_id,
                 "delivery_time": item_del_at.isoformat() if item_del_at else None
-            })
+            }
+            if sel_by is not None:
+                prog_item["selected_by_loader"] = sel_by
+            if sel_time is not None:
+                prog_item["selected_time"] = sel_time
+            synced_progress_items.append(prog_item)
 
-        import json
         if synced_progress_items:
             order.package_progress = json.dumps(synced_progress_items)
 
@@ -1837,6 +1881,31 @@ async def create_delivery_session(order_id: int, loader_id: int, session_msg_id:
         session.add(ds)
         await session.commit()
         await session.refresh(ds)
+
+        logger.info(
+            f"[PKG_SESSION_DEBUG]\n"
+            f"CREATING SESSION\n"
+            f"order_id={order_id}\n"
+            f"loader_id={loader_id}\n"
+            f"session_msg_id={session_msg_id}\n"
+            f"selected_packages={selected_packages}\n"
+            f"created_session_id={ds.id}"
+        )
+
+        stmt_v = select(DeliverySession).where(DeliverySession.id == ds.id)
+        ds_verified = (await session.execute(stmt_v)).scalar_one_or_none()
+        if ds_verified:
+            logger.info(
+                f"[PKG_SESSION_DEBUG]\n"
+                f"SESSION VERIFIED\n"
+                f"session_id={ds_verified.id}\n"
+                f"order_id={ds_verified.order_id}\n"
+                f"loader_id={ds_verified.loader_id}\n"
+                f"session_msg_id={ds_verified.delivery_session_message_id}\n"
+                f"status={ds_verified.status}\n"
+                f"selected_packages={ds_verified.selected_packages}"
+            )
+
         logger.info(f"[DELIVERY_SESSION] Session #{ds.id} created for Order #{order_id} (Msg ID: {session_msg_id}, Loader: {loader_id}).")
         return ds
 
@@ -1860,25 +1929,44 @@ async def get_active_delivery_session(order_id: int, loader_id: Optional[int] = 
     Looks up an active waiting_images DeliverySession by session_msg_id, or by (order_id, loader_id).
     """
     async with AsyncSessionLocal() as session:
+        ds_result = None
         if session_msg_id:
             stmt = select(DeliverySession).where(
                 (DeliverySession.delivery_session_message_id == session_msg_id) &
                 (DeliverySession.status == "waiting_images")
             )
-            ds = (await session.execute(stmt)).scalar_one_or_none()
-            if ds:
-                return ds
+            ds_result = (await session.execute(stmt)).scalar_one_or_none()
 
-        stmt = select(DeliverySession).where(
-            (DeliverySession.order_id == order_id) &
-            (DeliverySession.status == "waiting_images")
+        if not ds_result and order_id:
+            stmt = select(DeliverySession).where(
+                (DeliverySession.order_id == order_id) &
+                (DeliverySession.status == "waiting_images")
+            )
+            if loader_id:
+                stmt = stmt.where(DeliverySession.loader_id == loader_id)
+
+            stmt = stmt.order_by(DeliverySession.id.desc())
+            res = await session.execute(stmt)
+            ds_result = res.scalars().first()
+
+        logger.info(
+            f"[PKG_SESSION_DEBUG]\n"
+            f"SESSION LOOKUP\n"
+            f"order_id={order_id}\n"
+            f"loader_id={loader_id}\n"
+            f"session_msg_id={session_msg_id}\n"
+            f"RESULT={ds_result.id if ds_result else 'None'}"
         )
-        if loader_id:
-            stmt = stmt.where(DeliverySession.loader_id == loader_id)
 
-        stmt = stmt.order_by(DeliverySession.id.desc())
-        res = await session.execute(stmt)
-        return res.scalars().first()
+        if not ds_result:
+            stmt_all = select(DeliverySession).where(
+                (DeliverySession.order_id == order_id) | (DeliverySession.loader_id == loader_id if loader_id else False)
+            )
+            all_res = (await session.execute(stmt_all)).scalars().all()
+            all_info = [f"id={s.id},order={s.order_id},loader={s.loader_id},msg_id={s.delivery_session_message_id},status={s.status}" for s in all_res]
+            logger.info(f"[PKG_SESSION_DEBUG] ALL ACTIVE SESSIONS FOR ORDER {order_id} / LOADER {loader_id}: {all_info}")
+
+        return ds_result
 
 
 async def close_delivery_session(session_id: int) -> None:
@@ -2270,7 +2358,7 @@ async def get_loader_price(loader_id: int, product_key: str) -> Optional[Decimal
     Returns Decimal or None if not found.
     """
     pkey = product_key.strip().lower()
-    if loader_id not in LOADER_PRICES_CACHE:
+    if loader_id not in LOADER_PRICES_CACHE or pkey not in LOADER_PRICES_CACHE.get(loader_id, {}):
         await reload_loader_prices_cache(loader_id=loader_id)
 
     loader_cache = LOADER_PRICES_CACHE.get(loader_id, {})
@@ -3030,6 +3118,8 @@ async def reset_delivery_ledger(admin_id: int, chat_id: Optional[int] = None) ->
             session.add(rt_entry)
 
             await session.commit()
+            LOADERS_CACHE.clear()
+            LOADER_PRICES_CACHE.clear()
 
             logger.info(
                 f"[LEDGER_RESET]\n"

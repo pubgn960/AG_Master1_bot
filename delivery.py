@@ -210,10 +210,31 @@ async def deliver_order_by_id(
 
     if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
         target_grp = loader_chat_id or order.loader_group_id
+        try:
+            from models import Loader
+            from database import AsyncSessionLocal, reload_loaders_cache
+            from sqlalchemy import select, or_
+            await reload_loaders_cache()
+            async with AsyncSessionLocal() as session:
+                stmt_l = select(Loader).where(or_(Loader.group_id == target_grp, Loader.id == target_grp))
+                l_obj = (await session.execute(stmt_l)).scalar_one_or_none()
+                if l_obj:
+                    resolved_loader_id = l_obj.id
+        except Exception:
+            pass
+
+    if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
+        target_grp = loader_chat_id or order.loader_group_id
         for l_id, l_data in LOADERS_CACHE.items():
-            if l_data.get("group_id") == target_grp or l_id == target_grp:
+            if isinstance(l_data, dict) and (l_data.get("group_id") == target_grp or l_id == target_grp):
                 resolved_loader_id = l_id
                 break
+
+    # Ensure order pricing and items are saved and updated with resolved loader pricing first
+    if order.category == "B" or not order.secret_profit_code:
+        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
+        if priced_order:
+            order = priced_order
 
     # Get current package progress items from DB or initialize from raw_text
     if order.package_progress:
@@ -240,12 +261,6 @@ async def deliver_order_by_id(
                 if it.get("status") != "Delivered":
                     selected_delivery_items = [it]
                     break
-
-    # Ensure order pricing and items are saved and updated with resolved loader pricing first
-    if order.category == "B" or not order.secret_profit_code:
-        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
-        if priced_order:
-            order = priced_order
 
     # Build stored client prices lookup from existing order.items or order.client_price_total
     order_client_prices: Dict[str, Any] = {}
@@ -283,6 +298,16 @@ async def deliver_order_by_id(
     )
 
     session_secret_code = session_calc.get("secret_profit_code")
+    if session_secret_code:
+        from database import AsyncSessionLocal
+        from sqlalchemy import update
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(Order).where(Order.id == order.id).values(secret_profit_code=session_secret_code)
+            )
+            await session.commit()
+        order.secret_profit_code = session_secret_code
+
     item_codes_map: Dict[str, str] = {}
     for calc_it in session_calc.get("items", []):
         pkg_alias = calc_it["product_key"].replace("cp_", "") if calc_it["product_key"].startswith("cp_") else calc_it["product_key"]
@@ -381,6 +406,14 @@ async def deliver_order_by_id(
         except Exception:
             pass
 
+    if not selected_items_list:
+        selected_items_list = selected_delivery_items
+
+    print("DEBUG delivery.py BEFORE mark_selected_packages_delivered:")
+    print("  progress_items:", progress_items)
+    print("  selected_items_list:", selected_items_list)
+    print("  item_codes_map:", item_codes_map)
+
     updated_items, is_all_completed, delivered_cnt = mark_selected_packages_delivered(
         progress_items,
         loader_id=loader_user_id,
@@ -388,6 +421,11 @@ async def deliver_order_by_id(
         item_codes=item_codes_map,
         client_delivered_msg_id=last_sent_customer_msg_id
     )
+
+    print("DEBUG delivery.py AFTER mark_selected_packages_delivered:")
+    print("  updated_items:", updated_items)
+    print("  is_all_completed:", is_all_completed)
+
     updated_progress_json = json.dumps(updated_items)
     await update_order_package_progress(order.id, updated_progress_json)
     order.package_progress = updated_progress_json
