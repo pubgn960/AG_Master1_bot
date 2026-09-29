@@ -3034,13 +3034,31 @@ async def category_b_approval_callback_handler(update: Update, context: ContextT
                 logger.exception(f"[LOADER] Failed to edit message: {e}")
             return
 
-        # 2. Copy ORIGINAL customer message to selected loader group
+        # 2. Copy ORIGINAL customer message to selected loader group with package toggle keyboard
         if order.client_chat_id and order.original_message_id:
             try:
+                loader_kb = None
+                if order.package_progress:
+                    try:
+                        loader_kb = build_loader_package_keyboard(order.id, json.loads(order.package_progress))
+                    except Exception:
+                        pass
+
+                if not loader_kb:
+                    raw_content = order.raw_text or order.package or ""
+                    parsed_pkg = parse_test_order_packages(raw_content)
+                    if parsed_pkg and parsed_pkg.get("packages"):
+                        init_progress_items = [
+                            {"package": item["package"], "qty": item["qty"], "unit_price": item["unit_price"], "status": "Pending"}
+                            for item in parsed_pkg["packages"]
+                        ]
+                        loader_kb = build_loader_package_keyboard(order.id, init_progress_items)
+
                 forwarded_msg = await context.bot.copy_message(
                     chat_id=target_group_id,
                     from_chat_id=order.client_chat_id,
-                    message_id=order.original_message_id
+                    message_id=order.original_message_id,
+                    reply_markup=loader_kb
                 )
                 logger.info(f"[LOADER]\nCopy Success\nOrder #{order.id} copied to Loader Group '{loader_name}' ({target_group_id}) with Loader Msg ID {forwarded_msg.message_id}.")
 
@@ -5181,11 +5199,37 @@ async def process_pending_category_b_orders(client_group_id: int, telegram_user_
             loader_group_id = BOT_SETTINGS.get("delivery_group_id")
             if loader_group_id:
                 try:
-                    await context.bot.send_message(
-                        chat_id=loader_group_id,
-                        text=f"📦 <b>Category B Order #{order.id} Paid via Wallet</b>\n\nEmail: {order.email}\nPackage: {order.package}",
-                        parse_mode="HTML"
-                    )
+                    loader_kb = None
+                    if order.package_progress:
+                        try:
+                            loader_kb = build_loader_package_keyboard(order.id, json.loads(order.package_progress))
+                        except Exception:
+                            pass
+                    if not loader_kb:
+                        raw_content = order.raw_text or order.package or ""
+                        parsed_pkg = parse_test_order_packages(raw_content)
+                        if parsed_pkg and parsed_pkg.get("packages"):
+                            init_progress_items = [
+                                {"package": item["package"], "qty": item["qty"], "unit_price": item["unit_price"], "status": "Pending"}
+                                for item in parsed_pkg["packages"]
+                            ]
+                            loader_kb = build_loader_package_keyboard(order.id, init_progress_items)
+
+                    if order.client_chat_id and order.original_message_id:
+                        forwarded_msg = await context.bot.copy_message(
+                            chat_id=loader_group_id,
+                            from_chat_id=order.client_chat_id,
+                            message_id=order.original_message_id,
+                            reply_markup=loader_kb
+                        )
+                        await set_order_loader_message_id(order.id, forwarded_msg.message_id, loader_group_id=loader_group_id)
+                    else:
+                        await context.bot.send_message(
+                            chat_id=loader_group_id,
+                            text=f"📦 <b>Category B Order #{order.id} Paid via Wallet</b>\n\nEmail: {order.email}\nPackage: {order.package}",
+                            reply_markup=loader_kb,
+                            parse_mode="HTML"
+                        )
                 except Exception as e:
                     logger.error(f"[WALLET_AUTO_PROCESS] Failed to notify loader group: {e}")
 
