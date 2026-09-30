@@ -1962,27 +1962,59 @@ async def price_input_text_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def exportprices_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Super Admin command /exportprices.
-    Reads ALL package prices from the database (NOT hardcoded values)
-    and replies with the current production price list.
+    Admin command /exportprices.
+    Exports the CURRENT saved client price list from the database as a clean JSON document.
+    Does NOT export private loader costs.
     """
+    message = update.effective_message
+    if not message:
+        return
+
     user = update.effective_user
-    if not user or not is_super_admin(user.id):
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
         logger.warning(f"[PRICE_EXPORT] Unauthorized /exportprices attempt by user #{user.id if user else 'Unknown'}.")
+        await message.reply_text("⛔ You are not authorized to use this command.")
         return
 
     try:
-        prices = await get_all_package_prices_from_db()
-        if not prices:
-            prices = PACKAGE_PRICES
+        import json
+        from database import get_all_global_client_prices_from_db
+        db_prices = await get_all_global_client_prices_from_db()
 
-        export_text = format_export_prices(prices)
-        await update.message.reply_text(export_text)
-        now_str = datetime.now(timezone.utc).isoformat()
-        logger.info(f"[PRICE_EXPORT] Admin #{user.id}, Timestamp {now_str}, Number of Packages Exported: {len(prices)}")
+        prices_list = []
+        if db_prices:
+            for item in db_prices:
+                prices_list.append({
+                    "product_key": item.product_key,
+                    "display_name": item.display_name,
+                    "price": float(item.price),
+                    "category": item.package_type
+                })
+
+        exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        export_payload = {
+            "export_type": "client_prices",
+            "exported_at": exported_at,
+            "prices": prices_list
+        }
+
+        json_bytes = json.dumps(export_payload, indent=2).encode("utf-8")
+        timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"client_prices_export_{timestamp_file}.json"
+
+        file_obj = io.BytesIO(json_bytes)
+        file_obj.name = filename
+
+        await message.reply_document(
+            document=file_obj,
+            filename=filename,
+            caption=f"📄 <b>Client Price List Export</b>\n\nTotal Products: {len(prices_list)}",
+            parse_mode="HTML"
+        )
+        logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {len(prices_list)} client prices to {filename}.")
     except Exception as e:
-        logger.exception(f"[PRICE_EXPORT] Failed to export prices for admin #{user.id}: {e}")
-        await update.message.reply_text("❌ Failed to export price list.")
+        logger.exception(f"[PRICE_EXPORT] Failed to export client prices for admin #{user.id}: {e}")
+        await message.reply_text("❌ Failed to export client price list.")
 
 
 async def updateprices_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

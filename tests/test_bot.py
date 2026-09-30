@@ -11359,6 +11359,145 @@ class TestOrder110LoaderGroupIdAndSessionFix(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(p["status"] == "Delivered" for p in pkgs_final))
 
 
+class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for /exportprices admin command:
+    1. Authorized admin can export prices
+    2. Unauthorized user is rejected
+    3. Exported data contains current database prices (normal, special, safe vault, full chain)
+    4. Loader private prices are NOT included
+    5. Empty price list is handled safely
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal
+        from models import GlobalClientPrice, LoaderPrice
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.commit()
+
+    async def test_unauthorized_user_is_rejected(self):
+        from handlers import exportprices_command_handler
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_user = MagicMock()
+        mock_user.id = 999888777
+
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await exportprices_command_handler(update, context)
+
+        mock_msg.reply_text.assert_called_once()
+        reply_args = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("not authorized", reply_args.lower())
+
+    async def test_authorized_admin_exports_current_db_prices_and_excludes_loader_prices(self):
+        from database import set_global_client_price, set_loader_price, add_loader
+        from handlers import exportprices_command_handler
+        from config import Config
+        from unittest.mock import MagicMock, AsyncMock
+        import json
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # 1. Seed DB with client prices of various categories
+        await set_global_client_price("cp_2400", 16.0, display_name="2400 CP", package_type="normal_cp")
+        await set_global_client_price("cp_9600", 57.0, display_name="9600 CP", package_type="special_cp")
+        await set_global_client_price("safe_vault_50", 38.0, display_name="$50 Safe Vault", package_type="safe_vault")
+        await set_global_client_price("full_chain", 16.0, display_name="Full Chain", package_type="full_chain")
+
+        # 2. Add private loader prices (which MUST NOT be exported)
+        loader = await add_loader(group_id=-100999, loader_name="Private Loader")
+        await set_loader_price(loader.id, "cp_2400", 12.0)
+        await set_loader_price(loader.id, "secret_loader_package", 99.0)
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await exportprices_command_handler(update, context)
+
+        mock_msg.reply_document.assert_called_once()
+        kwargs = mock_msg.reply_document.call_args[1]
+
+        file_obj = kwargs.get("document")
+        filename = kwargs.get("filename")
+
+        self.assertIsNotNone(file_obj)
+        self.assertTrue(filename.startswith("client_prices_export_"))
+        self.assertTrue(filename.endswith(".json"))
+
+        file_obj.seek(0)
+        content = json.loads(file_obj.read().decode("utf-8"))
+
+        self.assertEqual(content["export_type"], "client_prices")
+        prices = content["prices"]
+        self.assertEqual(len(prices), 4)
+
+        keys = [p["product_key"] for p in prices]
+        self.assertIn("cp_2400", keys)
+        self.assertIn("cp_9600", keys)
+        self.assertIn("safe_vault_50", keys)
+        self.assertIn("full_chain", keys)
+        self.assertNotIn("secret_loader_package", keys)
+
+        # Check fields preserved
+        cp2400 = next(p for p in prices if p["product_key"] == "cp_2400")
+        self.assertEqual(cp2400["display_name"], "2400 CP")
+        self.assertEqual(cp2400["price"], 16.0)
+        self.assertEqual(cp2400["category"], "normal_cp")
+
+    async def test_empty_price_list_handled_safely(self):
+        from handlers import exportprices_command_handler
+        from config import Config
+        from unittest.mock import MagicMock, AsyncMock
+        import json
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await exportprices_command_handler(update, context)
+
+        mock_msg.reply_document.assert_called_once()
+        kwargs = mock_msg.reply_document.call_args[1]
+        file_obj = kwargs.get("document")
+
+        file_obj.seek(0)
+        content = json.loads(file_obj.read().decode("utf-8"))
+
+        self.assertEqual(content["export_type"], "client_prices")
+        self.assertEqual(content["prices"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
 
