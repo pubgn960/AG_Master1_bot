@@ -11406,7 +11406,6 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         from handlers import exportprices_command_handler
         from config import Config
         from unittest.mock import MagicMock, AsyncMock
-        import json
 
         admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
 
@@ -11414,7 +11413,7 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         await set_global_client_price("cp_2400", 16.0, display_name="2400 CP", package_type="normal_cp")
         await set_global_client_price("cp_9600", 57.0, display_name="9600 CP", package_type="special_cp")
         await set_global_client_price("safe_vault_50", 38.0, display_name="$50 Safe Vault", package_type="safe_vault")
-        await set_global_client_price("full_chain", 16.0, display_name="Full Chain", package_type="full_chain")
+        await set_global_client_price("full_chain", 16.0, display_name="560 CP + 300 Mythic Cards", package_type="full_chain")
 
         # 2. Add private loader prices (which MUST NOT be exported)
         loader = await add_loader(group_id=-100999, loader_name="Private Loader")
@@ -11443,33 +11442,29 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(file_obj)
         self.assertTrue(filename.startswith("client_prices_export_"))
-        self.assertTrue(filename.endswith(".json"))
+        self.assertTrue(filename.endswith(".txt"))
 
         file_obj.seek(0)
-        content = json.loads(file_obj.read().decode("utf-8"))
+        text_content = file_obj.read().decode("utf-8")
 
-        self.assertEqual(content["export_type"], "client_prices")
-        prices = content["prices"]
-        self.assertEqual(len(prices), 4)
+        self.assertIn("AG CLIENT PRICE LIST", text_content)
+        self.assertIn("NORMAL CP", text_content)
+        self.assertIn("2400 CP ➜ $16", text_content)
+        self.assertIn("SPECIAL CP", text_content)
+        self.assertIn("9600 CP ➜ $57", text_content)
+        self.assertIn("SAFE VAULT", text_content)
+        self.assertIn("$50 ➜ $38", text_content)
+        self.assertIn("FULL CHAIN", text_content)
+        self.assertIn("560 CP + 300 Mythic Cards ➜ $16", text_content)
 
-        keys = [p["product_key"] for p in prices]
-        self.assertIn("cp_2400", keys)
-        self.assertIn("cp_9600", keys)
-        self.assertIn("safe_vault_50", keys)
-        self.assertIn("full_chain", keys)
-        self.assertNotIn("secret_loader_package", keys)
-
-        # Check fields preserved
-        cp2400 = next(p for p in prices if p["product_key"] == "cp_2400")
-        self.assertEqual(cp2400["display_name"], "2400 CP")
-        self.assertEqual(cp2400["price"], 16.0)
-        self.assertEqual(cp2400["category"], "normal_cp")
+        # Confirm loader prices excluded
+        self.assertNotIn("secret_loader_package", text_content)
+        self.assertNotIn("$12", text_content)
 
     async def test_empty_price_list_handled_safely(self):
         from handlers import exportprices_command_handler
         from config import Config
         from unittest.mock import MagicMock, AsyncMock
-        import json
 
         admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
 
@@ -11490,12 +11485,15 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
         file_obj = kwargs.get("document")
+        filename = kwargs.get("filename")
+
+        self.assertTrue(filename.endswith(".txt"))
 
         file_obj.seek(0)
-        content = json.loads(file_obj.read().decode("utf-8"))
+        text_content = file_obj.read().decode("utf-8")
 
-        self.assertEqual(content["export_type"], "client_prices")
-        self.assertEqual(content["prices"], [])
+        self.assertIn("AG CLIENT PRICE LIST", text_content)
+        self.assertIn("(No client prices found in database)", text_content)
 
 
 if __name__ == "__main__":

@@ -1960,10 +1960,55 @@ async def price_input_text_handler(update: Update, context: ContextTypes.DEFAULT
 # Production Bulk Price Update System
 # ==========================================
 
+def format_client_prices_export_txt(db_prices: List[Any]) -> str:
+    """
+    Formats DB GlobalClientPrice records into clean human-readable text format for export.
+    """
+    header = "AG CLIENT PRICE LIST\n====================\n"
+    if not db_prices:
+        return header + "\n(No client prices found in database)"
+
+    category_order = ["normal_cp", "special_cp", "bonus_deal", "safe_vault", "full_chain"]
+    category_titles = {
+        "normal_cp": "NORMAL CP",
+        "special_cp": "SPECIAL CP",
+        "bonus_deal": "BONUS DEAL",
+        "safe_vault": "SAFE VAULT",
+        "full_chain": "FULL CHAIN",
+    }
+
+    grouped: Dict[str, List[Any]] = {}
+    for item in db_prices:
+        cat = getattr(item, "package_type", "normal_cp") or "normal_cp"
+        grouped.setdefault(cat, []).append(item)
+
+    sections = []
+    all_cats = category_order + [c for c in grouped.keys() if c not in category_order]
+
+    for cat in all_cats:
+        if cat not in grouped or not grouped[cat]:
+            continue
+
+        title = category_titles.get(cat, cat.replace("_", " ").upper())
+        lines = [title]
+        for item in grouped[cat]:
+            dname = getattr(item, "display_name", "") or getattr(item, "product_key", "")
+            if cat == "safe_vault" and dname.endswith(" Safe Vault"):
+                dname = dname.replace(" Safe Vault", "").strip()
+
+            val = float(getattr(item, "price", 0.0))
+            price_str = f"${int(val)}" if val == int(val) else f"${val}"
+            lines.append(f"{dname} ➜ {price_str}")
+
+        sections.append("\n".join(lines))
+
+    return header + "\n" + "\n\n".join(sections)
+
+
 async def exportprices_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Admin command /exportprices.
-    Exports the CURRENT saved client price list from the database as a clean JSON document.
+    Exports the CURRENT saved client price list from the database as a clean text file (.txt).
     Does NOT export private loader costs.
     """
     message = update.effective_message
@@ -1977,41 +2022,26 @@ async def exportprices_command_handler(update: Update, context: ContextTypes.DEF
         return
 
     try:
-        import json
         from database import get_all_global_client_prices_from_db
         db_prices = await get_all_global_client_prices_from_db()
 
-        prices_list = []
-        if db_prices:
-            for item in db_prices:
-                prices_list.append({
-                    "product_key": item.product_key,
-                    "display_name": item.display_name,
-                    "price": float(item.price),
-                    "category": item.package_type
-                })
+        export_text = format_client_prices_export_txt(db_prices)
+        txt_bytes = export_text.encode("utf-8")
 
-        exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        export_payload = {
-            "export_type": "client_prices",
-            "exported_at": exported_at,
-            "prices": prices_list
-        }
-
-        json_bytes = json.dumps(export_payload, indent=2).encode("utf-8")
         timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"client_prices_export_{timestamp_file}.json"
+        filename = f"client_prices_export_{timestamp_file}.txt"
 
-        file_obj = io.BytesIO(json_bytes)
+        file_obj = io.BytesIO(txt_bytes)
         file_obj.name = filename
 
+        count = len(db_prices) if db_prices else 0
         await message.reply_document(
             document=file_obj,
             filename=filename,
-            caption=f"📄 <b>Client Price List Export</b>\n\nTotal Products: {len(prices_list)}",
+            caption=f"📄 <b>Client Price List Export</b>\n\nTotal Products: {count}",
             parse_mode="HTML"
         )
-        logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {len(prices_list)} client prices to {filename}.")
+        logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {count} client prices to {filename}.")
     except Exception as e:
         logger.exception(f"[PRICE_EXPORT] Failed to export client prices for admin #{user.id}: {e}")
         await message.reply_text("❌ Failed to export client price list.")
