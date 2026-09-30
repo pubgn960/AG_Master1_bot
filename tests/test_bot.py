@@ -8437,8 +8437,8 @@ class TestSetLoaderPriceReplyBased(unittest.IsolatedAsyncioTestCase):
              patch("main.check_order_timeouts", AsyncMock(return_value=0)):
             await post_init(app)
 
-        mock_bot.set_my_commands.assert_called_once()
-        sent_bot_commands = mock_bot.set_my_commands.call_args[0][0]
+        self.assertTrue(mock_bot.set_my_commands.called)
+        sent_bot_commands = mock_bot.set_my_commands.call_args_list[0][0][0]
         cmd_names = [cmd.command for cmd in sent_bot_commands]
         self.assertIn("setloaderprice", cmd_names, "setloaderprice must be present in Telegram BotCommand list passed to set_my_commands")
 
@@ -11424,6 +11424,7 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11433,6 +11434,13 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
 
         await exportprices_command_handler(update, context)
+
+        mock_msg.reply_text.assert_called_once()
+        summary_text = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("✅ Client Price List Exported", summary_text)
+        self.assertIn("📦 Total Prices: 4", summary_text)
+        self.assertIn("📄 Format: TXT", summary_text)
+        self.assertIn("🔒 Client prices only", summary_text)
 
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
@@ -11472,6 +11480,7 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11481,6 +11490,11 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
 
         await exportprices_command_handler(update, context)
+
+        mock_msg.reply_text.assert_called_once()
+        summary_text = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("✅ Client Price List Exported", summary_text)
+        self.assertIn("📦 Total Prices: 0", summary_text)
 
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
@@ -11568,6 +11582,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11577,6 +11592,14 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
 
         await loaderexportprice_command_handler(update, context)
+
+        mock_msg.reply_text.assert_called_once()
+        summary_text = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("✅ Loader Price List Exported", summary_text)
+        self.assertIn("👥 Loader Groups: 2", summary_text)
+        self.assertIn("📦 Total Price Records: 3", summary_text)
+        self.assertIn("📄 Format: TXT", summary_text)
+        self.assertIn("🔒 Private loader prices", summary_text)
 
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
@@ -11625,6 +11648,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11668,6 +11692,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11696,6 +11721,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
         mock_user.id = admin_id
 
         mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
         mock_msg.reply_document = AsyncMock()
 
         update = MagicMock()
@@ -11706,6 +11732,12 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
+        mock_msg.reply_text.assert_called_once()
+        summary_text = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("✅ Loader Price List Exported", summary_text)
+        self.assertIn("👥 Loader Groups: 0", summary_text)
+        self.assertIn("📦 Total Price Records: 0", summary_text)
+
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
         file_obj = kwargs.get("document")
@@ -11715,6 +11747,76 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("AG LOADER PRICE LIST", text_content)
         self.assertIn("(No loader prices found in database)", text_content)
+
+
+class TestTelegramCommandMenuRegistration(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for Telegram BotCommand menu registration:
+    1. Default/normal-user scope (BotCommandScopeDefault) does NOT contain exportprices or loaderexportprice.
+    2. Admin-specific scope (BotCommandScopeChat) contains both exportprices and loaderexportprice.
+    3. Admin registration is performed for all configured admin IDs.
+    4. Normal commands remain present in both default and admin scopes.
+    """
+
+    async def test_scoped_command_registration(self):
+        from main import post_init
+        from telegram import BotCommandScopeDefault, BotCommandScopeChat
+        from utils import get_all_admin_user_ids
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_app = MagicMock()
+        mock_app.bot.set_my_commands = AsyncMock()
+
+        await post_init(mock_app)
+
+        admin_ids = get_all_admin_user_ids()
+        expected_calls = 1 + len(admin_ids)  # 1 default call + N admin calls
+        self.assertEqual(mock_app.bot.set_my_commands.call_count, expected_calls)
+
+        calls = mock_app.bot.set_my_commands.call_args_list
+
+        default_call = None
+        admin_calls = {}
+
+        for call in calls:
+            scope = call[1].get("scope") if len(call) > 1 and "scope" in call[1] else None
+            if isinstance(scope, BotCommandScopeDefault):
+                default_call = call
+            elif isinstance(scope, BotCommandScopeChat):
+                admin_calls[scope.chat_id] = call
+
+        # A. Default command menu verification
+        self.assertIsNotNone(default_call, "BotCommandScopeDefault must be registered")
+        default_cmds = default_call[0][0]
+        default_names = [c.command for c in default_cmds]
+
+        self.assertNotIn("exportprices", default_names, "/exportprices MUST NOT be in default user menu")
+        self.assertNotIn("loaderexportprice", default_names, "/loaderexportprice MUST NOT be in default user menu")
+        self.assertIn("start", default_names)
+        self.assertIn("help", default_names)
+        self.assertIn("status", default_names)
+        self.assertIn("loaderlist", default_names)
+
+        # B. Admin command menu verification for all configured admins
+        for admin_id in admin_ids:
+            self.assertIn(admin_id, admin_calls, f"Admin #{admin_id} must have BotCommandScopeChat registration")
+            admin_call = admin_calls[admin_id]
+            admin_cmds = admin_call[0][0]
+            admin_cmd_dict = {c.command: c.description for c in admin_cmds}
+
+            self.assertIn("exportprices", admin_cmd_dict)
+            self.assertEqual(admin_cmd_dict["exportprices"], "Export client prices")
+            self.assertIn("loaderexportprice", admin_cmd_dict)
+            self.assertEqual(admin_cmd_dict["loaderexportprice"], "Export loader prices")
+
+            self.assertIn("start", admin_cmd_dict)
+            self.assertIn("help", admin_cmd_dict)
+            self.assertIn("status", admin_cmd_dict)
+            self.assertIn("loaderlist", admin_cmd_dict)
+
+            # Check no duplicate command names in admin command list
+            admin_names = [c.command for c in admin_cmds]
+            self.assertEqual(len(admin_names), len(set(admin_names)), "Admin commands list must not contain duplicates")
 
 
 if __name__ == "__main__":

@@ -348,6 +348,24 @@ def is_admin(user_id: Optional[int]) -> bool:
     return is_super_admin(user_id)
 
 
+def get_all_admin_user_ids() -> Set[int]:
+    """
+    Resolves set of all active authorized admin user IDs from Config.ADMIN_IDS,
+    AUTH_USERS_CACHE (where role=='admin'), and default super admin seed 1573531032.
+    """
+    admin_ids: Set[int] = set()
+    admin_ids.add(1573531032)
+
+    if Config.ADMIN_IDS:
+        admin_ids.update(Config.ADMIN_IDS)
+
+    for uid, role in AUTH_USERS_CACHE.items():
+        if role == "admin":
+            admin_ids.add(uid)
+
+    return admin_ids
+
+
 async def check_admin_permission(update: Update) -> bool:
     """
     Verifies Super Admin access for command updates.

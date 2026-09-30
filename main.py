@@ -9,7 +9,7 @@ import re
 import sys
 import asyncio
 import logging
-from telegram import BotCommand
+from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -30,7 +30,7 @@ from database import (
     reload_global_client_prices_cache,
     reload_loader_prices_cache
 )
-from utils import setup_logging
+from utils import setup_logging, get_all_admin_user_ids
 from handlers import (
     source_group_handler,
     edited_message_handler,
@@ -188,7 +188,7 @@ async def post_init(application: Application) -> None:
     await reload_loader_prices_cache()
 
     # Register Clean & Frequently Used Bot Commands for Telegram '/' menu UI
-    raw_commands = [
+    default_raw_commands = [
         BotCommand("start", "Start Bot"),
         BotCommand("help", "Help"),
         BotCommand("dashboard", "Open Live Web Dashboard & Mini-App"),
@@ -211,7 +211,6 @@ async def post_init(application: Application) -> None:
         BotCommand("pending", "Pending Orders"),
         BotCommand("find", "Find Order"),
         BotCommand("stats", "Statistics"),
-        BotCommand("exportprices", "Export Price List"),
         BotCommand("updateprices", "Bulk Update Prices"),
         BotCommand("setclientprice", "Set Global Client Prices"),
         BotCommand("setloaderprice", "Set Loader Price List (Reply)"),
@@ -230,18 +229,27 @@ async def post_init(application: Application) -> None:
         BotCommand("testbinance", "Test Binance API Connectivity")
     ]
 
-    valid_commands = []
-    for cmd in raw_commands:
-        if validate_bot_command(cmd):
-            valid_commands.append(cmd)
-        else:
-            logger.warning(f"[COMMANDS] Skipping invalid BotCommand name='{cmd.command}' desc='{cmd.description}'")
+    admin_raw_commands = default_raw_commands + [
+        BotCommand("exportprices", "Export client prices"),
+        BotCommand("loaderexportprice", "Export loader prices")
+    ]
+
+    valid_default_commands = [cmd for cmd in default_raw_commands if validate_bot_command(cmd)]
+    valid_admin_commands = [cmd for cmd in admin_raw_commands if validate_bot_command(cmd)]
 
     try:
-        await application.bot.set_my_commands(valid_commands)
-        logger.info(f"[COMMANDS] Registered {len(valid_commands)} bot commands successfully.")
+        await application.bot.set_my_commands(valid_default_commands, scope=BotCommandScopeDefault())
+        logger.info(f"[COMMANDS] Registered {len(valid_default_commands)} default bot commands for normal users.")
     except Exception:
-        logger.exception("[COMMANDS] Failed to register bot commands.")
+        logger.exception("[COMMANDS] Failed to register default bot commands.")
+
+    admin_ids = get_all_admin_user_ids()
+    for admin_id in admin_ids:
+        try:
+            await application.bot.set_my_commands(valid_admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            logger.info(f"[COMMANDS] Registered {len(valid_admin_commands)} admin bot commands for admin #{admin_id}.")
+        except Exception:
+            logger.exception(f"[COMMANDS] Failed to register admin bot commands for admin #{admin_id}.")
 
     # Initial order timeout check on startup
     expired = await check_order_timeouts(timeout_hours=24)
