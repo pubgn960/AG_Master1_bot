@@ -201,19 +201,35 @@ async def post_init(application: Application) -> None:
         BotCommand("a", "Set Category A"),
         BotCommand("b", "Set Category B"),
         BotCommand("category", "View Group Category"),
+        BotCommand("removecategory", "Remove Category"),
+        BotCommand("approve", "Approve Order"),
+        BotCommand("reject", "Reject Order"),
+        BotCommand("groups", "Group Configuration"),
+        BotCommand("status", "Bot Status"),
+        BotCommand("removesource", "Remove Client Group"),
+        BotCommand("removedelivery", "Remove Loader Group"),
+        BotCommand("resetgroups", "Reset Groups"),
         BotCommand("loaderadd", "Add Loader"),
         BotCommand("loaderlist", "List Loaders"),
         BotCommand("loaderremove", "Remove Loader"),
         BotCommand("user", "Manage Delivery Users"),
         BotCommand("users", "List Authorized Users"),
-        BotCommand("groups", "Group Configuration"),
-        BotCommand("status", "Bot Status"),
         BotCommand("pending", "Pending Orders"),
+        BotCommand("delivered", "Delivered Orders"),
         BotCommand("find", "Find Order"),
+        BotCommand("order", "Order Info"),
+        BotCommand("cancel", "Cancel Order"),
+        BotCommand("resend", "Resend Order"),
+        BotCommand("delete", "Delete Order"),
         BotCommand("stats", "Statistics"),
+        BotCommand("export", "Export Orders CSV"),
+        BotCommand("backup", "Backup Database"),
+        BotCommand("restore", "Restore Database"),
+        BotCommand("exportprices", "Export Client Prices"),
+        BotCommand("loaderexportprice", "Export Loader Prices"),
         BotCommand("updateprices", "Bulk Update Prices"),
         BotCommand("setclientprice", "Set Global Client Prices"),
-        BotCommand("setloaderprice", "Set Loader Price List (Reply)"),
+        BotCommand("setloaderprice", "Set Loader Price List"),
         BotCommand("calculate", "Add or Subtract Amount"),
         BotCommand("total", "View Current Total"),
         BotCommand("pay", "Record Payment & Reset Total"),
@@ -223,33 +239,29 @@ async def post_init(application: Application) -> None:
         BotCommand("ledger", "View Delivery Ledger"),
         BotCommand("todaytotal", "View Today Revenue & Stats"),
         BotCommand("resetledger", "Reset Running Total"),
+        BotCommand("cancelorder", "Client Cancel Order Request"),
+        BotCommand("topup", "Admin Top-up Customer Wallet"),
         BotCommand("wallet", "View Category B Wallet Balance"),
         BotCommand("balance", "View Category B Wallet Balance"),
-        BotCommand("topup", "Admin Top-up Customer Wallet"),
-        BotCommand("testbinance", "Test Binance API Connectivity")
-    ]
-
-    admin_raw_commands = default_raw_commands + [
-        BotCommand("exportprices", "Export client prices"),
-        BotCommand("loaderexportprice", "Export loader prices")
+        BotCommand("testbinance", "Test Binance API Connectivity"),
+        BotCommand("pendingorders", "Pending Orders Operations"),
+        BotCommand("assignloader", "Assign Order Loader"),
+        BotCommand("reassignloader", "Reassign Order Loader"),
+        BotCommand("myorders", "My Active Orders"),
+        BotCommand("revieworders", "Orders Needing Review"),
+        BotCommand("completedorders", "Completed Orders"),
+        BotCommand("cancelledorders", "Cancelled Orders"),
+        BotCommand("failedorders", "Failed Orders"),
+        BotCommand("retryorder", "Retry Order")
     ]
 
     valid_default_commands = [cmd for cmd in default_raw_commands if validate_bot_command(cmd)]
-    valid_admin_commands = [cmd for cmd in admin_raw_commands if validate_bot_command(cmd)]
 
     try:
         await application.bot.set_my_commands(valid_default_commands, scope=BotCommandScopeDefault())
-        logger.info(f"[COMMANDS] Registered {len(valid_default_commands)} default bot commands for normal users.")
+        logger.info(f"[COMMANDS] Registered {len(valid_default_commands)} default bot commands.")
     except Exception:
         logger.exception("[COMMANDS] Failed to register default bot commands.")
-
-    admin_ids = get_all_admin_user_ids()
-    for admin_id in admin_ids:
-        try:
-            await application.bot.set_my_commands(valid_admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
-            logger.info(f"[COMMANDS] Registered {len(valid_admin_commands)} admin bot commands for admin #{admin_id}.")
-        except Exception:
-            logger.exception(f"[COMMANDS] Failed to register admin bot commands for admin #{admin_id}.")
 
     # Initial order timeout check on startup
     expired = await check_order_timeouts(timeout_hours=24)
@@ -332,6 +344,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("subtractprice", subtractprice_command_handler))
     application.add_handler(CommandHandler("ledger", ledger_command_handler))
     application.add_handler(CommandHandler("todaytotal", todaytotal_command_handler))
+    application.add_handler(CommandHandler("resetledger", resetledger_command_handler))
     application.add_handler(CommandHandler("cancelorder", client_cancel_command_handler))
     application.add_handler(CommandHandler("topup", topup_command_handler))
     application.add_handler(CommandHandler(["wallet", "balance"], wallet_command_handler))

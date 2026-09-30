@@ -11753,16 +11753,14 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 class TestTelegramCommandMenuRegistration(unittest.IsolatedAsyncioTestCase):
     """
     Test suite for Telegram BotCommand menu registration:
-    1. Default/normal-user scope (BotCommandScopeDefault) does NOT contain exportprices or loaderexportprice.
-    2. Admin-specific scope (BotCommandScopeChat) contains both exportprices and loaderexportprice.
-    3. Admin registration is performed for all configured admin IDs.
-    4. Normal commands remain present in both default and admin scopes.
+    1. Single common default command scope (BotCommandScopeDefault) contains ALL implemented commands.
+    2. Includes exportprices and loaderexportprice in the single global command menu.
+    3. No chat-specific (BotCommandScopeChat) registrations are executed.
     """
 
     async def test_scoped_command_registration(self):
         from main import post_init
-        from telegram import BotCommandScopeDefault, BotCommandScopeChat
-        from utils import get_all_admin_user_ids
+        from telegram import BotCommandScopeDefault
         from unittest.mock import MagicMock, AsyncMock
 
         mock_app = MagicMock()
@@ -11770,54 +11768,30 @@ class TestTelegramCommandMenuRegistration(unittest.IsolatedAsyncioTestCase):
 
         await post_init(mock_app)
 
-        admin_ids = get_all_admin_user_ids()
-        expected_calls = 1 + len(admin_ids)  # 1 default call + N admin calls
-        self.assertEqual(mock_app.bot.set_my_commands.call_count, expected_calls)
+        # set_my_commands must be called exactly once for BotCommandScopeDefault
+        self.assertEqual(mock_app.bot.set_my_commands.call_count, 1)
 
-        calls = mock_app.bot.set_my_commands.call_args_list
+        call = mock_app.bot.set_my_commands.call_args_list[0]
+        scope = call[1].get("scope") if len(call) > 1 and "scope" in call[1] else None
+        self.assertIsInstance(scope, BotCommandScopeDefault, "BotCommandScopeDefault must be registered")
 
-        default_call = None
-        admin_calls = {}
+        registered_cmds = call[0][0]
+        cmd_names = [c.command for c in registered_cmds]
 
-        for call in calls:
-            scope = call[1].get("scope") if len(call) > 1 and "scope" in call[1] else None
-            if isinstance(scope, BotCommandScopeDefault):
-                default_call = call
-            elif isinstance(scope, BotCommandScopeChat):
-                admin_calls[scope.chat_id] = call
+        # Verify export commands are included in the single global command menu
+        self.assertIn("exportprices", cmd_names, "/exportprices must be present in global command menu")
+        self.assertIn("loaderexportprice", cmd_names, "/loaderexportprice must be present in global command menu")
+        self.assertIn("start", cmd_names)
+        self.assertIn("help", cmd_names)
+        self.assertIn("status", cmd_names)
+        self.assertIn("loaderlist", cmd_names)
+        self.assertIn("pendingorders", cmd_names)
+        self.assertIn("assignloader", cmd_names)
+        self.assertIn("reassignloader", cmd_names)
+        self.assertIn("myorders", cmd_names)
 
-        # A. Default command menu verification
-        self.assertIsNotNone(default_call, "BotCommandScopeDefault must be registered")
-        default_cmds = default_call[0][0]
-        default_names = [c.command for c in default_cmds]
-
-        self.assertNotIn("exportprices", default_names, "/exportprices MUST NOT be in default user menu")
-        self.assertNotIn("loaderexportprice", default_names, "/loaderexportprice MUST NOT be in default user menu")
-        self.assertIn("start", default_names)
-        self.assertIn("help", default_names)
-        self.assertIn("status", default_names)
-        self.assertIn("loaderlist", default_names)
-
-        # B. Admin command menu verification for all configured admins
-        for admin_id in admin_ids:
-            self.assertIn(admin_id, admin_calls, f"Admin #{admin_id} must have BotCommandScopeChat registration")
-            admin_call = admin_calls[admin_id]
-            admin_cmds = admin_call[0][0]
-            admin_cmd_dict = {c.command: c.description for c in admin_cmds}
-
-            self.assertIn("exportprices", admin_cmd_dict)
-            self.assertEqual(admin_cmd_dict["exportprices"], "Export client prices")
-            self.assertIn("loaderexportprice", admin_cmd_dict)
-            self.assertEqual(admin_cmd_dict["loaderexportprice"], "Export loader prices")
-
-            self.assertIn("start", admin_cmd_dict)
-            self.assertIn("help", admin_cmd_dict)
-            self.assertIn("status", admin_cmd_dict)
-            self.assertIn("loaderlist", admin_cmd_dict)
-
-            # Check no duplicate command names in admin command list
-            admin_names = [c.command for c in admin_cmds]
-            self.assertEqual(len(admin_names), len(set(admin_names)), "Admin commands list must not contain duplicates")
+        # Check no duplicate command names in command list
+        self.assertEqual(len(cmd_names), len(set(cmd_names)), "Commands list must not contain duplicates")
 
 
 if __name__ == "__main__":
