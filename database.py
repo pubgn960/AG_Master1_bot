@@ -919,7 +919,7 @@ async def set_order_loader_message_id(order_id: int, loader_message_id: int, loa
     """Updates the forwarded loader message ID and optional loader group ID for an order."""
     async with AsyncSessionLocal() as session:
         values: Dict[str, Any] = {"loader_message_id": loader_message_id}
-        if loader_group_id is not None:
+        if loader_group_id is not None and loader_group_id < 0:
             values["loader_group_id"] = loader_group_id
 
         stmt = (
@@ -983,7 +983,10 @@ async def save_order_pricing(
 
         if resolved_loader_id is not None:
             loader_info = LOADERS_CACHE.get(resolved_loader_id)
-            order.loader_group_id = loader_info["group_id"] if (loader_info and loader_info.get("group_id")) else resolved_loader_id
+            if loader_info and loader_info.get("group_id"):
+                order.loader_group_id = loader_info["group_id"]
+            elif isinstance(resolved_loader_id, int) and resolved_loader_id < 0:
+                order.loader_group_id = resolved_loader_id
 
         order_input: Any = order.package or order.raw_text or ""
         if order.package_progress:

@@ -11178,6 +11178,187 @@ class TestPackageActiveDeliverySessionBugFix(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s_items[0]["secret_profit_code"], "V")
 
 
+class TestOrder110LoaderGroupIdAndSessionFix(unittest.IsolatedAsyncioTestCase):
+    """
+    Dedicated regression tests for Order #110 multi-package loader issue:
+    1. loader_user_id != loader_group_id separation (user ID never overwrites order.loader_group_id).
+    2. Delivery from actual configured Loader Group is accepted; wrong chat is rejected.
+    3. One package selection creates exactly ONE active DeliverySession (no duplicate sessions created).
+    4. Session lookup resolves the correct package.
+    5. First (2400 CP) and second (10800 CP) packages can be delivered independently.
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal
+        from models import Order, DeliverySession, Loader
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(DeliverySession))
+            await session.execute(delete(Order))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+    async def test_loader_user_id_does_not_corrupt_order_loader_group_id(self):
+        from database import create_order, save_order_pricing, get_order_by_id, add_loader
+        loader_group_id = -1004475489329
+        loader_user_id = 1573531032
+
+        loader = await add_loader(group_id=loader_group_id, loader_name="Group Loader")
+
+        order = await create_order(
+            email="order110_fix@gmail.com",
+            package="2400 CP + 10800 CP",
+            category="B",
+            status="Pending"
+        )
+        from database import set_order_loader_message_id
+        await set_order_loader_message_id(order.id, 9991, loader_group_id=loader_group_id)
+
+        # Call save_order_pricing with loader_user_id (1573531032)
+        priced = await save_order_pricing(order.id, loader_id=loader_user_id)
+        chk = await get_order_by_id(order.id)
+
+        # order.loader_group_id MUST remain the Telegram group ID -1004475489329
+        self.assertEqual(chk.loader_group_id, loader_group_id, "save_order_pricing MUST NOT set order.loader_group_id to positive user ID!")
+        self.assertNotEqual(chk.loader_group_id, loader_user_id)
+
+    async def test_delivery_session_creation_guarantees_exactly_one_active_session(self):
+        from database import create_order, create_delivery_session, AsyncSessionLocal
+        from models import DeliverySession
+        from sqlalchemy import select
+        import json
+
+        order = await create_order(
+            email="order110_session@gmail.com",
+            package="2400 CP + 10800 CP",
+            category="B",
+            status="Pending"
+        )
+
+        loader_user_id = 1573531032
+        pkgs = json.dumps([{"package": "10800", "qty": 1}])
+
+        # First call: when toggle button is clicked (Order Card Msg ID 1715)
+        ds1 = await create_delivery_session(order.id, loader_user_id, 1715, pkgs)
+        self.assertIsNotNone(ds1)
+
+        # Second call: when confirm button is clicked (Prompt Msg ID 1720)
+        ds2 = await create_delivery_session(order.id, loader_user_id, 1720, pkgs)
+        self.assertIsNotNone(ds2)
+
+        # Verify active session count for this order & loader is EXACTLY 1
+        async with AsyncSessionLocal() as session:
+            stmt = select(DeliverySession).where(
+                (DeliverySession.order_id == order.id) &
+                (DeliverySession.loader_id == loader_user_id) &
+                (DeliverySession.status == "waiting_images")
+            )
+            active_sessions = (await session.execute(stmt)).scalars().all()
+
+        self.assertEqual(len(active_sessions), 1, "There MUST be exactly 1 active DeliverySession per package selection!")
+        self.assertEqual(active_sessions[0].delivery_session_message_id, 1720)
+
+    async def test_order_110_independent_package_delivery_and_chat_validation(self):
+        from database import create_order, save_order_pricing, get_order_by_id, add_loader, set_loader_price, create_delivery_session
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+        from models import Image
+        from database import AsyncSessionLocal
+        import json
+
+        loader_group_id = -1004475489329
+        wrong_group_id = -1009999999999
+        loader_user_id = 1573531032
+        client_chat_id = -100111222
+
+        loader = await add_loader(group_id=loader_group_id, loader_name="Order 110 Loader")
+        await set_loader_price(loader.id, "cp_2400", 14.0)
+        await set_loader_price(loader.id, "cp_10800", 50.0)
+
+        pkgs_json = json.dumps([
+            {"package": "2400", "qty": 1, "unit_price": 16.0, "client_price": 16.0, "status": "Pending"},
+            {"package": "10800", "qty": 1, "unit_price": 65.5, "client_price": 65.5, "status": "Pending"}
+        ])
+
+        order = await create_order(
+            email="order110_flow@gmail.com",
+            package="2400 CP + 10800 CP",
+            category="B",
+            client_chat_id=client_chat_id,
+            status="Pending",
+            package_progress=pkgs_json
+        )
+        await set_order_loader_message_id(order.id, 9992, loader_group_id=loader_group_id)
+        order = await save_order_pricing(order.id, loader_id=loader.id)
+
+        bot = MagicMock()
+        bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=2001)])
+        bot.send_message = AsyncMock(return_value=MagicMock(message_id=2002))
+        bot.set_message_reaction = AsyncMock(return_value=True)
+
+        async with AsyncSessionLocal() as session:
+            session.add(Image(order_id=order.id, telegram_file_id="img_2400", file_type="photo"))
+            await session.commit()
+
+        # Step 1: Deliver 2400 CP
+        await create_delivery_session(order.id, loader_user_id, 1701, json.dumps([{"package": "2400", "qty": 1}]))
+        res1 = await deliver_order_by_id(bot=bot, order_id=order.id, loader_chat_id=loader_group_id, loader_reply_msg_id=1701, target_delivery_chat_id=client_chat_id)
+        self.assertTrue(res1)
+
+        ord1 = await get_order_by_id(order.id)
+        self.assertEqual(ord1.status, "Partially Delivered")
+        self.assertEqual(ord1.loader_group_id, loader_group_id)
+
+        # Step 2: Loader selects 10800 CP
+        await create_delivery_session(order.id, loader_user_id, 1720, json.dumps([{"package": "10800", "qty": 1}]))
+
+        # Deliver 10800 CP from wrong chat -> rejected
+        from handlers import delivery_group_handler
+        wrong_update = MagicMock()
+        wrong_update.effective_chat.id = wrong_group_id
+        wrong_user = MagicMock()
+        wrong_user.id = loader_user_id
+        wrong_update.effective_user = wrong_user
+        wrong_msg = MagicMock()
+        wrong_msg.message_id = 3001
+        wrong_msg.chat.id = wrong_group_id
+        wrong_msg.from_user.id = loader_user_id
+        wrong_msg.from_user.is_bot = False
+        wrong_reply = MagicMock()
+        wrong_reply.message_id = 1720
+        wrong_reply.from_user.id = 99999
+        wrong_reply.from_user.is_bot = True
+        wrong_msg.reply_to_message = wrong_reply
+        wrong_msg.photo = [MagicMock(file_id="img_10800")]
+        wrong_update.effective_message = wrong_msg
+        wrong_update.message = wrong_msg
+
+        context = MagicMock()
+        context.bot.id = 99999
+
+        await delivery_group_handler(wrong_update, context)
+
+        # Confirm 10800 CP remains Pending after wrong chat submission
+        chk_wrong = await get_order_by_id(order.id)
+        pkgs_wrong = json.loads(chk_wrong.package_progress)
+        self.assertEqual(pkgs_wrong[1]["status"], "Pending")
+
+        # Step 3: Deliver 10800 CP from CORRECT loader group chat -> SUCCESS
+        async with AsyncSessionLocal() as session:
+            session.add(Image(order_id=order.id, telegram_file_id="img_10800", file_type="photo"))
+            await session.commit()
+
+        res2 = await deliver_order_by_id(bot=bot, order_id=order.id, loader_chat_id=loader_group_id, loader_reply_msg_id=1720, target_delivery_chat_id=client_chat_id)
+        self.assertTrue(res2)
+
+        ord2 = await get_order_by_id(order.id)
+        self.assertEqual(ord2.status, "Delivered")
+        self.assertEqual(ord2.loader_group_id, loader_group_id)
+        pkgs_final = json.loads(ord2.package_progress)
+        self.assertTrue(all(p["status"] == "Delivered" for p in pkgs_final))
+
+
 if __name__ == "__main__":
     unittest.main()
 

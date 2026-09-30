@@ -3249,9 +3249,12 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
                     pass
 
     # Extra Guard: Verify candidate order belongs to this loader group chat
-    if order.loader_group_id and order.loader_group_id != chat.id:
+    if order.loader_group_id and order.loader_group_id < 0 and order.loader_group_id != chat.id:
         logger.warning(f"[LOADER] Order #{order.id} loader_group_id ({order.loader_group_id}) does not match current chat {chat.id}. Ignored.")
         return
+    if not order.loader_group_id or order.loader_group_id > 0:
+        if chat.id < 0:
+            order.loader_group_id = chat.id
 
     is_media = bool(message.photo or (message.document and (message.document.mime_type or "").startswith("image/")))
     detected_issue = detect_loader_issue(text_content)
@@ -5332,7 +5335,7 @@ async def order_lookup_command_handler(update: Update, context: ContextTypes.DEF
         if user.id in LOADERS_CACHE:
             loader_group = LOADERS_CACHE[user.id].get("group_id")
 
-        is_assigned = (order.loader_group_id == user.id) or (loader_group is not None and order.loader_group_id == loader_group)
+        is_assigned = (loader_group is not None and order.loader_group_id == loader_group)
         if not is_assigned:
             await update.effective_message.reply_text("⛔ You are not authorized to view this order.")
             return

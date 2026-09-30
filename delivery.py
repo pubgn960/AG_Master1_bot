@@ -205,12 +205,17 @@ async def deliver_order_by_id(
             selected_delivery_items = []
 
     # Automated Category B & Package-Level Secret Profit Code Calculation at Delivery Time
-    resolved_loader_id = None
-    if active_ds and active_ds.loader_id:
-        resolved_loader_id = active_ds.loader_id
+    loader_user_id = active_ds.loader_id if active_ds else None
+    target_grp = loader_chat_id or order.loader_group_id
+    db_loader_id = None
 
-    if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
-        target_grp = loader_chat_id or order.loader_group_id
+    if target_grp:
+        for l_id, l_data in LOADERS_CACHE.items():
+            if isinstance(l_data, dict) and (l_data.get("group_id") == target_grp or l_id == target_grp):
+                db_loader_id = l_id
+                break
+
+    if db_loader_id is None and target_grp:
         try:
             from models import Loader
             from database import AsyncSessionLocal, reload_loaders_cache
@@ -220,20 +225,13 @@ async def deliver_order_by_id(
                 stmt_l = select(Loader).where(or_(Loader.group_id == target_grp, Loader.id == target_grp))
                 l_obj = (await session.execute(stmt_l)).scalar_one_or_none()
                 if l_obj:
-                    resolved_loader_id = l_obj.id
+                    db_loader_id = l_obj.id
         except Exception:
             pass
 
-    if resolved_loader_id is None and (loader_chat_id or order.loader_group_id):
-        target_grp = loader_chat_id or order.loader_group_id
-        for l_id, l_data in LOADERS_CACHE.items():
-            if isinstance(l_data, dict) and (l_data.get("group_id") == target_grp or l_id == target_grp):
-                resolved_loader_id = l_id
-                break
-
     # Ensure order pricing and items are saved and updated with resolved loader pricing first
     if order.category == "B" or not order.secret_profit_code:
-        priced_order = await save_order_pricing(order.id, loader_id=resolved_loader_id)
+        priced_order = await save_order_pricing(order.id, loader_id=db_loader_id)
         if priced_order:
             order = priced_order
 
@@ -308,7 +306,7 @@ async def deliver_order_by_id(
     from pricing_calculator import calculate_order_pricing
     session_calc = await calculate_order_pricing(
         order_items_or_text=selected_delivery_items,
-        loader_id=resolved_loader_id,
+        loader_id=db_loader_id,
         client_price_map=order_client_prices
     )
 
