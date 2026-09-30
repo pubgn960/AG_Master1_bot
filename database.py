@@ -2449,6 +2449,21 @@ async def get_all_loader_prices_from_db(loader_id: int) -> List[LoaderPrice]:
         return list(res.scalars().all())
 
 
+async def get_all_loader_prices_with_loaders_from_db() -> List[Tuple[Loader, List[LoaderPrice]]]:
+    """Retrieves all registered loaders and their active LoaderPrice records from DB."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Loader).options(joinedload(Loader.prices)).order_by(Loader.id)
+        res = await session.execute(stmt)
+        loaders = list(res.unique().scalars().all())
+
+        results = []
+        for l in loaders:
+            active_prices = [p for p in (l.prices or []) if p.active is not False]
+            if active_prices:
+                results.append((l, active_prices))
+        return results
+
+
 async def set_loader_price_in_db(
     loader_id: int,
     product_key: str,

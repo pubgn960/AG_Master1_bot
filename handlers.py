@@ -2047,6 +2047,172 @@ async def exportprices_command_handler(update: Update, context: ContextTypes.DEF
         await message.reply_text("❌ Failed to export client price list.")
 
 
+def format_loader_prices_export_txt(loader_tuples: List[Tuple[Any, List[Any]]]) -> str:
+    """
+    Formats DB Loader and LoaderPrice records into clean human-readable text format for export.
+    Groups prices by the actual Telegram Loader Group (group_id).
+    """
+    header = "AG LOADER PRICE LIST\n====================\n"
+    if not loader_tuples:
+        return header + "\n(No loader prices found in database)"
+
+    category_order = ["normal_cp", "special_cp", "bonus_deal", "safe_vault", "full_chain"]
+    category_titles = {
+        "normal_cp": "NORMAL CP",
+        "special_cp": "SPECIAL CP",
+        "bonus_deal": "BONUS DEAL",
+        "safe_vault": "SAFE VAULT",
+        "full_chain": "FULL CHAIN",
+    }
+
+    group_map: Dict[Any, Dict[str, Any]] = {}
+
+    for loader, prices in loader_tuples:
+        gid = getattr(loader, "group_id", None)
+        lname = getattr(loader, "loader_name", "") or ""
+
+        gname = None
+        if gid and gid in LOADERS_CACHE:
+            gname = LOADERS_CACHE[gid].get("name")
+        if not gname and lname and not lname.startswith("Loader #"):
+            gname = lname
+        if not gname:
+            gname = f"Loader Group ID: {gid}" if gid else "Loader Group"
+
+        group_key = gid if gid is not None else lname
+        if group_key not in group_map:
+            group_map[group_key] = {
+                "group_name": gname,
+                "group_id": gid,
+                "loaders": []
+            }
+        group_map[group_key]["loaders"].append({
+            "loader": loader,
+            "prices": prices
+        })
+
+    sorted_groups = sorted(group_map.values(), key=lambda g: str(g["group_name"]).lower())
+
+    group_sections = []
+    for g_info in sorted_groups:
+        gname = g_info["group_name"]
+        loaders_in_grp = g_info["loaders"]
+
+        sec_lines = [
+            f"LOADER GROUP: {gname}",
+            "--------------------------------"
+        ]
+
+        loader_price_maps = []
+        for l_entry in loaders_in_grp:
+            pm = {p.product_key: float(p.cost) for p in l_entry["prices"]}
+            loader_price_maps.append(pm)
+
+        are_identical = len(loader_price_maps) <= 1 or all(pm == loader_price_maps[0] for pm in loader_price_maps[1:])
+
+        if are_identical:
+            all_prices = loaders_in_grp[0]["prices"]
+
+            grouped_cat: Dict[str, List[Any]] = {}
+            for item in all_prices:
+                cat = getattr(item, "package_type", "normal_cp") or "normal_cp"
+                grouped_cat.setdefault(cat, []).append(item)
+
+            all_cats = category_order + [c for c in grouped_cat.keys() if c not in category_order]
+            for cat in all_cats:
+                if cat not in grouped_cat or not grouped_cat[cat]:
+                    continue
+
+                title = category_titles.get(cat, cat.replace("_", " ").upper())
+                sec_lines.append("")
+                sec_lines.append(title)
+                for item in grouped_cat[cat]:
+                    dname = getattr(item, "display_name", "") or getattr(item, "product_key", "")
+                    if cat == "safe_vault" and dname.endswith(" Safe Vault"):
+                        dname = dname.replace(" Safe Vault", "").strip()
+
+                    val = float(getattr(item, "cost", 0.0))
+                    price_str = f"${int(val)}" if val == int(val) else f"${val}"
+                    sec_lines.append(f"{dname} ➜ {price_str}")
+        else:
+            for l_entry in loaders_in_grp:
+                ldr = l_entry["loader"]
+                l_name = getattr(ldr, "loader_name", f"Loader #{ldr.id}")
+                sec_lines.append("")
+                sec_lines.append(f"{l_name}:")
+
+                grouped_cat = {}
+                for item in l_entry["prices"]:
+                    cat = getattr(item, "package_type", "normal_cp") or "normal_cp"
+                    grouped_cat.setdefault(cat, []).append(item)
+
+                all_cats = category_order + [c for c in grouped_cat.keys() if c not in category_order]
+                for cat in all_cats:
+                    if cat not in grouped_cat or not grouped_cat[cat]:
+                        continue
+
+                    title = category_titles.get(cat, cat.replace("_", " ").upper())
+                    sec_lines.append(title)
+                    for item in grouped_cat[cat]:
+                        dname = getattr(item, "display_name", "") or getattr(item, "product_key", "")
+                        if cat == "safe_vault" and dname.endswith(" Safe Vault"):
+                            dname = dname.replace(" Safe Vault", "").strip()
+
+                        val = float(getattr(item, "cost", 0.0))
+                        price_str = f"${int(val)}" if val == int(val) else f"${val}"
+                        sec_lines.append(f"{dname} ➜ {price_str}")
+
+        group_sections.append("\n".join(sec_lines))
+
+    sep = "\n\n--------------------------------\n\n" if len(group_sections) > 1 else "\n\n"
+    return header + "\n" + sep.join(group_sections)
+
+
+async def loaderexportprice_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Admin command /loaderexportprice.
+    Exports ALL saved private loader prices into one clean TXT file,
+    grouped by the actual Telegram LOADER GROUP where those prices belong.
+    Does NOT export client prices.
+    """
+    message = update.effective_message
+    if not message:
+        return
+
+    user = update.effective_user
+    if not user or not (is_super_admin(user.id) or is_admin(user.id)):
+        logger.warning(f"[LOADER_PRICE_EXPORT] Unauthorized /loaderexportprice attempt by user #{user.id if user else 'Unknown'}.")
+        await message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    try:
+        from database import get_all_loader_prices_with_loaders_from_db
+        loader_tuples = await get_all_loader_prices_with_loaders_from_db()
+
+        export_text = format_loader_prices_export_txt(loader_tuples)
+        txt_bytes = export_text.encode("utf-8")
+
+        timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"loader_prices_export_{timestamp_file}.txt"
+
+        file_obj = io.BytesIO(txt_bytes)
+        file_obj.name = filename
+
+        total_price_records = sum(len(prices) for _, prices in loader_tuples) if loader_tuples else 0
+        total_groups = len({l.group_id for l, _ in loader_tuples if getattr(l, "group_id", None)}) if loader_tuples else 0
+
+        await message.reply_document(
+            document=file_obj,
+            filename=filename,
+            caption=f"📄 <b>Loader Price List Export</b>\n\nTotal Loader Groups: {total_groups}\nTotal Price Records: {total_price_records}",
+            parse_mode="HTML"
+        )
+        logger.info(f"[LOADER_PRICE_EXPORT] Admin #{user.id} exported {total_price_records} loader prices across {total_groups} loader groups to {filename}.")
+    except Exception as e:
+        logger.exception(f"[LOADER_PRICE_EXPORT] Failed to export loader prices for admin #{user.id}: {e}")
+        await message.reply_text("❌ Failed to export loader price list.")
+
+
 async def updateprices_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Super Admin command /updateprices [A|B].

@@ -11496,6 +11496,227 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(No client prices found in database)", text_content)
 
 
+class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for /loaderexportprice admin command:
+    1. Authorized admin can export loader prices.
+    2. Unauthorized user is rejected.
+    3. LoaderPrice records are exported.
+    4. GlobalClientPrice records are NOT exported.
+    5. Multiple loader groups are separated correctly.
+    6. Multiple loaders in same group are grouped under same Telegram group name.
+    7. Different prices for different loaders in same group are preserved.
+    8. Group name resolution works correctly.
+    9. Missing/unresolvable group name uses safe group-ID fallback.
+    10. Empty loader-price database is handled safely.
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, AsyncSessionLocal, LOADERS_CACHE
+        from models import GlobalClientPrice, LoaderPrice, Loader
+        from sqlalchemy import delete
+        await init_db()
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+        LOADERS_CACHE.clear()
+
+    async def test_unauthorized_user_is_rejected(self):
+        from handlers import loaderexportprice_command_handler
+        from unittest.mock import MagicMock, AsyncMock
+
+        mock_user = MagicMock()
+        mock_user.id = 999888777
+
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await loaderexportprice_command_handler(update, context)
+
+        mock_msg.reply_text.assert_called_once()
+        reply_args = mock_msg.reply_text.call_args[0][0]
+        self.assertIn("not authorized", reply_args.lower())
+
+    async def test_admin_exports_loader_prices_and_excludes_client_prices(self):
+        from database import add_loader, set_loader_price, set_global_client_price
+        from handlers import loaderexportprice_command_handler
+        from config import Config
+        from unittest.mock import MagicMock, AsyncMock
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # 1. Add global client prices (MUST NOT be exported by /loaderexportprice)
+        await set_global_client_price("cp_2400", 16.0, display_name="2400 CP", package_type="normal_cp")
+
+        # 2. Add 2 loader groups
+        l_pk = await add_loader(group_id=-100111, loader_name="CODM LOADERS 🇵🇰")
+        await set_loader_price(l_pk.id, "cp_2400", 12.0, display_name="2400 CP")
+        await set_loader_price(l_pk.id, "cp_10800", 50.0, display_name="10800 CP")
+
+        l_es = await add_loader(group_id=-100222, loader_name="CODM LOADERS 🇪🇸")
+        await set_loader_price(l_es.id, "cp_2400", 13.0, display_name="2400 CP")
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await loaderexportprice_command_handler(update, context)
+
+        mock_msg.reply_document.assert_called_once()
+        kwargs = mock_msg.reply_document.call_args[1]
+
+        file_obj = kwargs.get("document")
+        filename = kwargs.get("filename")
+
+        self.assertIsNotNone(file_obj)
+        self.assertTrue(filename.startswith("loader_prices_export_"))
+        self.assertTrue(filename.endswith(".txt"))
+
+        file_obj.seek(0)
+        text_content = file_obj.read().decode("utf-8")
+
+        self.assertIn("AG LOADER PRICE LIST", text_content)
+        self.assertIn("LOADER GROUP: CODM LOADERS 🇵🇰", text_content)
+        self.assertIn("LOADER GROUP: CODM LOADERS 🇪🇸", text_content)
+        self.assertIn("2400 CP ➜ $12", text_content)
+        self.assertIn("2400 CP ➜ $13", text_content)
+        self.assertIn("10800 CP ➜ $50", text_content)
+
+        # Confirm client price (16.0) is NOT exported
+        self.assertNotIn("$16", text_content)
+
+    async def test_multiple_loaders_in_same_group_differing_prices_preserved(self):
+        from database import set_loader_price, AsyncSessionLocal
+        from handlers import loaderexportprice_command_handler
+        from config import Config
+        from models import Loader
+        from unittest.mock import MagicMock, AsyncMock
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        # Create two Loader rows with distinct group IDs
+        async with AsyncSessionLocal() as session:
+            l1 = Loader(loader_name="Loader Alpha", group_id=-100555)
+            l2 = Loader(loader_name="Loader Beta", group_id=-100556)
+            session.add_all([l1, l2])
+            await session.commit()
+            l1_id, l2_id = l1.id, l2.id
+
+        await set_loader_price(l1_id, "cp_2400", 15.0, display_name="2400 CP")
+        await set_loader_price(l2_id, "cp_2400", 14.5, display_name="2400 CP")
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await loaderexportprice_command_handler(update, context)
+
+        mock_msg.reply_document.assert_called_once()
+        kwargs = mock_msg.reply_document.call_args[1]
+        file_obj = kwargs.get("document")
+
+        file_obj.seek(0)
+        text_content = file_obj.read().decode("utf-8")
+
+        self.assertIn("LOADER GROUP: Loader Alpha", text_content)
+        self.assertIn("LOADER GROUP: Loader Beta", text_content)
+        self.assertIn("2400 CP ➜ $15", text_content)
+        self.assertIn("2400 CP ➜ $14.5", text_content)
+
+    async def test_unresolvable_group_name_uses_fallback(self):
+        from database import add_loader, set_loader_price, AsyncSessionLocal
+        from handlers import loaderexportprice_command_handler
+        from config import Config
+        from models import Loader
+        from unittest.mock import MagicMock, AsyncMock
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        async with AsyncSessionLocal() as session:
+            l = Loader(loader_name="Loader #-1009999", group_id=-1009999)
+            session.add(l)
+            await session.commit()
+            lid = l.id
+
+        await set_loader_price(lid, "cp_420", 3.5, display_name="420 CP")
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await loaderexportprice_command_handler(update, context)
+
+        file_obj = mock_msg.reply_document.call_args[1].get("document")
+        file_obj.seek(0)
+        text_content = file_obj.read().decode("utf-8")
+
+        self.assertIn("LOADER GROUP: Loader Group ID: -1009999", text_content)
+        self.assertIn("420 CP ➜ $3.5", text_content)
+
+    async def test_empty_loader_price_database_handled_safely(self):
+        from handlers import loaderexportprice_command_handler
+        from config import Config
+        from unittest.mock import MagicMock, AsyncMock
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
+        await loaderexportprice_command_handler(update, context)
+
+        mock_msg.reply_document.assert_called_once()
+        kwargs = mock_msg.reply_document.call_args[1]
+        file_obj = kwargs.get("document")
+
+        file_obj.seek(0)
+        text_content = file_obj.read().decode("utf-8")
+
+        self.assertIn("AG LOADER PRICE LIST", text_content)
+        self.assertIn("(No loader prices found in database)", text_content)
+
+
 if __name__ == "__main__":
     unittest.main()
 

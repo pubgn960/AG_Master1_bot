@@ -89,6 +89,7 @@ from handlers import (
     removedelivery_command,
     resetgroups_command,
     exportprices_command_handler,
+    loaderexportprice_command_handler,
     updateprices_command_handler,
     setclientprice_command_handler,
     setloaderprice_command_handler,
@@ -311,6 +312,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("backup", backup_command))
     application.add_handler(CommandHandler("restore", restore_command))
     application.add_handler(CommandHandler("exportprices", exportprices_command_handler))
+    application.add_handler(CommandHandler("loaderexportprice", loaderexportprice_command_handler))
     application.add_handler(CommandHandler("updateprices", updateprices_command_handler))
     application.add_handler(CommandHandler("setclientprice", setclientprice_command_handler))
     application.add_handler(CommandHandler("setloaderprice", setloaderprice_command_handler))
