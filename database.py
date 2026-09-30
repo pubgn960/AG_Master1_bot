@@ -2015,6 +2015,7 @@ DEFAULT_PACKAGE_PRICES: Dict[str, float] = {
     "10800": 64.0,
     "9600": 55.0,
     "7200": 42.0,
+    "5000": 33.0,
     "5040": 33.0,
     "4800": 29.0,
     "2400": 16.5,
@@ -2250,22 +2251,41 @@ async def get_global_client_price(product_key: str) -> Optional[float]:
     """
     Retrieves the global client price for a specific product_key.
     Prioritizes active custom DB/cache price, then PRODUCT_CATALOG reference_price, otherwise None.
+    Supports candidate key lookups (e.g. cp_5000, 5000, cp_5040, 5040).
     """
-    pkey = product_key.strip().lower()
-    if pkey in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE[pkey].get("active") is not False:
-        cached_val = GLOBAL_CLIENT_PRICES_CACHE[pkey].get("price")
-        if cached_val is not None:
-            return float(cached_val)
+    from order_parser import normalize_package_alias
+    raw_str = str(product_key).strip().lower()
+    num_raw = raw_str[3:] if raw_str.startswith("cp_") else raw_str
+    num_raw = re.sub(r'\s*cp$', '', num_raw).strip()
+    canonical_pkg = normalize_package_alias(num_raw) if num_raw else normalize_package_alias(raw_str)
+
+    candidate_keys = []
+    if canonical_pkg:
+        candidate_keys.append(f"cp_{canonical_pkg}")
+        candidate_keys.append(canonical_pkg)
+    if num_raw and num_raw not in candidate_keys:
+        candidate_keys.append(f"cp_{num_raw}")
+        candidate_keys.append(num_raw)
+    if raw_str not in candidate_keys:
+        candidate_keys.append(raw_str)
+
+    for pkey in candidate_keys:
+        if pkey in GLOBAL_CLIENT_PRICES_CACHE and GLOBAL_CLIENT_PRICES_CACHE[pkey].get("active") is not False:
+            cached_val = GLOBAL_CLIENT_PRICES_CACHE[pkey].get("price")
+            if cached_val is not None:
+                return float(cached_val)
 
     async with AsyncSessionLocal() as session:
-        stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey, GlobalClientPrice.active == True)
-        item = (await session.execute(stmt)).scalar_one_or_none()
-        if item and item.price is not None:
-            return float(item.price)
+        for pkey in candidate_keys:
+            stmt = select(GlobalClientPrice).where(GlobalClientPrice.product_key == pkey, GlobalClientPrice.active == True)
+            item = (await session.execute(stmt)).scalar_one_or_none()
+            if item and item.price is not None:
+                return float(item.price)
 
     from product_catalog import PRODUCT_CATALOG
-    if pkey in PRODUCT_CATALOG and PRODUCT_CATALOG[pkey].get("reference_price") is not None:
-        return float(PRODUCT_CATALOG[pkey]["reference_price"])
+    for pkey in candidate_keys:
+        if pkey in PRODUCT_CATALOG and PRODUCT_CATALOG[pkey].get("reference_price") is not None:
+            return float(PRODUCT_CATALOG[pkey]["reference_price"])
 
     return None
 
@@ -2372,28 +2392,45 @@ async def bulk_set_global_client_prices_in_db(price_map: Dict[str, float]) -> bo
 async def get_loader_price(loader_id: int, product_key: str) -> Optional[Decimal]:
     """
     Retrieves the loader cost price for a specific loader_id and product_key as a Decimal.
-    Checks RAM cache first, falls back to DB query.
+    Checks RAM cache first, falls back to DB query. Supports candidate key lookups.
     Returns Decimal or None if not found.
     """
-    pkey = product_key.strip().lower()
-    if loader_id not in LOADER_PRICES_CACHE or pkey not in LOADER_PRICES_CACHE.get(loader_id, {}):
+    from order_parser import normalize_package_alias
+    raw_str = str(product_key).strip().lower()
+    num_raw = raw_str[3:] if raw_str.startswith("cp_") else raw_str
+    num_raw = re.sub(r'\s*cp$', '', num_raw).strip()
+    canonical_pkg = normalize_package_alias(num_raw) if num_raw else normalize_package_alias(raw_str)
+
+    candidate_keys = []
+    if canonical_pkg:
+        candidate_keys.append(f"cp_{canonical_pkg}")
+        candidate_keys.append(canonical_pkg)
+    if num_raw and num_raw not in candidate_keys:
+        candidate_keys.append(f"cp_{num_raw}")
+        candidate_keys.append(num_raw)
+    if raw_str not in candidate_keys:
+        candidate_keys.append(raw_str)
+
+    if loader_id not in LOADER_PRICES_CACHE:
         await reload_loader_prices_cache(loader_id=loader_id)
 
     loader_cache = LOADER_PRICES_CACHE.get(loader_id, {})
-    if pkey in loader_cache:
-        cost_val = loader_cache[pkey].get("cost")
-        if cost_val is not None:
-            return Decimal(str(cost_val))
+    for pkey in candidate_keys:
+        if pkey in loader_cache:
+            cost_val = loader_cache[pkey].get("cost")
+            if cost_val is not None:
+                return Decimal(str(cost_val))
 
     async with AsyncSessionLocal() as session:
-        stmt = select(LoaderPrice).where(
-            LoaderPrice.loader_id == loader_id,
-            LoaderPrice.product_key == pkey,
-            LoaderPrice.active == True
-        )
-        item = (await session.execute(stmt)).scalar_one_or_none()
-        if item and item.cost is not None:
-            return Decimal(str(item.cost))
+        for pkey in candidate_keys:
+            stmt = select(LoaderPrice).where(
+                LoaderPrice.loader_id == loader_id,
+                LoaderPrice.product_key == pkey,
+                LoaderPrice.active == True
+            )
+            item = (await session.execute(stmt)).scalar_one_or_none()
+            if item and item.cost is not None:
+                return Decimal(str(item.cost))
 
     return None
 

@@ -490,7 +490,7 @@ def get_db_type_name() -> str:
 
 
 SUPPORTED_PACKAGES: Set[str] = {
-    "80", "420", "880", "2400", "4800", "5040", "7200", "9600", "10800",
+    "80", "420", "880", "2400", "4800", "5000", "5040", "7200", "9600", "10800",
     "12000", "14400", "16800", "19200", "21600", "24000", "38400", "43200",
     "48000", "55200", "72000", "96000", "108000"
 }
@@ -512,6 +512,7 @@ PACKAGE_PRICES: Dict[str, float] = {
     "10800": 64.0,
     "9600": 55.0,
     "7200": 42.0,
+    "5000": 33.0,
     "5040": 33.0,
     "4800": 29.0,
     "2400": 16.5,
@@ -619,7 +620,7 @@ def format_export_prices(price_map: Dict[str, float]) -> str:
     Formats prices for export in standard format matching requirements:
     Standard Packs first, blank line, Special Packs and any newly added packages second.
     """
-    standard_order = ["10800", "5040", "2400", "880", "420", "80"]
+    standard_order = ["10800", "5000", "5040", "2400", "880", "420", "80"]
 
     def _fmt_price(val: float) -> str:
         return f"{int(val)}" if val.is_integer() else f"{val:g}"
@@ -1529,10 +1530,11 @@ def format_delivered_packages_caption(items: Any, include_price: bool = True) ->
             has_unpriced = True
 
         qty_str = f" ×{qty}" if qty > 1 else ""
-        if pkg_name.lower().endswith("cp"):
-            lines.append(f"✅ {pkg_name}{qty_str}")
+        display_pkg = canonical_pkg if canonical_pkg else pkg_name
+        if display_pkg.lower().endswith("cp"):
+            lines.append(f"✅ {display_pkg}{qty_str}")
         else:
-            lines.append(f"✅ {pkg_name} CP{qty_str}")
+            lines.append(f"✅ {display_pkg} CP{qty_str}")
 
     if include_price and not has_unpriced and session_price > 0:
         lines.append("")

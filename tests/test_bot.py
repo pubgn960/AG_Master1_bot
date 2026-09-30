@@ -730,7 +730,7 @@ class TestPOCOrderPriceDetection(unittest.TestCase):
         # 1. 10800,5040&2400/880+420 -> Expected 5 packages: 10800, 5040, 2400, 880, 420 = 126.0$ (64+33+16.5+8+4.5)
         p1 = parse_test_order_packages("10800,5040&2400/880+420")
         self.assertIsNotNone(p1)
-        self.assertEqual([item["package"] for item in p1["packages"]], ["10800", "5040", "2400", "880", "420"])
+        self.assertEqual([item["package"] for item in p1["packages"]], ["10800", "5000", "2400", "880", "420"])
         self.assertEqual(p1["total_price"], 126.0)
 
         # 2. 2400,880 -> Expected 2400, 880 = 24.5$ (16.5+8)
@@ -868,7 +868,7 @@ class TestPOCOrderPriceDetection(unittest.TestCase):
         self.assertIsNotNone(p1)
         self.assertFalse(p1.get("has_unknown"))
         self.assertEqual(len(p1["packages"]), 3)
-        self.assertEqual([item["package"] for item in p1["packages"]], ["10800", "5040", "2400"])
+        self.assertEqual([item["package"] for item in p1["packages"]], ["10800", "5000", "2400"])
 
         # 2. Non-order text with numeric credentials (Password 2400abc, Email 2400@gmail.com, UID 108000123)
         cred_msg = (
@@ -981,11 +981,11 @@ class TestMultiPackageDeliveryWorkflow(unittest.TestCase):
 
         card = format_loader_card_summary(restored_items, 97.5)
         self.assertIn("✅ 10800 CP", card)
-        self.assertIn("⬜ 5040 CP", card)
+        self.assertIn("⬜ 5000 CP", card)
 
         kb = build_loader_package_keyboard(99, restored_items)
         self.assertIsNotNone(kb)
-        self.assertEqual(kb.inline_keyboard[0][0].text, "⬜ 5040")
+        self.assertEqual(kb.inline_keyboard[0][0].text, "⬜ 5000")
 
     def test_loader_order_card_redesign_layout(self):
         import json
@@ -1020,7 +1020,7 @@ class TestMultiPackageDeliveryWorkflow(unittest.TestCase):
 
         self.assertIn("📦 PACKAGE STATUS", card_text)
         self.assertIn("⬜ 10800 CP", card_text)
-        self.assertIn("⬜ 5040 CP", card_text)
+        self.assertIn("⬜ 5000 CP", card_text)
         self.assertIn("⬜ 2400 CP", card_text)
         self.assertNotIn("💰 Total Price", card_text)
 
@@ -1086,7 +1086,7 @@ class TestDeliverySessionRouting(unittest.TestCase):
         caption = format_delivered_packages_caption(selected_for_session)
         self.assertIn("📦 Delivered Package(s)", caption)
         self.assertIn("✅ 10800 CP", caption)
-        self.assertIn("✅ 5040 CP", caption)
+        self.assertIn("✅ 5000 CP", caption)
         self.assertIn("💰 Price: 98.5$", caption)
         self.assertNotIn("2400", caption)
 
@@ -1098,7 +1098,7 @@ class TestDeliverySessionRouting(unittest.TestCase):
         # 3. Verify Client card summary displays ✅ for 10800 and 5040, and ☐/⬜ for 2400
         summary = format_package_progress_summary(updated_items, 113.5)
         self.assertIn("✅ 10800 CP", summary)
-        self.assertIn("✅ 5040 CP", summary)
+        self.assertIn("✅ 5000 CP", summary)
         self.assertIn("☐ 2400 CP", summary)
         self.assertNotIn("🎉 All Packages Delivered", summary)
 
@@ -1378,7 +1378,7 @@ class TestDeliverySessionRouting(unittest.TestCase):
         # Example 3: Multiple packages 10800+5040+420
         p3 = parse_test_order_packages("10800+5040+420")
         f3 = format_package_summary_and_price(p3)
-        self.assertEqual(f3, "📦 Package(s):\n• 10800 CP\n• 5040 CP\n• 420 CP\n\n💰 Price: 101.5$")
+        self.assertEqual(f3, "📦 Package(s):\n• 10800 CP\n• 5000 CP\n• 420 CP\n\n💰 Price: 101.5$")
 
         # Example 4: Quantity 2400x2+880 (Expanded)
         p4 = parse_test_order_packages("2400x2+880")
@@ -1638,7 +1638,7 @@ class TestBulkPriceUpdateSystem(unittest.IsolatedAsyncioTestCase):
         from utils import format_export_prices
 
         db_prices = await get_all_package_prices_from_db()
-        self.assertEqual(len(db_prices), 22)
+        self.assertEqual(len(db_prices), 23)
         export_text = format_export_prices(db_prices)
         self.assertIn("10800 64", export_text)
         self.assertIn("2400 16.5", export_text)
@@ -1677,7 +1677,7 @@ class TestBulkPriceUpdateSystem(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(price_map)
         self.assertEqual(len(price_map), 22)
         self.assertEqual(price_map["10800"], 65.0)
-        self.assertEqual(price_map["5040"], 34.0)
+        self.assertEqual(price_map["5000"], 34.0)
         self.assertEqual(price_map["2400"], 17.0)
 
     async def test_validation_errors_and_rollback(self):
@@ -2370,7 +2370,7 @@ class TestMultiPackageSelectionRegression(unittest.TestCase):
         # Delivered packages: 10800 + 5040 -> Price: 64$ + 33$ = 97$
         pkg_names = [it["package"] for it in selected_items]
         pkg_str = "+".join(pkg_names)
-        self.assertEqual(pkg_str, "10800+5040")
+        self.assertEqual(pkg_str, "10800+5000")
 
         total_price, ok = calculate_delivered_packages_value(pkg_str)
         self.assertTrue(ok)
@@ -2560,16 +2560,16 @@ class TestMultilingualDetectorAndPackageAliases(unittest.TestCase):
         parsed = parse_test_order_packages(msg)
         self.assertIsNotNone(parsed)
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["packages"][0]["qty"], 1)
 
     def test_package_aliases_and_multiplication_notation(self):
         from utils import parse_test_order_packages
 
-        # 5k -> 5040
+        # 5k -> 5000
         p5k = parse_test_order_packages("5k")
         self.assertEqual(len(p5k["packages"]), 1)
-        self.assertEqual(p5k["packages"][0]["package"], "5040")
+        self.assertEqual(p5k["packages"][0]["package"], "5000")
 
         # 10k -> 10800
         p10k = parse_test_order_packages("10k")
@@ -2586,25 +2586,25 @@ class TestMultilingualDetectorAndPackageAliases(unittest.TestCase):
         self.assertEqual(len(p_mult1["packages"]), 3)
         self.assertEqual(p_mult1["packages"][0]["package"], "10800")
 
-        # 5040x3 -> Expanded to 3 items
+        # 5040x3 -> Expanded to 3 items of 5000
         p_mult2 = parse_test_order_packages("5040x3")
         self.assertEqual(len(p_mult2["packages"]), 3)
-        self.assertEqual(p_mult2["packages"][0]["package"], "5040")
+        self.assertEqual(p_mult2["packages"][0]["package"], "5000")
 
         # 2400 ×2 -> Expanded to 2 items
         p_mult3 = parse_test_order_packages("2400 ×2")
         self.assertEqual(len(p_mult3["packages"]), 2)
         self.assertEqual(p_mult3["packages"][0]["package"], "2400")
 
-        # 5k*2 -> Expanded to 2 items of 5040
+        # 5k*2 -> Expanded to 2 items of 5000
         p_mult4 = parse_test_order_packages("5k*2")
         self.assertEqual(len(p_mult4["packages"]), 2)
-        self.assertEqual(p_mult4["packages"][0]["package"], "5040")
+        self.assertEqual(p_mult4["packages"][0]["package"], "5000")
 
-        # 5k x2 -> Expanded to 2 items of 5040
+        # 5k x2 -> Expanded to 2 items of 5000
         p_mult5 = parse_test_order_packages("5k x2")
         self.assertEqual(len(p_mult5["packages"]), 2)
-        self.assertEqual(p_mult5["packages"][0]["package"], "5040")
+        self.assertEqual(p_mult5["packages"][0]["package"], "5000")
 
     def test_email_and_package_fallback_rule(self):
         from keywords import contains_order_keyword
@@ -2674,10 +2674,10 @@ class TestPackageMultiplierExpansionEngine(unittest.IsolatedAsyncioTestCase):
         pkgs3 = [it["package"] for it in p3["packages"]]
         self.assertEqual(pkgs3, ["10800", "10800", "10800"])
 
-        # 5k*2 -> 5040, 5040
+        # 5k*2 -> 5000, 5000
         p4 = parse_test_order_packages("5k*2")
         pkgs4 = [it["package"] for it in p4["packages"]]
-        self.assertEqual(pkgs4, ["5040", "5040"])
+        self.assertEqual(pkgs4, ["5000", "5000"])
         self.assertEqual(p4["total_price"], 66.0)
 
         # 10k×4 -> 10800, 10800, 10800, 10800
@@ -2689,7 +2689,7 @@ class TestPackageMultiplierExpansionEngine(unittest.IsolatedAsyncioTestCase):
         # 5040x2
         p6 = parse_test_order_packages("5040x2")
         pkgs6 = [it["package"] for it in p6["packages"]]
-        self.assertEqual(pkgs6, ["5040", "5040"])
+        self.assertEqual(pkgs6, ["5000", "5000"])
 
         # 880*5
         p7 = parse_test_order_packages("880*5")
@@ -2785,7 +2785,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         p = parse_order_v2(sample)
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["email"], "wilveralexanderramos37@gmail.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
 
     def test_sample_4(self):
         from order_parser import parse_order_v2
@@ -2794,7 +2794,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["login_method"], "Activision")
         self.assertEqual(p["email"], "jotapyp@gmail.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
 
     def test_sample_5(self):
         from order_parser import parse_order_v2
@@ -2827,7 +2827,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         p = parse_order_v2(sample)
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["email"], "palmaadalbert.31@gmail.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
 
     def test_sample_9(self):
         from order_parser import parse_order_v2
@@ -2845,7 +2845,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         self.assertEqual(p["login_method"], "Activision")
         self.assertEqual(p["email"], "braudyscalderon@gmail.com")
         pkgs = [item["package"] for item in p["packages"]]
-        self.assertEqual(pkgs, ["5040", "2400"])
+        self.assertEqual(pkgs, ["5000", "2400"])
         self.assertEqual(p["unknown_packages"], [])
 
     def test_sample_11(self):
@@ -2854,7 +2854,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         p = parse_order_v2(sample)
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["email"], "nestor_torrique99@hotmail.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
         self.assertEqual(p["unknown_packages"], [])
 
     def test_sample_12(self):
@@ -2898,7 +2898,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["login_method"], "Facebook")
         self.assertEqual(p["email"], "kennyalexanderpay@gmail.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
         self.assertEqual(len(p["recovery_codes"]), 3)
 
     def test_sample_17(self):
@@ -2915,7 +2915,7 @@ class TestProductionOrderParserV2RealCustomerSamples(unittest.TestCase):
         p = parse_order_v2(sample)
         self.assertTrue(p["order_detected"])
         self.assertEqual(p["email"], "mcallistercastrillon@icloud.com")
-        self.assertEqual(p["packages"][0]["package"], "5040")
+        self.assertEqual(p["packages"][0]["package"], "5000")
 
 
 class TestCanonicalPackageAliasNormalizationFix(unittest.IsolatedAsyncioTestCase):
@@ -2935,19 +2935,33 @@ class TestCanonicalPackageAliasNormalizationFix(unittest.IsolatedAsyncioTestCase
     def test_canonical_alias_resolutions(self):
         from order_parser import normalize_package_alias, parse_order_v2
 
-        self.assertEqual(normalize_package_alias("5k"), "5040")
-        self.assertEqual(normalize_package_alias("5K"), "5040")
-        self.assertEqual(normalize_package_alias("5000"), "5040")
-        self.assertEqual(normalize_package_alias("5040"), "5040")
+        # 5000 CP aliases
+        self.assertEqual(normalize_package_alias("5k"), "5000")
+        self.assertEqual(normalize_package_alias("5K"), "5000")
+        self.assertEqual(normalize_package_alias("5000"), "5000")
+        self.assertEqual(normalize_package_alias("5000 CP"), "5000")
+        self.assertEqual(normalize_package_alias("5040"), "5000")
+        self.assertEqual(normalize_package_alias("5040 CP"), "5000")
+
+        # 10800 CP aliases
+        self.assertEqual(normalize_package_alias("10k"), "10800")
+        self.assertEqual(normalize_package_alias("10K"), "10800")
+        self.assertEqual(normalize_package_alias("10000"), "10800")
+        self.assertEqual(normalize_package_alias("10000 CP"), "10800")
+        self.assertEqual(normalize_package_alias("10.8k"), "10800")
+        self.assertEqual(normalize_package_alias("10.9k"), "10800")
+        self.assertEqual(normalize_package_alias("10800"), "10800")
+        self.assertEqual(normalize_package_alias("10900"), "10800")
+        self.assertEqual(normalize_package_alias("10900 CP"), "10800")
 
         # 5k, 5000, 5040 price equality
         p_5k = parse_order_v2("Email: a@g.com\n5k")
         p_5000 = parse_order_v2("Email: a@g.com\n5000")
         p_5040 = parse_order_v2("Email: a@g.com\n5040")
 
-        self.assertEqual(p_5k["packages"][0]["package"], "5040")
-        self.assertEqual(p_5000["packages"][0]["package"], "5040")
-        self.assertEqual(p_5040["packages"][0]["package"], "5040")
+        self.assertEqual(p_5k["packages"][0]["package"], "5000")
+        self.assertEqual(p_5000["packages"][0]["package"], "5000")
+        self.assertEqual(p_5040["packages"][0]["package"], "5000")
 
         self.assertEqual(p_5k["packages"][0]["unit_price"], 33.0)
         self.assertEqual(p_5000["packages"][0]["unit_price"], 33.0)
@@ -2956,46 +2970,53 @@ class TestCanonicalPackageAliasNormalizationFix(unittest.IsolatedAsyncioTestCase
     def test_multi_package_canonical_normalization(self):
         from utils import parse_test_order_packages
 
-        # 5000+2400 -> 5040 + 2400
+        # 5000+2400 -> 5000 + 2400
         p1 = parse_test_order_packages("5000+2400")
         pkgs1 = [it["package"] for it in p1["packages"]]
-        self.assertEqual(pkgs1, ["5040", "2400"])
+        self.assertEqual(pkgs1, ["5000", "2400"])
         self.assertFalse(p1["has_unknown"])
         self.assertEqual(p1["total_price"], 49.5)
 
-        # 5k+2400 -> 5040 + 2400
+        # 5k+2400 -> 5000 + 2400
         p2 = parse_test_order_packages("5k+2400")
         pkgs2 = [it["package"] for it in p2["packages"]]
-        self.assertEqual(pkgs2, ["5040", "2400"])
+        self.assertEqual(pkgs2, ["5000", "2400"])
         self.assertFalse(p2["has_unknown"])
         self.assertEqual(p2["total_price"], 49.5)
 
-        # 5040+2400 -> 5040 + 2400
+        # 5040+2400 -> 5000 + 2400
         p3 = parse_test_order_packages("5040+2400")
         pkgs3 = [it["package"] for it in p3["packages"]]
-        self.assertEqual(pkgs3, ["5040", "2400"])
+        self.assertEqual(pkgs3, ["5000", "2400"])
         self.assertFalse(p3["has_unknown"])
         self.assertEqual(p3["total_price"], 49.5)
+
+        # 10900+2400 -> 10800 + 2400
+        p4 = parse_test_order_packages("10900+2400")
+        pkgs4 = [it["package"] for it in p4["packages"]]
+        self.assertEqual(pkgs4, ["10800", "2400"])
+        self.assertFalse(p4["has_unknown"])
+        self.assertEqual(p4["total_price"], 80.5)
 
     def test_multiplier_canonical_normalization(self):
         from utils import parse_test_order_packages
 
-        # 5000*2 -> 5040, 5040
+        # 5000*2 -> 5000, 5000
         p1 = parse_test_order_packages("5000*2")
         pkgs1 = [it["package"] for it in p1["packages"]]
-        self.assertEqual(pkgs1, ["5040", "5040"])
+        self.assertEqual(pkgs1, ["5000", "5000"])
         self.assertEqual(p1["total_price"], 66.0)
 
-        # 5k*2 -> 5040, 5040
+        # 5k*2 -> 5000, 5000
         p2 = parse_test_order_packages("5k*2")
         pkgs2 = [it["package"] for it in p2["packages"]]
-        self.assertEqual(pkgs2, ["5040", "5040"])
+        self.assertEqual(pkgs2, ["5000", "5000"])
         self.assertEqual(p2["total_price"], 66.0)
 
-        # 5040*2 -> 5040, 5040
+        # 5040*2 -> 5000, 5000
         p3 = parse_test_order_packages("5040*2")
         pkgs3 = [it["package"] for it in p3["packages"]]
-        self.assertEqual(pkgs3, ["5040", "5040"])
+        self.assertEqual(pkgs3, ["5000", "5000"])
         self.assertEqual(p3["total_price"], 66.0)
 
     async def test_loader_display_ledger_and_running_total_canonical_prices(self):
@@ -3005,18 +3026,18 @@ class TestCanonicalPackageAliasNormalizationFix(unittest.IsolatedAsyncioTestCase
         parsed = parse_test_order_packages("5000+2400")
         items = parsed["packages"]
 
-        # Loader UI receives canonical packages (☐ 5040 CP / ⬜ 5040)
+        # Loader UI receives canonical packages (☐ 5000 CP / ⬜ 5000)
         kb = build_loader_package_keyboard(101, items)
         self.assertIsNotNone(kb)
         btn_texts = [btn.text for row in kb.inline_keyboard for btn in row]
-        self.assertIn("5040", btn_texts[0])
+        self.assertIn("5000", btn_texts[0])
 
         # Partial delivery & Ledger
         updated, is_completed, del_cnt = mark_selected_packages_delivered(items, loader_id=5, selected_items=[items[0]])
         self.assertEqual(del_cnt, 1)
 
         pkg_str = items[0]["package"]
-        self.assertEqual(pkg_str, "5040")
+        self.assertEqual(pkg_str, "5000")
 
         val, ok = calculate_delivered_packages_value(pkg_str)
         self.assertTrue(ok)
@@ -4123,7 +4144,7 @@ class TestFacebookRecoveryCodeParserExclusion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed["login_method"], "Facebook")
         self.assertEqual(parsed["recovery_codes"], ["1430 8078", "1982 9264", "2347 4217"])
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["unknown_packages"], [])
 
         pkg_names = [p["package"] for p in parsed["packages"]]
@@ -4149,7 +4170,7 @@ class TestFacebookRecoveryCodeParserExclusion(unittest.IsolatedAsyncioTestCase):
         parsed = parse_order_v2(sample_fb2)
 
         self.assertTrue(parsed["order_detected"])
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["unknown_packages"], [])
         self.assertEqual(parsed["recovery_codes"], ["2534 6603", "3075 1980", "3568 0949"])
 
@@ -4168,7 +4189,7 @@ class TestFacebookRecoveryCodeParserExclusion(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(parsed["order_detected"])
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         pkg_names = [p["package"] for p in parsed["packages"]]
         self.assertNotIn("529619465770", pkg_names)
         self.assertNotIn("54", pkg_names)
@@ -4703,7 +4724,7 @@ class TestCategoryAOrderDetectionRestoration(unittest.TestCase):
         parsed = parse_order_v2(text, category="A")
         self.assertTrue(parsed["order_detected"])
         self.assertEqual(parsed["email"], "john.doe@gmail.com")
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(extract_customer_ref_id(text), "500")
 
     def test_category_a_order_with_extra_blank_lines(self):
@@ -4767,7 +4788,7 @@ class TestCategoryAOrderDetectionRestoration(unittest.TestCase):
         self.assertEqual(extract_customer_ref_id(text), "280")
         self.assertEqual(parsed["recovery_codes"], ["0674 5886", "0796 5268", "1726 2601"])
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["unknown_packages"], [])
 
 
@@ -4869,7 +4890,7 @@ class TestOrderParserV2(unittest.TestCase):
         self.assertEqual(parsed["username"], "Maracay..")
         self.assertEqual(parsed["password"], "23793556")
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["unknown_packages"], [])
 
     def test_facebook_header_ref_id(self):
@@ -4889,7 +4910,7 @@ class TestOrderParserV2(unittest.TestCase):
         self.assertEqual(parsed["customer_ref_id"], "100")
         self.assertEqual(parsed["password"], "718569324")
         self.assertEqual(len(parsed["packages"]), 1)
-        self.assertEqual(parsed["packages"][0]["package"], "5040")
+        self.assertEqual(parsed["packages"][0]["package"], "5000")
         self.assertEqual(parsed["unknown_packages"], [])
 
 
@@ -10193,7 +10214,7 @@ class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["email"], "victormanuel09876t@gmail.com")
         self.assertEqual(res["password"], "Vicman28.")
         self.assertEqual(res["username"], "Rcvictor")
-        self.assertEqual(res["packages"][0]["package"], "5040")
+        self.assertEqual(res["packages"][0]["package"], "5000")
 
     def test_pattern_e_253_unlabelled_order(self):
         from order_parser import parse_order_v2
@@ -10211,7 +10232,7 @@ class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res["order_detected"])
         self.assertEqual(res["customer_ref_id"].strip("#"), "253")
         self.assertEqual(res["phone"], "+573053657865")
-        self.assertEqual(res["packages"][0]["package"], "5040")
+        self.assertEqual(res["packages"][0]["package"], "5000")
         self.assertTrue(res["username"] == "Andre" or len(res["unclassified_data"]) > 0)
 
     def test_pattern_f_254_spanish_labels(self):
@@ -10228,7 +10249,7 @@ class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["username"], "a")
         self.assertEqual(res["email"], "angeloveliz0505@gmail.com")
         self.assertEqual(res["password"], "angelo2020")
-        self.assertEqual(res["packages"][0]["package"], "5040")
+        self.assertEqual(res["packages"][0]["package"], "5000")
 
     def test_pattern_g_277_unlabelled_email(self):
         from order_parser import parse_order_v2
@@ -10277,7 +10298,7 @@ class TestRealCustomerOrderPatternsAndParser(unittest.IsolatedAsyncioTestCase):
         )
         res = parse_order_v2(raw)
         self.assertTrue(res["order_detected"])
-        self.assertEqual(res["packages"][0]["package"], "5040")
+        self.assertEqual(res["packages"][0]["package"], "5000")
 
     def test_pattern_j_250_special_characters(self):
         from order_parser import parse_order_v2

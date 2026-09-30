@@ -15,10 +15,35 @@ logger = logging.getLogger(__name__)
 
 # Default Alias Mapping (Configurable)
 DEFAULT_PACKAGE_ALIASES: Dict[str, str] = {
+    "10k": "10800",
+    "10000": "10800",
+    "10000cp": "10800",
+    "10000 cp": "10800",
     "10.8k": "10800",
     "10,8k": "10800",
+    "10.9k": "10800",
+    "10,9k": "10800",
+    "10800": "10800",
+    "10800cp": "10800",
+    "10800 cp": "10800",
+    "10900": "10800",
+    "10900cp": "10800",
+    "10900 cp": "10800",
     "10.800": "10800",
     "10,800": "10800",
+    "10.900": "10800",
+    "10,900": "10800",
+    "5k": "5000",
+    "5000": "5000",
+    "5000cp": "5000",
+    "5000 cp": "5000",
+    "5040": "5000",
+    "5040cp": "5000",
+    "5040 cp": "5000",
+    "5.04k": "5000",
+    "5,04k": "5000",
+    "5.0k": "5000",
+    "5,0k": "5000",
     "7.4k": "7400",
     "7,4k": "7400",
     "7.400": "7400",
@@ -41,14 +66,6 @@ DEFAULT_PACKAGE_ALIASES: Dict[str, str] = {
     "24k": "24000",
     "24,000": "24000",
     "24.000": "24000",
-    "5.04k": "5040",
-    "5,04k": "5040",
-    "5040": "5040",
-    "5000": "5040",
-    "5k": "5040",
-    "5,0k": "5040",
-    "5.0k": "5040",
-    "10k": "10800",
     "20k": "19200",
 }
 
@@ -121,7 +138,7 @@ def get_dynamic_package_prices(category: str = "A") -> Dict[str, float]:
         "48000": 254.0, "43200": 229.0, "38400": 211.0, "31200": 179.0, "24000": 132.0,
         "21600": 119.0, "19200": 109.0, "16800": 95.0, "14400": 82.0,
         "12000": 69.0, "10800": 64.0, "9600": 55.0, "7400": 43.0, "7200": 42.0,
-        "5040": 33.0, "4800": 29.0, "2400": 16.5, "880": 8.0,
+        "5000": 33.0, "5040": 33.0, "4800": 29.0, "2400": 16.5, "880": 8.0,
         "420": 4.5, "80": 1.0
     }
     try:
@@ -141,18 +158,26 @@ def get_dynamic_package_prices(category: str = "A") -> Dict[str, float]:
 
 
 def normalize_package_alias(pkg_name: Optional[str], alias_map: Optional[Dict[str, str]] = None) -> str:
-    """Normalizes package alias to canonical package string."""
+    """Normalizes package alias to canonical package string (e.g. '5000', '10800')."""
     if not pkg_name:
         return ""
     pkg_str = str(pkg_name).strip()
 
-    # Strip dots/commas from thousands formatted numbers (e.g. 12.000 -> 12000, 4.800 -> 4800)
+    # Strip cp_ / CP_ prefix if present
+    if pkg_str.lower().startswith("cp_"):
+        pkg_str = pkg_str[3:].strip()
+
+    # Strip trailing cp / CP
+    pkg_str = re.sub(r'\s*cp\.?\b', '', pkg_str, flags=re.IGNORECASE).strip()
+
+    # Strip dots/commas from thousands formatted numbers (e.g. 12.000 -> 12000, 4.800 -> 4800, 10.800 -> 10800, 10.900 -> 10900)
     if re.match(r'^\d{1,3}[.,]\d{3}$', pkg_str):
         pkg_str = re.sub(r'[.,]', '', pkg_str)
 
     aliases = dict(DEFAULT_PACKAGE_ALIASES)
     if alias_map:
-        aliases.update(alias_map)
+        for k, v in alias_map.items():
+            aliases[str(k).lower()] = str(v)
 
     pkg_clean = pkg_str.lower()
     return aliases.get(pkg_clean, pkg_str)
