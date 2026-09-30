@@ -11433,27 +11433,24 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
 
         context = MagicMock()
 
+        mock_user = MagicMock()
+        mock_user.id = admin_id
+
+        mock_msg = MagicMock()
+        mock_msg.reply_text = AsyncMock()
+        mock_msg.reply_document = AsyncMock()
+
+        update = MagicMock()
+        update.effective_user = mock_user
+        update.effective_message = mock_msg
+
+        context = MagicMock()
+
         await exportprices_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        mock_msg.reply_document.assert_called_once()
-        kwargs = mock_msg.reply_document.call_args[1]
-
-        file_obj = kwargs.get("document")
-        filename = kwargs.get("filename")
-        caption = kwargs.get("caption", "")
-
-        self.assertIsNotNone(file_obj)
-        self.assertTrue(filename.startswith("client_prices_export_"))
-        self.assertTrue(filename.endswith(".txt"))
-
-        self.assertIn("✅ Client Price List Exported", caption)
-        self.assertIn("📦 Total Prices: 4", caption)
-        self.assertIn("📄 Format: TXT", caption)
-        self.assertIn("🔒 Client prices only", caption)
-
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("AG CLIENT PRICE LIST", text_content)
         self.assertIn("NORMAL CP", text_content)
@@ -11491,19 +11488,9 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
 
         await exportprices_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        mock_msg.reply_document.assert_called_once()
-        kwargs = mock_msg.reply_document.call_args[1]
-        file_obj = kwargs.get("document")
-        filename = kwargs.get("filename")
-        caption = kwargs.get("caption", "")
-
-        self.assertTrue(filename.endswith(".txt"))
-        self.assertIn("✅ Client Price List Exported", caption)
-        self.assertIn("📦 Total Prices: 0", caption)
-
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("AG CLIENT PRICE LIST", text_content)
         self.assertIn("(No client prices found in database)", text_content)
@@ -11592,26 +11579,9 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        mock_msg.reply_document.assert_called_once()
-        kwargs = mock_msg.reply_document.call_args[1]
-
-        file_obj = kwargs.get("document")
-        filename = kwargs.get("filename")
-        caption = kwargs.get("caption", "")
-
-        self.assertIsNotNone(file_obj)
-        self.assertTrue(filename.startswith("loader_prices_export_"))
-        self.assertTrue(filename.endswith(".txt"))
-
-        self.assertIn("✅ Loader Price List Exported", caption)
-        self.assertIn("👥 Loader Groups: 2", caption)
-        self.assertIn("📦 Total Price Records: 3", caption)
-        self.assertIn("📄 Format: TXT", caption)
-        self.assertIn("🔒 Private loader prices", caption)
-
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("AG LOADER PRICE LIST", text_content)
         self.assertIn("LOADER GROUP: CODM LOADERS 🇵🇰", text_content)
@@ -11658,13 +11628,9 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        mock_msg.reply_document.assert_called_once()
-        kwargs = mock_msg.reply_document.call_args[1]
-        file_obj = kwargs.get("document")
-
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("LOADER GROUP: Loader Alpha", text_content)
         self.assertIn("LOADER GROUP: Loader Beta", text_content)
@@ -11703,10 +11669,9 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        file_obj = mock_msg.reply_document.call_args[1].get("document")
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("LOADER GROUP: Loader Group ID: -1009999", text_content)
         self.assertIn("420 CP ➜ $3.5", text_content)
@@ -11733,21 +11698,35 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_not_called()
-        mock_msg.reply_document.assert_called_once()
-        kwargs = mock_msg.reply_document.call_args[1]
-        file_obj = kwargs.get("document")
-        caption = kwargs.get("caption", "")
-
-        self.assertIn("✅ Loader Price List Exported", caption)
-        self.assertIn("👥 Loader Groups: 0", caption)
-        self.assertIn("📦 Total Price Records: 0", caption)
-
-        file_obj.seek(0)
-        text_content = file_obj.read().decode("utf-8")
+        mock_msg.reply_document.assert_not_called()
+        mock_msg.reply_text.assert_called_once()
+        text_content = mock_msg.reply_text.call_args[0][0]
 
         self.assertIn("AG LOADER PRICE LIST", text_content)
         self.assertIn("(No loader prices found in database)", text_content)
+
+    def test_text_splitting_utility_safely_splits_without_breaking_lines(self):
+        from handlers import split_text_into_telegram_chunks
+
+        # Short text fits in 1 chunk
+        short_text = "Line 1\nLine 2\nLine 3"
+        chunks = split_text_into_telegram_chunks(short_text, max_chars=100)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0], short_text)
+
+        # Long text with line breaks
+        lines = [f"{i}0800 CP ➜ $65.5" for i in range(200)]
+        long_text = "AG CLIENT PRICE LIST\n" + "\n".join(lines)
+        chunks = split_text_into_telegram_chunks(long_text, max_chars=500)
+        self.assertTrue(len(chunks) > 1)
+
+        # Check each chunk length <= 500
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 500)
+
+        # Re-assembled lines match original lines exactly without line corruption
+        reassembled = "\n".join(chunks)
+        self.assertEqual(reassembled, long_text)
 
 
 class TestTelegramCommandMenuRegistration(unittest.IsolatedAsyncioTestCase):

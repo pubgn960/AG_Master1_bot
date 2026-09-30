@@ -2005,11 +2005,43 @@ def format_client_prices_export_txt(db_prices: List[Any]) -> str:
     return header + "\n" + "\n\n".join(sections)
 
 
+def split_text_into_telegram_chunks(text: str, max_chars: int = 4000) -> List[str]:
+    """
+    Splits plain text into Telegram-compliant chunks without breaking individual lines.
+    Splits strictly at newline (\n) boundaries.
+    If len(text) <= max_chars, returns [text].
+    """
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    lines = text.split("\n")
+    chunks: List[str] = []
+    current_chunk: List[str] = []
+    current_len = 0
+
+    for line in lines:
+        line_len = len(line) + 1  # include newline char
+        if current_len + line_len > max_chars and current_chunk:
+            chunks.append("\n".join(current_chunk))
+            current_chunk = []
+            current_len = 0
+
+        current_chunk.append(line)
+        current_len += line_len
+
+    if current_chunk:
+        chunks.append("\n".join(current_chunk))
+
+    return chunks
+
+
 async def exportprices_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Admin command /exportprices.
-    Exports the CURRENT saved client price list from the database as a clean text file (.txt).
-    Does NOT export private loader costs.
+    Exports the CURRENT saved client price list directly into the Telegram chat as text message(s).
+    Does NOT export private loader costs or send file attachments.
     """
     message = update.effective_message
     if not message:
@@ -2026,27 +2058,13 @@ async def exportprices_command_handler(update: Update, context: ContextTypes.DEF
         db_prices = await get_all_global_client_prices_from_db()
 
         export_text = format_client_prices_export_txt(db_prices)
-        txt_bytes = export_text.encode("utf-8")
+        chunks = split_text_into_telegram_chunks(export_text, max_chars=4000)
 
-        timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"client_prices_export_{timestamp_file}.txt"
-
-        file_obj = io.BytesIO(txt_bytes)
-        file_obj.name = filename
+        for chunk in chunks:
+            await message.reply_text(chunk)
 
         count = len(db_prices) if db_prices else 0
-        caption_text = (
-            "✅ Client Price List Exported\n\n"
-            f"📦 Total Prices: {count}\n"
-            "📄 Format: TXT\n"
-            "🔒 Client prices only"
-        )
-        await message.reply_document(
-            document=file_obj,
-            filename=filename,
-            caption=caption_text
-        )
-        logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {count} client prices to {filename}.")
+        logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {count} client prices across {len(chunks)} text message(s).")
     except Exception as e:
         logger.exception(f"[PRICE_EXPORT] Failed to export client prices for admin #{user.id}: {e}")
         await message.reply_text("❌ Failed to export client price list.")
@@ -2176,9 +2194,9 @@ def format_loader_prices_export_txt(loader_tuples: List[Tuple[Any, List[Any]]]) 
 async def loaderexportprice_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Admin command /loaderexportprice.
-    Exports ALL saved private loader prices into one clean TXT file,
+    Exports ALL saved private loader prices directly into the Telegram chat as text message(s),
     grouped by the actual Telegram LOADER GROUP where those prices belong.
-    Does NOT export client prices.
+    Does NOT export client prices or send file attachments.
     """
     message = update.effective_message
     if not message:
@@ -2195,31 +2213,15 @@ async def loaderexportprice_command_handler(update: Update, context: ContextType
         loader_tuples = await get_all_loader_prices_with_loaders_from_db()
 
         export_text = format_loader_prices_export_txt(loader_tuples)
-        txt_bytes = export_text.encode("utf-8")
+        chunks = split_text_into_telegram_chunks(export_text, max_chars=4000)
 
-        timestamp_file = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        filename = f"loader_prices_export_{timestamp_file}.txt"
-
-        file_obj = io.BytesIO(txt_bytes)
-        file_obj.name = filename
+        for chunk in chunks:
+            await message.reply_text(chunk)
 
         total_price_records = sum(len(prices) for _, prices in loader_tuples) if loader_tuples else 0
-        group_keys = {getattr(l, "group_id", None) if getattr(l, "group_id", None) is not None else getattr(l, "loader_name", "") for l, prices in loader_tuples if prices} if loader_tuples else set()
-        total_groups = len(group_keys)
+        total_groups = len({getattr(l, "group_id", None) if getattr(l, "group_id", None) is not None else getattr(l, "loader_name", "") for l, prices in loader_tuples if prices}) if loader_tuples else 0
 
-        caption_text = (
-            "✅ Loader Price List Exported\n\n"
-            f"👥 Loader Groups: {total_groups}\n"
-            f"📦 Total Price Records: {total_price_records}\n"
-            "📄 Format: TXT\n"
-            "🔒 Private loader prices"
-        )
-        await message.reply_document(
-            document=file_obj,
-            filename=filename,
-            caption=caption_text
-        )
-        logger.info(f"[LOADER_PRICE_EXPORT] Admin #{user.id} exported {total_price_records} loader prices across {total_groups} loader groups to {filename}.")
+        logger.info(f"[LOADER_PRICE_EXPORT] Admin #{user.id} exported {total_price_records} loader prices across {total_groups} loader groups in {len(chunks)} text message(s).")
     except Exception as e:
         logger.exception(f"[LOADER_PRICE_EXPORT] Failed to export loader prices for admin #{user.id}: {e}")
         await message.reply_text("❌ Failed to export loader price list.")
