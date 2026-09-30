@@ -2035,18 +2035,16 @@ async def exportprices_command_handler(update: Update, context: ContextTypes.DEF
         file_obj.name = filename
 
         count = len(db_prices) if db_prices else 0
-        summary_msg = (
+        caption_text = (
             "✅ Client Price List Exported\n\n"
             f"📦 Total Prices: {count}\n"
             "📄 Format: TXT\n"
             "🔒 Client prices only"
         )
-        await message.reply_text(summary_msg)
         await message.reply_document(
             document=file_obj,
             filename=filename,
-            caption=f"📄 <b>Client Price List Export</b>\n\nTotal Products: {count}",
-            parse_mode="HTML"
+            caption=caption_text
         )
         logger.info(f"[PRICE_EXPORT] Admin #{user.id} exported {count} client prices to {filename}.")
     except Exception as e:
@@ -2209,19 +2207,17 @@ async def loaderexportprice_command_handler(update: Update, context: ContextType
         group_keys = {getattr(l, "group_id", None) if getattr(l, "group_id", None) is not None else getattr(l, "loader_name", "") for l, prices in loader_tuples if prices} if loader_tuples else set()
         total_groups = len(group_keys)
 
-        summary_msg = (
+        caption_text = (
             "✅ Loader Price List Exported\n\n"
             f"👥 Loader Groups: {total_groups}\n"
             f"📦 Total Price Records: {total_price_records}\n"
             "📄 Format: TXT\n"
             "🔒 Private loader prices"
         )
-        await message.reply_text(summary_msg)
         await message.reply_document(
             document=file_obj,
             filename=filename,
-            caption=f"📄 <b>Loader Price List Export</b>\n\nTotal Loader Groups: {total_groups}\nTotal Price Records: {total_price_records}",
-            parse_mode="HTML"
+            caption=caption_text
         )
         logger.info(f"[LOADER_PRICE_EXPORT] Admin #{user.id} exported {total_price_records} loader prices across {total_groups} loader groups to {filename}.")
     except Exception as e:

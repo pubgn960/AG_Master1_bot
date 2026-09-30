@@ -11435,22 +11435,22 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
 
         await exportprices_command_handler(update, context)
 
-        mock_msg.reply_text.assert_called_once()
-        summary_text = mock_msg.reply_text.call_args[0][0]
-        self.assertIn("✅ Client Price List Exported", summary_text)
-        self.assertIn("📦 Total Prices: 4", summary_text)
-        self.assertIn("📄 Format: TXT", summary_text)
-        self.assertIn("🔒 Client prices only", summary_text)
-
+        mock_msg.reply_text.assert_not_called()
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
 
         file_obj = kwargs.get("document")
         filename = kwargs.get("filename")
+        caption = kwargs.get("caption", "")
 
         self.assertIsNotNone(file_obj)
         self.assertTrue(filename.startswith("client_prices_export_"))
         self.assertTrue(filename.endswith(".txt"))
+
+        self.assertIn("✅ Client Price List Exported", caption)
+        self.assertIn("📦 Total Prices: 4", caption)
+        self.assertIn("📄 Format: TXT", caption)
+        self.assertIn("🔒 Client prices only", caption)
 
         file_obj.seek(0)
         text_content = file_obj.read().decode("utf-8")
@@ -11491,17 +11491,16 @@ class TestExportPricesCommand(unittest.IsolatedAsyncioTestCase):
 
         await exportprices_command_handler(update, context)
 
-        mock_msg.reply_text.assert_called_once()
-        summary_text = mock_msg.reply_text.call_args[0][0]
-        self.assertIn("✅ Client Price List Exported", summary_text)
-        self.assertIn("📦 Total Prices: 0", summary_text)
-
+        mock_msg.reply_text.assert_not_called()
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
         file_obj = kwargs.get("document")
         filename = kwargs.get("filename")
+        caption = kwargs.get("caption", "")
 
         self.assertTrue(filename.endswith(".txt"))
+        self.assertIn("✅ Client Price List Exported", caption)
+        self.assertIn("📦 Total Prices: 0", caption)
 
         file_obj.seek(0)
         text_content = file_obj.read().decode("utf-8")
@@ -11593,23 +11592,23 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_called_once()
-        summary_text = mock_msg.reply_text.call_args[0][0]
-        self.assertIn("✅ Loader Price List Exported", summary_text)
-        self.assertIn("👥 Loader Groups: 2", summary_text)
-        self.assertIn("📦 Total Price Records: 3", summary_text)
-        self.assertIn("📄 Format: TXT", summary_text)
-        self.assertIn("🔒 Private loader prices", summary_text)
-
+        mock_msg.reply_text.assert_not_called()
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
 
         file_obj = kwargs.get("document")
         filename = kwargs.get("filename")
+        caption = kwargs.get("caption", "")
 
         self.assertIsNotNone(file_obj)
         self.assertTrue(filename.startswith("loader_prices_export_"))
         self.assertTrue(filename.endswith(".txt"))
+
+        self.assertIn("✅ Loader Price List Exported", caption)
+        self.assertIn("👥 Loader Groups: 2", caption)
+        self.assertIn("📦 Total Price Records: 3", caption)
+        self.assertIn("📄 Format: TXT", caption)
+        self.assertIn("🔒 Private loader prices", caption)
 
         file_obj.seek(0)
         text_content = file_obj.read().decode("utf-8")
@@ -11659,6 +11658,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
+        mock_msg.reply_text.assert_not_called()
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
         file_obj = kwargs.get("document")
@@ -11703,6 +11703,7 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
+        mock_msg.reply_text.assert_not_called()
         file_obj = mock_msg.reply_document.call_args[1].get("document")
         file_obj.seek(0)
         text_content = file_obj.read().decode("utf-8")
@@ -11732,15 +11733,15 @@ class TestLoaderExportPriceCommand(unittest.IsolatedAsyncioTestCase):
 
         await loaderexportprice_command_handler(update, context)
 
-        mock_msg.reply_text.assert_called_once()
-        summary_text = mock_msg.reply_text.call_args[0][0]
-        self.assertIn("✅ Loader Price List Exported", summary_text)
-        self.assertIn("👥 Loader Groups: 0", summary_text)
-        self.assertIn("📦 Total Price Records: 0", summary_text)
-
+        mock_msg.reply_text.assert_not_called()
         mock_msg.reply_document.assert_called_once()
         kwargs = mock_msg.reply_document.call_args[1]
         file_obj = kwargs.get("document")
+        caption = kwargs.get("caption", "")
+
+        self.assertIn("✅ Loader Price List Exported", caption)
+        self.assertIn("👥 Loader Groups: 0", caption)
+        self.assertIn("📦 Total Price Records: 0", caption)
 
         file_obj.seek(0)
         text_content = file_obj.read().decode("utf-8")
