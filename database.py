@@ -2479,9 +2479,12 @@ async def update_loader_prices(
 
 
 async def get_all_loader_prices_from_db(loader_id: int) -> List[LoaderPrice]:
-    """Retrieves all LoaderPrice records for a specific loader_id."""
+    """Retrieves all active LoaderPrice records for a specific loader_id."""
     async with AsyncSessionLocal() as session:
-        stmt = select(LoaderPrice).where(LoaderPrice.loader_id == loader_id).order_by(LoaderPrice.product_key)
+        stmt = select(LoaderPrice).where(
+            LoaderPrice.loader_id == loader_id,
+            LoaderPrice.active == True
+        ).order_by(LoaderPrice.product_key)
         res = await session.execute(stmt)
         return list(res.scalars().all())
 
@@ -2495,7 +2498,7 @@ async def get_all_loader_prices_with_loaders_from_db() -> List[Tuple[Loader, Lis
 
         results = []
         for l in loaders:
-            active_prices = [p for p in (l.prices or []) if p.active is not False]
+            active_prices = [p for p in (l.prices or []) if p.active is True]
             if active_prices:
                 results.append((l, active_prices))
         return results
@@ -2547,11 +2550,30 @@ async def set_loader_price_in_db(
 
 
 async def bulk_set_loader_prices_in_db(loader_id: int, cost_map: Dict[str, float]) -> bool:
-    """Bulk upserts multiple loader prices for a specific loader_id."""
+    """
+    Bulk updates loader prices for a specific loader_id so the submitted list becomes
+    the COMPLETE active price list for that loader.
+    Deactivates any previous price records belonging to loader_id that are NOT in cost_map.
+    Does NOT affect any other loader's price records.
+    """
     from product_catalog import PRODUCT_CATALOG
     async with AsyncSessionLocal() as session:
         try:
             now = datetime.now(timezone.utc)
+            new_pkeys = {k.strip().lower() for k in cost_map.keys()}
+
+            # Deactivate old price records belonging ONLY to loader_id that are NOT in new_pkeys
+            stmt_old = select(LoaderPrice).where(
+                LoaderPrice.loader_id == loader_id,
+                LoaderPrice.active == True
+            )
+            existing_all = (await session.execute(stmt_old)).scalars().all()
+            for old_item in existing_all:
+                if old_item.product_key not in new_pkeys:
+                    old_item.active = False
+                    old_item.updated_at = now
+
+            # Upsert new price records for loader_id
             for pkey_raw, val in cost_map.items():
                 pkey = pkey_raw.strip().lower()
                 catalog_item = PRODUCT_CATALOG.get(pkey, {})
@@ -2569,6 +2591,7 @@ async def bulk_set_loader_prices_in_db(loader_id: int, cost_map: Dict[str, float
                     existing.display_name = dname
                     existing.package_type = pkg_type
                     existing.currency = curr
+                    existing.active = True
                     existing.updated_at = now
                 else:
                     session.add(LoaderPrice(

@@ -253,6 +253,20 @@ PRODUCT_CATALOG: Dict[str, Dict[str, Any]] = {
         "reference_price": 411.0,
         "currency": "USD"
     },
+    "cp_100800": {
+        "product_key": "cp_100800",
+        "display_name": "100800 CP",
+        "package_type": "special_cp",
+        "reference_price": 546.0,
+        "currency": "USD"
+    },
+    "cp_108000": {
+        "product_key": "cp_108000",
+        "display_name": "108000 CP",
+        "package_type": "special_cp",
+        "reference_price": 584.5,
+        "currency": "USD"
+    },
 
     # OTHER PRODUCTS
     "full_event_deal": {
