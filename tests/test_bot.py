@@ -5434,6 +5434,116 @@ Only available for $1 to $7 Accounts
         res_no_prices = parse_client_price_list("Hello this is just a normal conversation message")
         self.assertFalse(res_no_prices["valid"])
 
+    def test_price_list_parser_separators_and_aliases(self):
+        from price_list_parser import parse_client_price_list
+
+        # 1. 5000 CP ➜ $31
+        res1 = parse_client_price_list("5000 CP ➜ $31")
+        self.assertTrue(res1["valid"])
+        self.assertEqual(res1["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 2. 5000 CP - $31
+        res2 = parse_client_price_list("5000 CP - $31")
+        self.assertTrue(res2["valid"])
+        self.assertEqual(res2["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 3. 5000 CP – $31
+        res3 = parse_client_price_list("5000 CP – $31")
+        self.assertTrue(res3["valid"])
+        self.assertEqual(res3["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 4. 5000 CP — $31
+        res4 = parse_client_price_list("5000 CP — $31")
+        self.assertTrue(res4["valid"])
+        self.assertEqual(res4["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 5. 5040 CP ➜ $31 -> canonical 5000
+        res5 = parse_client_price_list("5040 CP ➜ $31")
+        self.assertTrue(res5["valid"])
+        self.assertEqual(res5["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 6. 5K ➜ $31 -> canonical 5000
+        res6 = parse_client_price_list("5K ➜ $31")
+        self.assertTrue(res6["valid"])
+        self.assertEqual(res6["parsed_prices"].get("cp_5000"), 31.0)
+
+        # 7. 10900 CP ➜ $64 -> canonical 10800
+        res7 = parse_client_price_list("10900 CP ➜ $64")
+        self.assertTrue(res7["valid"])
+        self.assertEqual(res7["parsed_prices"].get("cp_10800"), 64.0)
+
+        # 8. 10000 CP ➜ $64 -> canonical 10800
+        res8 = parse_client_price_list("10000 CP ➜ $64")
+        self.assertTrue(res8["valid"])
+        self.assertEqual(res8["parsed_prices"].get("cp_10800"), 64.0)
+
+        # 9. 10K ➜ $64 -> canonical 10800
+        res9 = parse_client_price_list("10K ➜ $64")
+        self.assertTrue(res9["valid"])
+        self.assertEqual(res9["parsed_prices"].get("cp_10800"), 64.0)
+
+        # 10. Safe Vault with -, –, — separators
+        vault_text = "$5 - $4.5\n$10 – $7\n$20 — $12"
+        res_v = parse_client_price_list(vault_text)
+        self.assertTrue(res_v["valid"])
+        self.assertEqual(res_v["parsed_prices"].get("safe_vault_5"), 4.5)
+        self.assertEqual(res_v["parsed_prices"].get("safe_vault_10"), 7.0)
+        self.assertEqual(res_v["parsed_prices"].get("safe_vault_20"), 12.0)
+
+        # 11. Full complete Loader Price List with all Normal CP, Special CP and Safe Vault entries
+        full_list = """
+NORMAL CP
+5000 CP ➜ $31
+10800 CP ➜ $64
+420 CP ➜ $3.7
+880 CP ➜ $7
+2400 CP ➜ $14
+
+SPECIAL CP
+4800 CP ➜ $28
+7200 CP ➜ $41
+9600 CP ➜ $54
+12000 CP ➜ $67.5
+14400 CP ➜ $81
+16800 CP ➜ $94
+19200 CP ➜ $108
+21600 CP ➜ $117
+24000 CP ➜ $130
+26400 CP ➜ $143
+28800 CP ➜ $156
+31200 CP ➜ $169
+33600 CP ➜ $182
+36000 CP ➜ $195
+38400 CP ➜ $208
+40800 CP ➜ $221
+43200 CP ➜ $234
+45600 CP ➜ $260.5
+48000 CP ➜ $260
+50400 CP ➜ $287.5
+52800 CP ➜ $301
+55200 CP ➜ $315.5
+57600 CP ➜ $329
+60000 CP ➜ $325
+62400 CP ➜ $356
+64800 CP ➜ $369.5
+67200 CP ➜ $373
+69600 CP ➜ $396.5
+72000 CP ➜ $390
+
+SAFE VAULT
+$5 ➜ $4.5
+$10 ➜ $7
+$20 ➜ $12
+$30 ➜ $21
+$50 ➜ $37
+"""
+        res_full = parse_client_price_list(full_list)
+        self.assertTrue(res_full["valid"])
+        self.assertEqual(res_full["counts"]["total"], 39)
+        self.assertEqual(res_full["counts"]["normal_cp"], 5)
+        self.assertEqual(res_full["counts"]["special_cp"], 29)
+        self.assertEqual(res_full["counts"]["other_products"], 5)
+
     async def test_setclientprice_command_unauthorized_and_no_reply(self):
         from handlers import setclientprice_command_handler
 

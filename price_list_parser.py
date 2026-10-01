@@ -7,6 +7,7 @@ Supports Normal CP, Special CP, Full Event Deal, Safe Vaults, and Full Chain.
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from product_catalog import PRODUCT_CATALOG, get_product_by_key
+from order_parser import normalize_package_alias
 
 
 def parse_client_price_list(text: str) -> Dict[str, Any]:
@@ -56,18 +57,18 @@ def parse_client_price_list(text: str) -> Dict[str, Any]:
     in_full_event_section = False
     in_full_chain_section = False
 
-    SEP_PATTERN = r"(?:➜|➡️|->|→|=|:)"
+    SEP_PATTERN = r"(?:➜|➡️|->|→|=|-|–|—|:)"
 
     # CP line regex: matches "10,800 CP ➜ $65.5" or "72,000 CP ➡️ $411💵" or "5000 CP -> $33"
     CP_LINE_RE = re.compile(
-        r"(?:💎|🔥)?\s*([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)\s*CP\b\s*"
+        r"(?:💎|🔥)?\s*([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+(?:\.[0-9]+)?[kK]?)\s*(?:CP)?\b\s*"
         + SEP_PATTERN +
         r"\s*\$?\s*([0-9]+(?:\.[0-9]+)?)"
     , re.IGNORECASE)
 
     # Safe Vault regex: matches "$50 ➜ $38 USDT" or "$30 -> $22" or "💵 $50 ➜ $38 USDT"
     SAFE_VAULT_RE = re.compile(
-        r"\$?\s*(50|30|20|10|5)\s*"
+        r"\$?\s*\b(50|30|20|10|5)\b\s*"
         + SEP_PATTERN +
         r"\s*\$?\s*([0-9]+(?:\.[0-9]+)?)"
     , re.IGNORECASE)
@@ -116,7 +117,7 @@ def parse_client_price_list(text: str) -> Dict[str, Any]:
                             continue
 
         # 3. Safe Vault lines
-        if "safe vault" in line_lower or any(f"${v}" in line_clean or f"${v} " in line_clean for v in [50, 30, 20, 10, 5]) or any(f"{v} ➜" in line_clean or f"{v}->" in line_clean or f"{v} ➡️" in line_clean for v in [50, 30, 20, 10, 5]):
+        if "safe vault" in line_lower or SAFE_VAULT_RE.search(line_clean) or any(f"${v}" in line_clean or f"${v} " in line_clean for v in [50, 30, 20, 10, 5]):
             m_sv = SAFE_VAULT_RE.search(line_clean)
             if m_sv:
                 vault_denom = m_sv.group(1)
@@ -126,7 +127,7 @@ def parse_client_price_list(text: str) -> Dict[str, Any]:
                 continue
 
         # 4. CP Package lines
-        if "cp" in line_lower:
+        if "cp" in line_lower or CP_LINE_RE.search(line_clean):
             # Skip non-catalog descriptions 560 CP and 3280 CP
             if "560 cp" in line_lower or "3280 cp" in line_lower:
                 continue
@@ -135,7 +136,8 @@ def parse_client_price_list(text: str) -> Dict[str, Any]:
             if m_cp:
                 cp_num_raw = m_cp.group(1).replace(",", "").replace(" ", "").strip()
                 cp_price = float(m_cp.group(2))
-                pkey = f"cp_{cp_num_raw}"
+                canonical_num = normalize_package_alias(cp_num_raw)
+                pkey = f"cp_{canonical_num}"
                 if pkey in PRODUCT_CATALOG:
                     add_price(pkey, cp_price, line_clean)
 
