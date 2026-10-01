@@ -8699,6 +8699,95 @@ class TestLoaderAddGroupIdParsing(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("loader name" in t.lower() for t in replied_texts))
         self.assertEqual(LOADER_ADD_SESSION[admin_id]["group_id"], -1004475489333)
 
+    async def test_interactive_loaderadd_wizard_flow_with_name_first(self):
+        from handlers import loaderadd_command, loader_text_wizard_handler, LOADER_ADD_SESSION
+        from database import get_all_loaders, LOADERS_CACHE
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        group_id = -1004475489444
+        loader_name = "Bravo Loader"
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        # Step 1: Execute /loaderadd without args to initiate wizard
+        update1 = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context1 = type("Context", (), {"args": []})()
+
+        await loaderadd_command(update1, context1)
+        self.assertIn(admin_id, LOADER_ADD_SESSION)
+        self.assertTrue(any("loader name" in t.lower() for t in replied_texts))
+
+        # Step 2: Send Loader Name text
+        replied_texts.clear()
+        update2 = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"text": loader_name, "reply_text": mock_reply})()
+        })()
+        context2 = type("Context", (), {})()
+
+        await loader_text_wizard_handler(update2, context2)
+        self.assertEqual(LOADER_ADD_SESSION[admin_id]["loader_name"], loader_name)
+        self.assertTrue(any("group id" in t.lower() for t in replied_texts))
+
+        # Step 3: Send Group ID text
+        replied_texts.clear()
+        update3 = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"text": str(group_id), "reply_text": mock_reply})()
+        })()
+        context3 = type("Context", (), {})()
+
+        await loader_text_wizard_handler(update3, context3)
+        self.assertNotIn(admin_id, LOADER_ADD_SESSION)
+        self.assertTrue(any("added successfully" in t.lower() or "loader added" in t.lower() for t in replied_texts))
+
+        loaders = await get_all_loaders()
+        loader = next((l for l in loaders if l.group_id == group_id), None)
+        self.assertIsNotNone(loader)
+        self.assertEqual(loader.loader_name, loader_name)
+        self.assertIn(loader.id, LOADERS_CACHE)
+        self.assertEqual(LOADERS_CACHE[loader.id]["name"], loader_name)
+
+    async def test_existing_loaders_without_name_graceful_fallback(self):
+        from database import add_loader, reload_loaders_cache, LOADERS_CACHE
+        from handlers import loaderlist_command
+        from config import Config
+
+        admin_id = list(Config.ADMIN_IDS)[0] if Config.ADMIN_IDS else 1573531032
+        group_id = -1004475489555
+
+        loader = await add_loader(group_id=group_id, loader_name="")
+        cache = await reload_loaders_cache()
+        self.assertIn(loader.id, cache)
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": admin_id})(),
+            "effective_chat": type("Chat", (), {"id": admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {})()
+
+        await loaderlist_command(update, context)
+        self.assertTrue(len(replied_texts) > 0)
+        self.assertTrue(any(str(group_id) in t for t in replied_texts))
+
     async def test_ordinary_amount_text_still_updates_running_total(self):
         from handlers import manual_running_total_text_handler
         from database import get_running_total_current
@@ -9618,7 +9707,7 @@ class TestNegativeManualRunningTotalAdjustment(unittest.IsolatedAsyncioTestCase)
                 mock_reply.reset_mock()
                 await app.process_update(upd_wizard)
                 mock_reply.assert_called_once()
-                self.assertIn("Invalid Loader Group ID", mock_reply.call_args[0][0])
+                self.assertTrue(any(kw in mock_reply.call_args[0][0].lower() for kw in ["loader group id", "invalid loader group id"]))
 
             finally:
                 LOADER_ADD_SESSION.clear()

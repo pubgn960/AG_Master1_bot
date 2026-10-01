@@ -3684,9 +3684,10 @@ async def delivery_group_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def loaderadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /loaderadd <group_id> [loader_name] command for Super Admin users.
-    Explicitly parses group_id, enforces duplicate protection, updates database & LOADERS_CACHE,
-    and returns user-friendly status responses.
+    Handles /loaderadd command for Super Admin users.
+    Supports:
+    1. Direct command with arguments: /loaderadd <group_id> [loader_name]
+    2. Interactive step-by-step wizard when invoked without arguments: /loaderadd
     """
     if not await check_admin_permission(update):
         return
@@ -3700,7 +3701,16 @@ async def loaderadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     args = context.args or []
 
     if not args:
-        await message.reply_text("❌ Usage: /loaderadd <loader_group_id>")
+        LOADER_ADD_SESSION[user.id] = {
+            "step": 1,
+            "chat_id": chat.id if chat else None,
+            "created_at": datetime.now(timezone.utc)
+        }
+        await message.reply_text(
+            "➕ <b>Add Loader Wizard</b>\n\n"
+            "Please send the <b>Loader Name</b> (e.g. Loader 1 or Alpha):",
+            parse_mode="HTML"
+        )
         return
 
     group_id_str = args[0].strip()
@@ -3744,6 +3754,7 @@ async def loaderadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         resp = (
             "✅ <b>Loader Group Added</b>\n\n"
+            f"<b>Name:</b> {html.escape(loader_name)}\n"
             f"<b>Group ID:</b> <code>{group_id}</code>"
         )
         await message.reply_text(resp, parse_mode="HTML")
@@ -3793,32 +3804,69 @@ async def loader_text_wizard_handler(update: Update, context: ContextTypes.DEFAU
     step = session.get("step", 1)
 
     if step == 1:
-        if not text.lstrip("-").isdigit():
-            await message.reply_text("❌ Invalid Loader Group ID. Must be numeric (e.g. -1001234567890).")
-            return
-
-        session["group_id"] = int(text)
-        session["step"] = 2
-        await message.reply_text("Send Loader Name")
+        if text.lstrip("-").isdigit():
+            session["group_id"] = int(text)
+            session["step"] = 2
+            await message.reply_text("Send Loader Name")
+        else:
+            session["loader_name"] = text
+            session["step"] = 2
+            await message.reply_text("Please send the <b>Loader Group ID</b> (e.g. <code>-1001234567890</code>):", parse_mode="HTML")
         return
 
     elif step == 2:
-        group_id = session.get("group_id")
-        loader_name = text
+        if "group_id" in session and "loader_name" not in session:
+            group_id = session.get("group_id")
+            loader_name = text
+        elif "loader_name" in session and "group_id" not in session:
+            loader_name = session.get("loader_name")
+            group_id_str = text.strip()
+            if not (group_id_str.lstrip("-").isdigit() and len(group_id_str.lstrip("-")) > 0):
+                await message.reply_text("❌ Invalid Loader Group ID. Must be numeric (e.g. -1001234567890).")
+                return
+            try:
+                group_id = int(group_id_str)
+            except ValueError:
+                await message.reply_text("❌ Invalid Loader Group ID.")
+                return
+        else:
+            await message.reply_text("❌ Error adding loader. Please try again with /loaderadd.")
+            LOADER_ADD_SESSION.pop(user.id, None)
+            return
 
         if not group_id or not loader_name:
             await message.reply_text("❌ Error adding loader. Please try again with /loaderadd.")
             LOADER_ADD_SESSION.pop(user.id, None)
             return
 
+        from database import LOADERS_CACHE, reload_loaders_cache, get_all_loaders, add_loader
+
+        if not LOADERS_CACHE:
+            await reload_loaders_cache()
+
+        is_duplicate = any(l.get("group_id") == group_id for l in LOADERS_CACHE.values())
+        if not is_duplicate:
+            loaders_db = await get_all_loaders()
+            is_duplicate = any(l.group_id == group_id for l in loaders_db)
+
+        if is_duplicate:
+            await message.reply_text("⚠️ This Loader Group is already registered.")
+            LOADER_ADD_SESSION.pop(user.id, None)
+            return
+
         try:
             await add_loader(group_id, loader_name)
-            await message.reply_text("✅ Loader Added Successfully")
+            await reload_loaders_cache()
+            await message.reply_text(
+                "✅ <b>Loader Added Successfully</b>\n\n"
+                f"<b>Name:</b> {html.escape(loader_name)}\n"
+                f"<b>Group ID:</b> <code>{group_id}</code>",
+                parse_mode="HTML"
+            )
         except Exception as e:
             logger.exception(f"[LOADER_MGMT] Failed to add loader: {e}")
             await message.reply_text(f"❌ Failed to add loader: {e}")
         finally:
-            # Rule 4: Completely remove wizard state after completion
             LOADER_ADD_SESSION.pop(user.id, None)
 
 
