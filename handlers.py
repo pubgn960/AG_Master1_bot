@@ -38,6 +38,7 @@ from database import (
     AUTH_USERS_CACHE,
     CLIENT_GROUPS_CACHE,
     LOADERS_CACHE,
+    reload_loaders_cache,
     AsyncSessionLocal,
     get_current_settings,
     update_source_group,
