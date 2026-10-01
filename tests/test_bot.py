@@ -11883,6 +11883,139 @@ class TestTelegramCommandMenuRegistration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(cmd_names), len(set(cmd_names)), "Commands list must not contain duplicates")
 
 
+class TestAdminAndUserManagementCommands(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for admin and delivery user management commands:
+    - /user admin add <id>
+    - /user admin remove <id>
+    - /user delivery add <id>
+    - /user delivery remove <id>
+    - /users
+    """
+
+    async def asyncSetUp(self):
+        from database import init_db, remove_authorized_user, reload_auth_users_cache
+        await init_db()
+        await remove_authorized_user(88776655)
+        await remove_authorized_user(99887766)
+        await reload_auth_users_cache()
+
+    async def test_admin_add_and_remove(self):
+        from handlers import user_command, users_command
+        from utils import is_super_admin
+
+        super_admin_id = 1573531032
+        target_id = 88776655
+
+        # 1. Super Admin adds admin
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": super_admin_id})(),
+            "effective_chat": type("Chat", (), {"id": super_admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["admin", "add", str(target_id)]})()
+
+        await user_command(update, context)
+        self.assertTrue(any("admin user added successfully" in t.lower() for t in replied_texts))
+        self.assertTrue(is_super_admin(target_id))
+
+        # 2. Verify /users shows Admin
+        replied_texts.clear()
+        context_users = type("Context", (), {"args": []})()
+        await users_command(update, context_users)
+        users_output = "\n".join(replied_texts)
+        self.assertIn("👑 Super Admin", users_output)
+        self.assertIn("🛡 Admin", users_output)
+        self.assertIn(str(target_id), users_output)
+
+        # 3. Super Admin removes admin
+        replied_texts.clear()
+        context_remove = type("Context", (), {"args": ["admin", "remove", str(target_id)]})()
+        await user_command(update, context_remove)
+        self.assertTrue(any("admin user removed successfully" in t.lower() for t in replied_texts))
+        self.assertFalse(is_super_admin(target_id))
+
+    async def test_unauthorized_user_rejected(self):
+        from handlers import user_command
+
+        non_admin_id = 11223344
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": non_admin_id})(),
+            "effective_chat": type("Chat", (), {"id": non_admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["admin", "add", "88776655"]})()
+
+        await user_command(update, context)
+        self.assertTrue(any("not authorized" in t.lower() for t in replied_texts))
+
+    async def test_cannot_remove_default_super_admin(self):
+        from handlers import user_command
+        from utils import is_super_admin
+
+        super_admin_id = 1573531032
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": super_admin_id})(),
+            "effective_chat": type("Chat", (), {"id": super_admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["admin", "remove", str(super_admin_id)]})()
+
+        await user_command(update, context)
+        self.assertTrue(any("cannot be removed" in t.lower() for t in replied_texts))
+        self.assertTrue(is_super_admin(super_admin_id))
+
+    async def test_delivery_add_and_remove_still_works(self):
+        from handlers import user_command
+        from utils import is_delivery_user
+
+        super_admin_id = 1573531032
+        target_id = 99887766
+
+        replied_texts = []
+        async def mock_reply(*args, **kwargs):
+            for a in args:
+                if isinstance(a, str):
+                    replied_texts.append(a)
+
+        update = type("Update", (), {
+            "effective_user": type("User", (), {"id": super_admin_id})(),
+            "effective_chat": type("Chat", (), {"id": super_admin_id, "type": "private"})(),
+            "effective_message": type("Message", (), {"reply_text": mock_reply})()
+        })()
+        context = type("Context", (), {"args": ["delivery", "add", str(target_id)]})()
+
+        await user_command(update, context)
+        self.assertTrue(any("delivery user added successfully" in t.lower() for t in replied_texts))
+        self.assertTrue(is_delivery_user(target_id))
+
+        replied_texts.clear()
+        context_rem = type("Context", (), {"args": ["delivery", "remove", str(target_id)]})()
+        await user_command(update, context_rem)
+        self.assertTrue(any("delivery user removed successfully" in t.lower() for t in replied_texts))
+        self.assertFalse(is_delivery_user(target_id))
+
+
 if __name__ == "__main__":
     unittest.main()
 

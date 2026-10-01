@@ -4089,46 +4089,55 @@ async def reject_order_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /user delivery add <user_id> and /user delivery remove <user_id> commands (Super Admin only).
+    Handles /user admin add/remove <user_id> and /user delivery add/remove <user_id> commands (Super Admin only).
     """
     if not await check_admin_permission(update):
         return
 
     args = context.args or []
 
-    if len(args) == 3 and args[0].lower() == "delivery":
+    if len(args) == 3:
+        role_target = args[0].lower()
         sub_action = args[1].lower()
         target_uid_str = args[2].strip()
 
-        if not target_uid_str.isdigit():
-            await update.effective_message.reply_text("❌ Invalid Telegram User ID. Must be numeric.", parse_mode="HTML")
-            return
+        if role_target in ("admin", "delivery") and sub_action in ("add", "remove"):
+            if not target_uid_str.isdigit():
+                await update.effective_message.reply_text("❌ Invalid Telegram User ID. Must be numeric.", parse_mode="HTML")
+                return
 
-        target_uid = int(target_uid_str)
+            target_uid = int(target_uid_str)
+            role_label = "Admin" if role_target == "admin" else "Delivery"
 
-        if sub_action == "add":
-            success, msg = await add_authorized_user(target_uid, role="delivery")
-            reply = (
-                f"✅ Delivery user added successfully.\n\n"
-                f"User ID:\n{target_uid}"
-            )
-            await update.effective_message.reply_text(reply)
-            return
-
-        elif sub_action == "remove":
-            success, msg = await remove_authorized_user(target_uid)
-            if success:
+            if sub_action == "add":
+                success, msg = await add_authorized_user(target_uid, role=role_target)
                 reply = (
-                    f"✅ Delivery user removed successfully.\n\n"
+                    f"✅ {role_label} user added successfully.\n\n"
                     f"User ID:\n{target_uid}"
                 )
-            else:
-                reply = f"❌ {msg}"
-            await update.effective_message.reply_text(reply)
-            return
+                await update.effective_message.reply_text(reply)
+                return
+
+            elif sub_action == "remove":
+                if target_uid == 1573531032:
+                    await update.effective_message.reply_text("❌ Super Admin (1573531032) cannot be removed.")
+                    return
+
+                success, msg = await remove_authorized_user(target_uid)
+                if success:
+                    reply = (
+                        f"✅ {role_label} user removed successfully.\n\n"
+                        f"User ID:\n{target_uid}"
+                    )
+                else:
+                    reply = f"❌ {msg}"
+                await update.effective_message.reply_text(reply)
+                return
 
     usage_msg = (
         "🛠 <b>User Management Usage</b>\n\n"
+        "• <code>/user admin add 123456789</code>\n"
+        "• <code>/user admin remove 123456789</code>\n"
         "• <code>/user delivery add 123456789</code>\n"
         "• <code>/user delivery remove 123456789</code>\n"
         "• <code>/users</code> - List all authorized users"
@@ -4138,22 +4147,39 @@ async def user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handles /users command listing Super Admin and Delivery Users (Super Admin only).
+    Handles /users command listing Super Admin, Admin, and Delivery Users (Super Admin only).
     """
     if not await check_admin_permission(update):
         return
 
+    from config import Config
+
     user_groups = await get_all_authorized_users()
-    admins = user_groups.get("admin", [1573531032])
+    db_admins = user_groups.get("admin", [])
     delivery_users = user_groups.get("delivery", [])
 
+    super_admins = set()
+    super_admins.add(1573531032)
+    if Config.ADMIN_IDS:
+        super_admins.update(Config.ADMIN_IDS)
+
+    # Exclude Super Admins from database admins section to avoid duplicate listing
+    db_only_admins = [a for a in db_admins if a not in super_admins]
+
     lines = ["👑 Super Admin\n"]
-    for a in admins:
-        lines.append(f"{a}")
+    for sa in sorted(super_admins):
+        lines.append(f"{sa}")
+
+    lines.append("\n🛡 Admin\n")
+    if db_only_admins:
+        for a in sorted(db_only_admins):
+            lines.append(f"{a}")
+    else:
+        lines.append("None")
 
     lines.append("\n📦 Delivery Users\n")
     if delivery_users:
-        for d in delivery_users:
+        for d in sorted(delivery_users):
             lines.append(f"{d}")
     else:
         lines.append("None")
