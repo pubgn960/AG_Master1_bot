@@ -2967,6 +2967,60 @@ class TestCanonicalPackageAliasNormalizationFix(unittest.IsolatedAsyncioTestCase
         self.assertEqual(p_5000["packages"][0]["unit_price"], 33.0)
         self.assertEqual(p_5040["packages"][0]["unit_price"], 33.0)
 
+    def test_cp_header_regex_email_false_positive_and_cp_headers(self):
+        from order_parser import parse_order_v2
+
+        # 1. 5000 + Activision + codparticular98@gmail.com (Original #09 order)
+        msg1 = "#09\n4WC8C9EZ8L2\n5000\nNick/Nombre CODM: °G4MA°\nActivision\ncodparticular98@gmail.com\ndilv3003"
+        res1 = parse_order_v2(msg1)
+        self.assertTrue(res1["order_detected"])
+        self.assertEqual(len(res1["packages"]), 1)
+        self.assertEqual(res1["packages"][0]["package"], "5000")
+
+        # 2. 2400 + codparticular98@gmail.com
+        msg2 = "#08\n4WC8C9EZ8L2\n2400\nNick/Nombre CODM: °G4MA°\nActivision\ncodparticular98@gmail.com\ndilv3003"
+        res2 = parse_order_v2(msg2)
+        self.assertTrue(res2["order_detected"])
+        self.assertEqual(len(res2["packages"]), 1)
+        self.assertEqual(res2["packages"][0]["package"], "2400")
+
+        # 3. 5K + codparticular98@gmail.com
+        msg3 = "#09\n4WC8C9EZ8L2\n5K\nActivision\ncodparticular98@gmail.com\ndilv3003"
+        res3 = parse_order_v2(msg3)
+        self.assertTrue(res3["order_detected"])
+        self.assertEqual(len(res3["packages"]), 1)
+        self.assertEqual(res3["packages"][0]["package"], "5000")
+
+        # 4. 5040 + codparticular98@gmail.com
+        msg4 = "#09\n4WC8C9EZ8L2\n5040\nActivision\ncodparticular98@gmail.com\ndilv3003"
+        res4 = parse_order_v2(msg4)
+        self.assertTrue(res4["order_detected"])
+        self.assertEqual(len(res4["packages"]), 1)
+        self.assertEqual(res4["packages"][0]["package"], "5000")
+
+        # 5. Actual CP headers still work
+        headers = [
+            "CP: 5000",
+            "CP Pack: 5000",
+            "Package: 5000",
+            "Pack: 5000",
+            "Codpoints: 5000",
+            "Codp: 5000"
+        ]
+        for header in headers:
+            msg_hdr = f"Login: user@gmail.com\nPass: pass123\n{header}"
+            res_hdr = parse_order_v2(msg_hdr)
+            self.assertTrue(res_hdr["order_detected"], f"Failed for header: {header}")
+            self.assertEqual(len(res_hdr["packages"]), 1, f"Failed for header: {header}")
+            self.assertEqual(res_hdr["packages"][0]["package"], "5000", f"Failed for header: {header}")
+
+        # 6. Normal emails not beginning with codp continue working
+        msg_norm = "Email: normaluser@gmail.com\nPass: pass123\n5000"
+        res_norm = parse_order_v2(msg_norm)
+        self.assertTrue(res_norm["order_detected"])
+        self.assertEqual(len(res_norm["packages"]), 1)
+        self.assertEqual(res_norm["packages"][0]["package"], "5000")
+
     def test_multi_package_canonical_normalization(self):
         from utils import parse_test_order_packages
 

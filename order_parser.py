@@ -114,7 +114,7 @@ GAME_HEADER_REGEX = re.compile(
 )
 
 CP_HEADER_REGEX = re.compile(
-    r'^\s*[^\w\s]*\s*(?:cp\s*pack|cp\s*package|pack\s*cp|codp\'?s|codpoints|codp|package|pack|cp)\s*[:=\.\-]?\s*(.*)$',
+    r'^\s*[^\w\s]*\s*(?:cp\s*pack|cp\s*package|pack\s*cp|codp\'?s|codpoints|codp|package|pack|cp)\b\s*[:=\.\-]?\s*(.*)$',
     re.IGNORECASE
 )
 
