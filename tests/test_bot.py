@@ -12335,6 +12335,176 @@ class TestAdminAndUserManagementCommands(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("delivery user removed successfully" in t.lower() for t in replied_texts))
         self.assertFalse(is_delivery_user(target_id))
 
+    async def test_bot_default_state_is_on(self):
+        from database import is_bot_enabled, BOT_SETTINGS, set_bot_enabled_in_db
+        await set_bot_enabled_in_db(True)
+        self.assertTrue(BOT_SETTINGS.get("bot_enabled", True))
+        is_on = await is_bot_enabled()
+        self.assertTrue(is_on)
+
+    async def test_admin_bot_off_and_on_commands(self):
+        from handlers import bot_command_handler
+        from database import is_bot_enabled, BOT_SETTINGS, set_bot_enabled_in_db
+        from unittest.mock import MagicMock, AsyncMock
+
+        await set_bot_enabled_in_db(True)
+        super_admin_id = 1573531032
+
+        # 1. /bot off
+        update_off = MagicMock()
+        update_off.effective_user.id = super_admin_id
+        update_off.effective_message.reply_text = AsyncMock()
+
+        context_off = MagicMock()
+        context_off.args = ["off"]
+
+        await bot_command_handler(update_off, context_off)
+        update_off.effective_message.reply_text.assert_called_once_with("🔴 Bot is OFF")
+        self.assertFalse(BOT_SETTINGS["bot_enabled"])
+        self.assertFalse(await is_bot_enabled())
+
+        # 2. /bot status
+        update_status = MagicMock()
+        update_status.effective_user.id = super_admin_id
+        update_status.effective_message.reply_text = AsyncMock()
+
+        context_status = MagicMock()
+        context_status.args = ["status"]
+
+        await bot_command_handler(update_status, context_status)
+        update_status.effective_message.reply_text.assert_called_once_with("🔴 Bot is OFF")
+
+        # 3. /bot on
+        update_on = MagicMock()
+        update_on.effective_user.id = super_admin_id
+        update_on.effective_message.reply_text = AsyncMock()
+
+        context_on = MagicMock()
+        context_on.args = ["on"]
+
+        await bot_command_handler(update_on, context_on)
+        update_on.effective_message.reply_text.assert_called_once_with("🟢 Bot is ON")
+        self.assertTrue(BOT_SETTINGS["bot_enabled"])
+        self.assertTrue(await is_bot_enabled())
+
+        # 4. /bot (no args)
+        update_noargs = MagicMock()
+        update_noargs.effective_user.id = super_admin_id
+        update_noargs.effective_message.reply_text = AsyncMock()
+
+        context_noargs = MagicMock()
+        context_noargs.args = []
+
+        await bot_command_handler(update_noargs, context_noargs)
+        update_noargs.effective_message.reply_text.assert_called_once_with("🟢 Bot is ON")
+
+    async def test_unauthorized_user_cannot_toggle_bot(self):
+        from handlers import bot_command_handler
+        from database import is_bot_enabled, set_bot_enabled_in_db
+        from unittest.mock import MagicMock, AsyncMock
+
+        await set_bot_enabled_in_db(True)
+        non_admin_id = 11223344
+
+        update = MagicMock()
+        update.effective_user.id = non_admin_id
+        update.effective_message.reply_text = AsyncMock()
+
+        context_off = MagicMock()
+        context_off.args = ["off"]
+
+        await bot_command_handler(update, context_off)
+        update.effective_message.reply_text.assert_called_once_with("⛔ You are not authorized to use this command.")
+        self.assertTrue(await is_bot_enabled())
+
+    async def test_new_client_order_ignored_when_bot_off(self):
+        from handlers import source_group_handler
+        from database import AsyncSessionLocal, BOT_SETTINGS, set_bot_enabled_in_db
+        from models import Order
+        from sqlalchemy import select
+        from unittest.mock import MagicMock, AsyncMock
+
+        await set_bot_enabled_in_db(False)
+
+        customer_id = 88776655
+        order_text = (
+            "Facebook\n\n"
+            "Email:\nbot_off_test@gmail.com\n\n"
+            "Password:\nPass1234\n\n"
+            "Order:\n2400"
+        )
+
+        update = MagicMock()
+        update.effective_user.id = customer_id
+        update.effective_chat.id = BOT_SETTINGS["source_group_id"] or -100123456
+        update.effective_message.text = order_text
+        update.effective_message.caption = None
+        update.effective_message.message_id = 99881
+        update.effective_message.reply_text = AsyncMock()
+
+        await source_group_handler(update, MagicMock())
+
+        # Verify no order created
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(Order).where(Order.email == "bot_off_test@gmail.com"))
+            orders = res.scalars().all()
+            self.assertEqual(len(orders), 0)
+
+        # Re-enable bot
+        await set_bot_enabled_in_db(True)
+
+    async def test_bot_on_resumes_order_processing(self):
+        from handlers import source_group_handler
+        from database import AsyncSessionLocal, BOT_SETTINGS, set_bot_enabled_in_db
+        from models import Order
+        from sqlalchemy import select
+        from unittest.mock import MagicMock, AsyncMock
+
+        await set_bot_enabled_in_db(True)
+
+        customer_id = 88776655
+        order_text = (
+            "Facebook\n\n"
+            "Email:\nbot_on_test@gmail.com\n\n"
+            "Password:\nPass1234\n\n"
+            "Order:\n2400"
+        )
+
+        update = MagicMock()
+        update.effective_user.id = customer_id
+        update.effective_chat.id = BOT_SETTINGS["source_group_id"] or -100123456
+        update.effective_message.text = order_text
+        update.effective_message.caption = None
+        update.effective_message.message_id = 99882
+        update.effective_message.reply_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot.copy_message = AsyncMock()
+
+        await source_group_handler(update, context)
+
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(select(Order).where(Order.email == "bot_on_test@gmail.com"))
+            orders = res.scalars().all()
+            self.assertEqual(len(orders), 1)
+
+        await set_bot_enabled_in_db(True)
+
+    async def test_bot_enabled_persists_across_cache_reload(self):
+        from database import set_bot_enabled_in_db, reload_bot_settings_cache, BOT_SETTINGS, is_bot_enabled
+
+        await set_bot_enabled_in_db(False)
+        self.assertFalse(BOT_SETTINGS["bot_enabled"])
+
+        await reload_bot_settings_cache()
+        self.assertFalse(BOT_SETTINGS["bot_enabled"])
+        self.assertFalse(await is_bot_enabled())
+
+        await set_bot_enabled_in_db(True)
+        await reload_bot_settings_cache()
+        self.assertTrue(BOT_SETTINGS["bot_enabled"])
+        self.assertTrue(await is_bot_enabled())
+
 
 if __name__ == "__main__":
     unittest.main()

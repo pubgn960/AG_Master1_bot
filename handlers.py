@@ -172,7 +172,9 @@ from database import (
     execute_manual_adjustment,
     get_last_running_total_entry,
     undo_last_running_total_action,
-    process_verified_payment_deduction
+    process_verified_payment_deduction,
+    is_bot_enabled,
+    set_bot_enabled_in_db
 )
 from utils import (
     extract_payment_info,
@@ -237,6 +239,11 @@ async def source_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if is_known_loader or chat.type == "private" or chat.id == BOT_SETTINGS.get("payment_review_group_id"):
             return
         logger.warning(f"[CLIENT] Client Group is not configured yet. Ignored message in chat {chat.id} ({chat.title}).")
+        return
+
+    # Check if bot is ON/OFF
+    if not BOT_SETTINGS.get("bot_enabled", True):
+        logger.info(f"[CLIENT] Bot is currently OFF. Ignored message {message.message_id} in client group {chat.id}.")
         return
 
     # Ignore Super Admin & Delivery User Messages in Client Group
@@ -779,6 +786,10 @@ async def edited_message_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     is_client_group = (chat.id == BOT_SETTINGS["source_group_id"]) or (chat.id in CLIENT_GROUPS_CACHE)
     if not is_client_group:
+        return
+
+    if not BOT_SETTINGS.get("bot_enabled", True):
+        logger.info(f"[CLIENT] Bot is currently OFF. Ignored edited message #{message.message_id} in chat {chat.id}.")
         return
 
     if user_id and (is_super_admin(user_id) or is_delivery_user(user_id)):
@@ -4895,6 +4906,43 @@ async def walletverification_command_handler(update: Update, context: ContextTyp
             "• <code>/walletverification on</code>\n"
             "• <code>/walletverification off</code>\n"
             "• <code>/walletverification status</code>"
+        )
+        await update.effective_message.reply_text(prompt, parse_mode="HTML")
+
+
+async def bot_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles /bot [on|off|status] command for authorized admins.
+    Toggles new customer order processing persistently in database and RAM cache.
+    """
+    if not await check_admin_permission(update):
+        return
+
+    args = context.args or []
+    if not args:
+        is_on = await is_bot_enabled()
+        status_str = "🟢 Bot is ON" if is_on else "🔴 Bot is OFF"
+        await update.effective_message.reply_text(status_str)
+        return
+
+    sub = args[0].lower()
+
+    if sub == "on":
+        await set_bot_enabled_in_db(True)
+        await update.effective_message.reply_text("🟢 Bot is ON")
+    elif sub == "off":
+        await set_bot_enabled_in_db(False)
+        await update.effective_message.reply_text("🔴 Bot is OFF")
+    elif sub == "status":
+        is_on = await is_bot_enabled()
+        status_str = "🟢 Bot is ON" if is_on else "🔴 Bot is OFF"
+        await update.effective_message.reply_text(status_str)
+    else:
+        prompt = (
+            "⚠️ <b>Usage:</b>\n"
+            "• <code>/bot on</code>\n"
+            "• <code>/bot off</code>\n"
+            "• <code>/bot status</code>"
         )
         await update.effective_message.reply_text(prompt, parse_mode="HTML")
 

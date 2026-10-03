@@ -49,7 +49,8 @@ BOT_SETTINGS: Dict[str, Any] = {
     "delivery_group_title": None,
     "payment_review_group_title": "Payment Review Group",
     "payment_verification_enabled": True,
-    "wallet_verification_enabled": True
+    "wallet_verification_enabled": True,
+    "bot_enabled": True
 }
 
 # Global in-memory user permission cache: telegram_user_id -> role ('admin' or 'delivery')
@@ -231,6 +232,17 @@ def _migrate_orders_schema(sync_conn: Any) -> None:
             except Exception as e:
                 logger.error(f"Failed to add column wallet_verification_enabled to settings: {e}")
 
+        if "bot_enabled" not in existing_columns:
+            logger.info("Adding missing column bot_enabled to settings...")
+            try:
+                if is_postgres:
+                    sync_conn.execute(text("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bot_enabled BOOLEAN DEFAULT TRUE;"))
+                else:
+                    sync_conn.execute(text("ALTER TABLE settings ADD COLUMN bot_enabled BOOLEAN DEFAULT TRUE;"))
+                logger.info("Successfully added column bot_enabled to settings.")
+            except Exception as e:
+                logger.error(f"Failed to add column bot_enabled to settings: {e}")
+
 
 async def init_db() -> None:
     """Initializes database schema and performs idempotent column migrations."""
@@ -276,6 +288,7 @@ async def get_or_create_settings() -> Settings:
                 payment_review_group_title="Payment Review Group",
                 payment_verification_enabled=True,
                 wallet_verification_enabled=True,
+                bot_enabled=True,
                 updated_at=datetime.now(timezone.utc)
             )
             session.add(settings)
@@ -307,6 +320,8 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
     BOT_SETTINGS["payment_verification_enabled"] = bool(pv_enabled if pv_enabled is not None else True)
     wv_enabled = getattr(settings, "wallet_verification_enabled", None)
     BOT_SETTINGS["wallet_verification_enabled"] = bool(wv_enabled if wv_enabled is not None else True)
+    b_enabled = getattr(settings, "bot_enabled", None)
+    BOT_SETTINGS["bot_enabled"] = bool(b_enabled if b_enabled is not None else True)
 
     # Pre-load Client Groups into CLIENT_GROUPS_CACHE in RAM
     async with AsyncSessionLocal() as session:
@@ -326,6 +341,7 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
     pay_id = BOT_SETTINGS["payment_review_group_id"]
     pv_st = "ON" if BOT_SETTINGS["payment_verification_enabled"] else "OFF"
     wv_st = "ON" if BOT_SETTINGS["wallet_verification_enabled"] else "OFF"
+    bot_st = "ON" if BOT_SETTINGS["bot_enabled"] else "OFF"
 
     logger.info("[CACHE]")
     if src_id:
@@ -336,6 +352,7 @@ async def reload_bot_settings_cache() -> Dict[str, Any]:
         logger.info(f"[CACHE] Payment Review Group Loaded: {pay_id}")
     logger.info(f"[CACHE] Payment Verification Status Loaded: {pv_st}")
     logger.info(f"[CACHE] Wallet Verification Status Loaded: {wv_st}")
+    logger.info(f"[CACHE] Bot Status Loaded: {bot_st}")
     logger.info(f"[CACHE] Loaded {len(CLIENT_GROUPS_CACHE)} Client Group Category mapping(s) into memory.")
 
     return BOT_SETTINGS
@@ -392,6 +409,34 @@ async def set_wallet_verification_status(enabled: bool) -> bool:
 
     BOT_SETTINGS["wallet_verification_enabled"] = enabled
     logger.info(f"[WALLET_VERIFICATION] Setting updated in DB & Cache: enabled={enabled}")
+    return enabled
+
+
+async def is_bot_enabled() -> bool:
+    """Returns current Bot ON/OFF status from cache or DB."""
+    if "bot_enabled" in BOT_SETTINGS:
+        return bool(BOT_SETTINGS["bot_enabled"])
+    settings = await get_or_create_settings()
+    be = getattr(settings, "bot_enabled", True)
+    return bool(be if be is not None else True)
+
+
+async def set_bot_enabled_in_db(enabled: bool) -> bool:
+    """Updates Bot ON/OFF status in DB and updates BOT_SETTINGS RAM cache."""
+    async with AsyncSessionLocal() as session:
+        stmt = select(Settings).where(Settings.id == 1)
+        res = await session.execute(stmt)
+        settings = res.scalar_one_or_none()
+        if not settings:
+            settings = Settings(id=1, bot_enabled=enabled)
+            session.add(settings)
+        else:
+            settings.bot_enabled = enabled
+            settings.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+
+    BOT_SETTINGS["bot_enabled"] = enabled
+    logger.info(f"[BOT_CONTROL] Setting updated in DB & Cache: bot_enabled={enabled}")
     return enabled
 
 
