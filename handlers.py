@@ -3210,6 +3210,13 @@ async def category_b_approval_callback_handler(update: Update, context: ContextT
         if len(parts) < 2 or not parts[1].isdigit():
             return
         order_id = int(parts[1])
+        order = await get_order_by_id(order_id)
+        if not order:
+            try:
+                await query.answer("❌ Order not found.", show_alert=True)
+            except Exception:
+                pass
+            return
 
         # Load loader information from DB if cache is empty
         if not LOADERS_CACHE:
@@ -3219,22 +3226,112 @@ async def category_b_approval_callback_handler(update: Update, context: ContextT
         if not loaders:
             loaders = await get_all_loaders()
 
+        # Build stored client prices lookup from existing order
+        order_client_prices: Dict[str, Any] = {}
+        if order.items:
+            for oi in order.items:
+                if oi.product_key and (oi.client_line_total is not None or oi.client_unit_price is not None):
+                    c_val = Decimal(str(oi.client_line_total if oi.client_line_total is not None else oi.client_unit_price))
+                    order_client_prices[oi.product_key.strip().lower()] = c_val
+                    alias = oi.product_key.replace("cp_", "").strip().lower()
+                    order_client_prices[alias] = c_val
+
+        order_input: Any = order.package or order.raw_text or ""
+        if order.package_progress:
+            try:
+                parsed_p = json.loads(order.package_progress)
+                if parsed_p and isinstance(parsed_p, list) and len(parsed_p) > 0:
+                    order_input = parsed_p
+            except Exception:
+                pass
+
+        from pricing_calculator import calculate_order_pricing
+
         buttons = []
+        breakdown_sections = []
+        has_multi_package = False
+
         if not loaders and BOT_SETTINGS["delivery_group_id"]:
             buttons.append([InlineKeyboardButton("📦 Primary Loader", callback_data=f"catb_select_loader:{order_id}:primary")])
         else:
             for l in loaders:
                 l_id = l["id"] if isinstance(l, dict) else l.id
                 l_name = l["name"] if isinstance(l, dict) else l.loader_name
-                buttons.append([InlineKeyboardButton(f"📦 {l_name}", callback_data=f"catb_select_loader:{order_id}:{l_id}")])
+
+                # Calculate loader pricing for this specific loader
+                l_calc = await calculate_order_pricing(
+                    order_items_or_text=order_input,
+                    loader_id=l_id,
+                    client_price_map=order_client_prices
+                )
+
+                l_items = l_calc.get("items", [])
+                if len(l_items) > 1:
+                    has_multi_package = True
+
+                is_complete = l_calc.get("is_loader_complete", False)
+                l_total = l_calc.get("loader_cost_total")
+
+                # Build breakdown lines for this loader
+                section_lines = [f"🚚 <b>{html.escape(l_name)}</b>"]
+                for it in l_items:
+                    d_name = it.get("display_name") or it.get("product_key", "")
+                    unit_cost = it.get("loader_unit_cost")
+                    line_cost = it.get("loader_line_total")
+                    qty = it.get("quantity", 1)
+                    qty_str = f" x{qty}" if qty > 1 else ""
+
+                    if line_cost is not None:
+                        section_lines.append(f"• {html.escape(d_name)}{qty_str} → ${float(line_cost):g}")
+                    elif unit_cost is not None:
+                        section_lines.append(f"• {html.escape(d_name)}{qty_str} → ${float(unit_cost):g}")
+                    else:
+                        section_lines.append(f"• ⚠️ {html.escape(d_name)}{qty_str} → Price Not Set")
+
+                if is_complete and l_total is not None:
+                    section_lines.append(f"<b>Total Loader Cost → ${float(l_total):g}</b>")
+                else:
+                    section_lines.append("<b>Total Loader Cost → Price Incomplete</b>")
+
+                breakdown_sections.append("\n".join(section_lines))
+
+                # Build button text
+                if len(l_items) <= 1:
+                    # Single package order
+                    d_name = l_items[0].get("display_name") if l_items else (order.package or "Package")
+                    if is_complete and l_total is not None:
+                        btn_label = f"🚚 {l_name} — {d_name}: ${float(l_total):g}"
+                    else:
+                        btn_label = f"⚠️ {l_name} — {d_name}: Price Not Set"
+                else:
+                    # Multi-package order
+                    if is_complete and l_total is not None:
+                        btn_label = f"🚚 {l_name} — Total: ${float(l_total):g}"
+                    else:
+                        btn_label = f"⚠️ {l_name} — Price Incomplete"
+
+                buttons.append([InlineKeyboardButton(btn_label, callback_data=f"catb_select_loader:{order_id}:{l_id}")])
 
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data=f"catb_cancel:{order_id}")])
         keyboard = InlineKeyboardMarkup(buttons)
 
-        select_text = (
-            f"Select Loader\n\n"
-            f"<b>Order ID:</b> #{order_id}"
-        )
+        client_total_str = f"<b>Client Price:</b> ${order.client_price_total:g}\n" if (order.client_price_total and order.client_price_total > 0) else ""
+
+        if has_multi_package:
+            select_text = (
+                f"🚚 <b>SELECT LOADER</b>\n\n"
+                f"<b>Order ID:</b> #{order_id}\n"
+                f"{client_total_str}\n"
+                f"<b>Loader Costs Breakdown:</b>\n\n"
+                + "\n\n".join(breakdown_sections)
+            )
+        else:
+            select_text = (
+                f"🚚 <b>SELECT LOADER</b>\n\n"
+                f"<b>Order ID:</b> #{order_id}\n"
+                f"{client_total_str}"
+            )
+
         try:
             await query.edit_message_text(select_text, reply_markup=keyboard, parse_mode="HTML")
         except Exception as e:
@@ -3260,25 +3357,52 @@ async def category_b_approval_callback_handler(update: Update, context: ContextT
 
         target_group_id = None
         loader_name = "Loader Group"
+        selected_loader_id: Optional[int] = None
 
         if loader_key == "primary":
             target_group_id = BOT_SETTINGS["delivery_group_id"]
             loader_name = BOT_SETTINGS["delivery_group_title"] or "Primary Loader"
         elif loader_key.isdigit():
-            lid = int(loader_key)
-            if lid in LOADERS_CACHE:
-                target_group_id = LOADERS_CACHE[lid]["group_id"]
-                loader_name = LOADERS_CACHE[lid]["name"]
+            selected_loader_id = int(loader_key)
+            if selected_loader_id in LOADERS_CACHE:
+                target_group_id = LOADERS_CACHE[selected_loader_id]["group_id"]
+                loader_name = LOADERS_CACHE[selected_loader_id]["name"]
             else:
-                # Direct DB lookup fallback
                 loaders = await get_all_loaders()
                 for l in loaders:
-                    if l.id == lid:
+                    if l.id == selected_loader_id:
                         target_group_id = l.group_id
                         loader_name = l.loader_name
                         break
 
-        logger.info(f"[LOADER]\nSelected Loader:\n{loader_name} (Group ID: {target_group_id})")
+        # Check if selected loader has complete prices for the order
+        if selected_loader_id is not None:
+            order_input: Any = order.package or order.raw_text or ""
+            if order.package_progress:
+                try:
+                    parsed_p = json.loads(order.package_progress)
+                    if parsed_p and isinstance(parsed_p, list) and len(parsed_p) > 0:
+                        order_input = parsed_p
+                except Exception:
+                    pass
+
+            from pricing_calculator import calculate_order_pricing
+            l_calc = await calculate_order_pricing(order_items_or_text=order_input, loader_id=selected_loader_id)
+            if not l_calc.get("is_loader_complete"):
+                missing_keys = l_calc.get("missing_loader_keys", [])
+                missing_str = ", ".join(missing_keys) if missing_keys else "packages"
+                try:
+                    await query.answer(f"⚠️ {loader_name} does not have prices set for {missing_str} in this order.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+        # Atomically save order pricing with selected loader's ID
+        priced_order = await save_order_pricing(order.id, loader_id=selected_loader_id)
+        if priced_order:
+            order = priced_order
+
+        logger.info(f"[LOADER]\nSelected Loader:\n{loader_name} (ID: {selected_loader_id}, Group ID: {target_group_id})")
 
         if not target_group_id:
             logger.error(f"[LOADER]\nCopy Failed\nLoader Group for ID '{loader_key}' not found.")

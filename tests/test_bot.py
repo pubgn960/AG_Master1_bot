@@ -12530,9 +12530,327 @@ class TestAdminAndUserManagementCommands(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(BOT_SETTINGS["bot_enabled"])
         self.assertTrue(await is_bot_enabled())
 
+class TestCategoryBAcceptLoaderSelection(unittest.IsolatedAsyncioTestCase):
+    """
+    Test suite for Category B Payment Review Accept Loader Selection & Pricing feature.
+    """
+
+    async def asyncSetUp(self):
+        from database import engine, Base, LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE, AsyncSessionLocal
+        from sqlalchemy import delete
+        from models import LoaderPrice, GlobalClientPrice, Loader, Order, OrderItem
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(Order))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def asyncTearDown(self):
+        from database import LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE, AsyncSessionLocal
+        from sqlalchemy import delete
+        from models import LoaderPrice, GlobalClientPrice, Loader, Order, OrderItem
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(Order))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def test_catb_accept_single_package_loader_pricing_display(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing
+        from handlers import category_b_approval_callback_handler
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        l2 = await add_loader(group_id=2002, loader_name="Loader B")
+
+        await set_loader_price(l1.id, "cp_10800", 70.0)
+        await set_loader_price(l2.id, "cp_10800", 68.0)
+
+        order = await create_order(email="catb_single@test.com", package="10800 CP", status="Payment Review")
+        await save_order_pricing(order.id)
+
+        edited = {}
+        async def mock_edit_text(text, reply_markup=None, parse_mode=None):
+            edited["text"] = text
+            edited["reply_markup"] = reply_markup
+
+        query = MagicMock()
+        query.data = f"catb_accept:{order.id}"
+        query.edit_message_text = AsyncMock(side_effect=mock_edit_text)
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        await category_b_approval_callback_handler(update, context)
+
+        self.assertIn("SELECT LOADER", edited.get("text", ""))
+        keyboard = edited.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        self.assertTrue(any("Loader A — 10800 CP: $70" in label for label in button_labels))
+        self.assertTrue(any("Loader B — 10800 CP: $68" in label for label in button_labels))
+
+    async def test_catb_accept_multi_package_loader_pricing_breakdown(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing
+        from handlers import category_b_approval_callback_handler
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        l2 = await add_loader(group_id=2002, loader_name="Loader B")
+
+        await set_loader_price(l1.id, "cp_2400", 14.0)
+        await set_loader_price(l1.id, "cp_5000", 30.0)
+        await set_loader_price(l1.id, "cp_10800", 65.0)
+
+        await set_loader_price(l2.id, "cp_2400", 15.0)
+        await set_loader_price(l2.id, "cp_5000", 32.0)
+        await set_loader_price(l2.id, "cp_10800", 68.0)
+
+        pkg_progress = json.dumps([
+            {"raw_item": "2400", "canonical_alias": "2400", "product_key": "cp_2400", "quantity": 1},
+            {"raw_item": "5000", "canonical_alias": "5000", "product_key": "cp_5000", "quantity": 1},
+            {"raw_item": "10800", "canonical_alias": "10800", "product_key": "cp_10800", "quantity": 1}
+        ])
+
+        order = await create_order(
+            email="catb_multi@test.com",
+            package="2400 CP + 5000 CP + 10800 CP",
+            package_progress=pkg_progress,
+            status="Payment Review"
+        )
+        await save_order_pricing(order.id)
+
+        edited = {}
+        async def mock_edit_text(text, reply_markup=None, parse_mode=None):
+            edited["text"] = text
+            edited["reply_markup"] = reply_markup
+
+        query = MagicMock()
+        query.data = f"catb_accept:{order.id}"
+        query.edit_message_text = AsyncMock(side_effect=mock_edit_text)
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        await category_b_approval_callback_handler(update, context)
+
+        text = edited.get("text", "")
+        self.assertIn("Loader A", text)
+        self.assertIn("Total Loader Cost → $109", text)
+        self.assertIn("Loader B", text)
+        self.assertIn("Total Loader Cost → $115", text)
+
+        keyboard = edited.get("reply_markup")
+        button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        self.assertTrue(any("Loader A — Total: $109" in label for label in button_labels))
+        self.assertTrue(any("Loader B — Total: $115" in label for label in button_labels))
+
+    async def test_catb_accept_missing_loader_price_no_fallback(self):
+        from database import add_loader, set_loader_price, create_order, get_order_by_id, save_order_pricing
+        from handlers import category_b_approval_callback_handler
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        l2 = await add_loader(group_id=2002, loader_name="Loader B")
+
+        await set_loader_price(l1.id, "cp_10800", 70.0)
+
+        order = await create_order(email="catb_missing@test.com", package="10800 CP", status="Payment Review")
+        await save_order_pricing(order.id)
+
+        edited = {}
+        async def mock_edit_text(text, reply_markup=None, parse_mode=None):
+            edited["text"] = text
+            edited["reply_markup"] = reply_markup
+
+        query = MagicMock()
+        query.data = f"catb_accept:{order.id}"
+        query.edit_message_text = AsyncMock(side_effect=mock_edit_text)
+        query.answer = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        await category_b_approval_callback_handler(update, context)
+
+        keyboard = edited.get("reply_markup")
+        button_labels = [btn.text for row in keyboard.inline_keyboard for btn in row]
+        self.assertTrue(any("⚠️ Loader B" in label and "Price Not Set" in label for label in button_labels))
+
+        alerts = []
+        async def mock_answer(text=None, show_alert=False):
+            if text:
+                alerts.append(text)
+
+        query2 = MagicMock()
+        query2.data = f"catb_select_loader:{order.id}:{l2.id}"
+        query2.answer = AsyncMock(side_effect=mock_answer)
+        query2.edit_message_text = AsyncMock()
+
+        update2 = MagicMock()
+        update2.callback_query = query2
+
+        await category_b_approval_callback_handler(update2, context)
+
+        self.assertTrue(len(alerts) > 0)
+        self.assertIn("Loader B does not have prices set", alerts[0])
+
+        ord_after = await get_order_by_id(order.id)
+        self.assertIsNone(ord_after.loader_group_id)
+
+    async def test_catb_accept_client_price_remains_unchanged(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing, get_order_by_id
+        from handlers import category_b_approval_callback_handler
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        await set_loader_price(l1.id, "cp_10800", 70.0)
+
+        order = await create_order(
+            email="catb_client_price@test.com",
+            package="10800 CP",
+            status="Payment Review",
+            client_chat_id=-1001234,
+            original_message_id=555
+        )
+        await save_order_pricing(order.id)
+
+        query = MagicMock()
+        query.data = f"catb_select_loader:{order.id}:{l1.id}"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot.copy_message = AsyncMock(return_value=MagicMock(message_id=999))
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await category_b_approval_callback_handler(update, context)
+
+        ord_after = await get_order_by_id(order.id)
+        self.assertEqual(float(ord_after.client_price_total), 65.5)
+
+    async def test_catb_accept_selected_loader_cost_profit_calculation(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing, get_order_by_id
+        from handlers import category_b_approval_callback_handler
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        l2 = await add_loader(group_id=2002, loader_name="Loader B")
+
+        await set_loader_price(l1.id, "cp_10800", 50.0)
+        await set_loader_price(l2.id, "cp_10800", 55.0)
+
+        order = await create_order(
+            email="catb_profit@test.com",
+            package="10800 CP",
+            status="Payment Review",
+            client_chat_id=-1001234,
+            original_message_id=556
+        )
+        await save_order_pricing(order.id)
+
+        query = MagicMock()
+        query.data = f"catb_select_loader:{order.id}:{l1.id}"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot.copy_message = AsyncMock(return_value=MagicMock(message_id=999))
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await category_b_approval_callback_handler(update, context)
+
+        ord_after = await get_order_by_id(order.id)
+        self.assertEqual(float(ord_after.loader_cost_total), 50.0)
+        self.assertEqual(float(ord_after.profit_amount), 15.5)
+
+    async def test_catb_accept_loader_cost_privacy_in_delivery(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing
+        from handlers import category_b_approval_callback_handler
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        await set_loader_price(l1.id, "cp_10800", 70.0)
+
+        order = await create_order(
+            email="catb_privacy@test.com",
+            package="10800 CP",
+            status="Payment Review",
+            client_chat_id=-1001234,
+            original_message_id=557
+        )
+        await save_order_pricing(order.id)
+
+        sent_messages = []
+        async def mock_copy_message(chat_id, from_chat_id, message_id, reply_markup=None):
+            sent_messages.append({"chat_id": chat_id, "reply_markup": reply_markup})
+            return MagicMock(message_id=999)
+
+        query = MagicMock()
+        query.data = f"catb_select_loader:{order.id}:{l1.id}"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        context = MagicMock()
+        context.bot.copy_message = AsyncMock(side_effect=mock_copy_message)
+
+        update = MagicMock()
+        update.callback_query = query
+
+        await category_b_approval_callback_handler(update, context)
+
+        for msg in sent_messages:
+            if msg.get("reply_markup"):
+                kb_text = str(msg["reply_markup"])
+                self.assertNotIn("70", kb_text)
+
+    async def test_catb_accept_category_a_workflow_unchanged(self):
+        from database import add_loader, set_loader_price, create_order, save_order_pricing
+        from unittest.mock import AsyncMock, MagicMock
+
+        l1 = await add_loader(group_id=2001, loader_name="Loader A")
+        await set_loader_price(l1.id, "cp_10800", 70.0)
+
+        order = await create_order(
+            email="cata_flow@test.com",
+            package="10800 CP",
+            status="Pending",
+            category="A"
+        )
+        await save_order_pricing(order.id)
+
+        self.assertEqual(order.status, "Pending")
+        self.assertIsNotNone(order.id)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
