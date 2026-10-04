@@ -5229,6 +5229,31 @@ class TestStep3SecretCodeAndCatalog(unittest.TestCase):
             decoded = decode_profit_code(encoded)
             self.assertEqual(decoded, val, f"Roundtrip failed for {val}: encoded as '{encoded}', decoded as '{decoded}'")
 
+    def test_order_228_profit_code_regression(self):
+        """
+        Regression test for Order #228:
+        Client price = 4.50, Loader cost = 3.70, Profit = 0.80.
+        Verifies that $0.80 profit does NOT generate 'U' ($0), but encodes as 'L' ($0.75 nearest quarter).
+        """
+        from decimal import Decimal
+        from profit_code_engine import encode_profit_code
+        from pricing_calculator import calculate_profit, calculate_profit_and_code
+
+        client_price = Decimal("4.50")
+        loader_cost = Decimal("3.70")
+        profit = calculate_profit(client_price, loader_cost)
+
+        self.assertEqual(profit, Decimal("0.80"))
+
+        code = encode_profit_code(profit)
+        self.assertNotEqual(code, "U", "Profit of $0.80 MUST NOT generate 'U' ($0.00)")
+        self.assertEqual(code, "L", "Profit of $0.80 MUST be encoded as 'L' ($0.75 nearest quarter)")
+
+        # Test with float math artifact (4.5 - 3.7 = 0.7999999999999998)
+        float_profit, float_code = calculate_profit_and_code(4.5, 3.7)
+        self.assertNotEqual(float_code, "U", "Float profit 0.7999999999999998 MUST NOT generate 'U'")
+        self.assertEqual(float_code, "L")
+
     def test_product_catalog_structure_and_reference_prices(self):
         from product_catalog import (
             PRODUCT_CATALOG,
