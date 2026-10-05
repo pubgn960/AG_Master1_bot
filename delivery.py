@@ -328,16 +328,18 @@ async def deliver_order_by_id(
             item_codes_map[pkg_alias] = calc_it["secret_profit_code"]
             item_codes_map[calc_it["product_key"]] = calc_it["secret_profit_code"]
 
-    # Determine Email / Caption for First Image: display email & secret profit code if available
-    if caption_text and "\n" in caption_text:
-        email_header = caption_text
-    elif session_secret_code:
-        email_header = f"{order.email}\n{session_secret_code}"
+    # Determine clean customer email (extract from caption if present, otherwise fallback to order.email)
+    caption_email = extract_last_email(caption_text)
+    clean_email = caption_email if caption_email else order.email
+
+    # Determine Email / Caption Header for First Image: display clean email & secret profit code if available
+    if session_secret_code:
+        email_header = f"{clean_email}\n{session_secret_code}"
     elif order.secret_profit_code:
-        email_header = f"{order.email}\n{order.secret_profit_code}"
+        email_header = f"{clean_email}\n{order.secret_profit_code}"
     else:
-        caption_email = extract_last_email(caption_text)
-        email_header = caption_email if caption_email else order.email
+        email_header = clean_email
+
 
     # Build screenshot caption containing ONLY packages delivered in this session
     include_price_in_caption = (order.category != "B" and not session_secret_code and not order.secret_profit_code)

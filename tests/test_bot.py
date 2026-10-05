@@ -12848,8 +12848,263 @@ class TestCategoryBAcceptLoaderSelection(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(order.id)
 
 
+
+class TestLoaderCaptionIsolation(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests isolation of raw loader captions from client-facing delivery messages.
+    Ensures loader credentials/internal notes are never leaked to Client Group.
+    """
+
+    async def asyncSetUp(self):
+        from database import engine, Base, LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE, AsyncSessionLocal
+        from sqlalchemy import delete
+        from models import LoaderPrice, GlobalClientPrice, Loader, Order, OrderItem, Image
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(Image))
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(Order))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def asyncTearDown(self):
+        from database import LOADER_PRICES_CACHE, LOADERS_CACHE, GLOBAL_CLIENT_PRICES_CACHE, AsyncSessionLocal
+        from sqlalchemy import delete
+        from models import LoaderPrice, GlobalClientPrice, Loader, Order, OrderItem, Image
+        async with AsyncSessionLocal() as session:
+            await session.execute(delete(Image))
+            await session.execute(delete(OrderItem))
+            await session.execute(delete(Order))
+            await session.execute(delete(LoaderPrice))
+            await session.execute(delete(GlobalClientPrice))
+            await session.execute(delete(Loader))
+            await session.commit()
+
+        LOADER_PRICES_CACHE.clear()
+        LOADERS_CACHE.clear()
+        GLOBAL_CLIENT_PRICES_CACHE.clear()
+
+    async def test_1_raw_loader_caption_with_credentials_not_in_client_message(self):
+        from database import create_order, add_images_to_order
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+
+        order = await create_order(
+            email="email_iso1@example.com",
+            package="10800 CP",
+            client_chat_id=-10011111,
+            status="Pending"
+        )
+        await add_images_to_order(order.id, [("img_cred_1", "photo")])
+
+        raw_loader_caption = (
+            "Activision\n"
+            "email_iso1@example.com\n"
+            "password123\n"
+            "recovery codes\n"
+            "10800 CP"
+        )
+
+        mock_bot = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 9001
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        success = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=-10022222,
+            target_delivery_chat_id=-10011111,
+            caption_text=raw_loader_caption
+        )
+
+        self.assertTrue(success)
+        mock_bot.send_media_group.assert_called_once()
+        media_arg = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        client_caption = media_arg[0].caption
+
+        self.assertIsNotNone(client_caption)
+        self.assertNotIn("password123", client_caption)
+        self.assertNotIn("recovery codes", client_caption)
+        self.assertNotIn("Activision", client_caption)
+        self.assertIn("email_iso1@example.com", client_caption)
+        self.assertIn("10800 CP", client_caption)
+
+    async def test_2_existing_client_facing_delivery_caption_appears_correctly(self):
+        from database import create_order, add_images_to_order, save_order_pricing
+        from delivery import deliver_order_by_id
+        from unittest.mock import MagicMock, AsyncMock
+
+        order = await create_order(
+            email="client_format_iso2@example.com",
+            package="5000 CP",
+            client_chat_id=-10011111,
+            category="A",
+            status="Pending"
+        )
+        order = await save_order_pricing(order.id)
+        await add_images_to_order(order.id, [("img_fmt_1", "photo")])
+
+        mock_bot = MagicMock()
+        mock_msg = MagicMock()
+        mock_msg.message_id = 9002
+        mock_bot.send_media_group = AsyncMock(return_value=[mock_msg])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        success = await deliver_order_by_id(
+            bot=mock_bot,
+            order_id=order.id,
+            loader_chat_id=-10022222,
+            target_delivery_chat_id=-10011111
+        )
+
+        self.assertTrue(success)
+        media_arg = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        client_caption = media_arg[0].caption
+
+        self.assertIn("client_format_iso2@example.com", client_caption)
+        self.assertIn("Delivered Package", client_caption)
+        self.assertIn("5000 CP", client_caption)
+
+    async def test_3_media_album_delivery_still_works(self):
+        from database import create_order
+        from media_collector import media_collector
+        from unittest.mock import MagicMock, AsyncMock
+
+        order = await create_order(
+            email="album_test_iso3@example.com",
+            package="10800 CP",
+            client_chat_id=-10011111,
+            status="Pending"
+        )
+
+        mock_msg1 = MagicMock()
+        mock_msg1.message_id = 7001
+        mock_msg1.media_group_id = "album_grp_99"
+        mock_msg1.chat.id = -10022222
+        mock_msg1.photo = [type("Photo", (), {"file_id": "photo_alb_1"})()]
+        mock_msg1.document = None
+        mock_msg1.caption = "Internal Loader Note\npassword: secret\n10800 CP"
+        mock_msg1.text = None
+
+        mock_msg2 = MagicMock()
+        mock_msg2.message_id = 7002
+        mock_msg2.media_group_id = "album_grp_99"
+        mock_msg2.chat.id = -10022222
+        mock_msg2.photo = [type("Photo", (), {"file_id": "photo_alb_2"})()]
+        mock_msg2.document = None
+        mock_msg2.caption = None
+        mock_msg2.text = None
+
+        mock_bot = MagicMock()
+        mock_bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=9003), MagicMock(message_id=9004)])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        await media_collector.add_reply_media_message(
+            message=mock_msg1,
+            order_id=order.id,
+            email=order.email,
+            bot=mock_bot,
+            caption_text=mock_msg1.caption
+        )
+        await media_collector.add_reply_media_message(
+            message=mock_msg2,
+            order_id=order.id,
+            email=order.email,
+            bot=mock_bot,
+            caption_text=None
+        )
+
+        await media_collector._flush_media_group(f"{order.id}_album_grp_99")
+
+        mock_bot.send_media_group.assert_called_once()
+        media_arg = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        self.assertEqual(len(media_arg), 2)
+        client_caption = media_arg[0].caption
+        self.assertNotIn("password: secret", client_caption)
+        self.assertNotIn("Internal Loader Note", client_caption)
+        self.assertIn("album_test_iso3@example.com", client_caption)
+
+    async def test_4_single_image_delivery_still_works(self):
+        from database import create_order
+        from media_collector import media_collector
+        from unittest.mock import MagicMock, AsyncMock
+
+        order = await create_order(
+            email="single_img_iso4@example.com",
+            package="2400 CP",
+            client_chat_id=-10011111,
+            status="Pending"
+        )
+
+        mock_msg = MagicMock()
+        mock_msg.message_id = 7005
+        mock_msg.media_group_id = None
+        mock_msg.chat.id = -10022222
+        mock_msg.photo = [type("Photo", (), {"file_id": "single_photo_123"})()]
+        mock_msg.document = None
+        mock_msg.caption = "Loader raw text\npass: abc123"
+        mock_msg.text = None
+
+        mock_bot = MagicMock()
+        mock_bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=9005)])
+        mock_bot.send_message = AsyncMock()
+        mock_bot.set_message_reaction = AsyncMock(return_value=True)
+
+        await media_collector.add_reply_media_message(
+            message=mock_msg,
+            order_id=order.id,
+            email=order.email,
+            bot=mock_bot,
+            caption_text=mock_msg.caption
+        )
+
+        mock_bot.send_media_group.assert_called_once()
+        media_arg = mock_bot.send_media_group.call_args_list[0][1]["media"]
+        self.assertEqual(len(media_arg), 1)
+        client_caption = media_arg[0].caption
+        self.assertNotIn("pass: abc123", client_caption)
+        self.assertIn("single_img_iso4@example.com", client_caption)
+
+    async def test_5_loader_caption_processed_internally(self):
+        from email_parser import extract_last_email
+        from utils import parse_test_order_packages
+
+        raw_caption = (
+            "Facebook Login\n"
+            "Email: customer_override@example.com\n"
+            "Password: secretpassword\n"
+            "Order:\n5000+2400"
+        )
+
+        # 1. Email extraction helper still works on loader caption
+        extracted_email = extract_last_email(raw_caption)
+        self.assertEqual(extracted_email, "customer_override@example.com")
+
+        # 2. Package parsing helper still works on raw caption text
+        parsed = parse_test_order_packages(raw_caption)
+        self.assertIsNotNone(parsed)
+        pkgs = [p["package"] for p in parsed["packages"]]
+        self.assertIn("5000", pkgs)
+        self.assertIn("2400", pkgs)
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
